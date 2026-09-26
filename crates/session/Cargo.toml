@@ -1,6 +1,9 @@
 [package]
 name = "vigia-session"
-description = "Cookie jar and persistent session state (auth survives runs without Chromium)"
+description = "Cookie jar and persistent profiles for authenticated browsing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+vigia-url = { path = "../url" }

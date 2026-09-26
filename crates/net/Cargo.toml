@@ -1,11 +1,12 @@
 [package]
 name = "vigia-net"
-description = "Thin HTTP client: sync, capped body reads, rustls only (no OpenSSL)"
+description = "Own HTTP/1.1 client: request/response, chunked, redirects, gzip. TLS via vigia-tls."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-thiserror = "2"
-ureq = { version = "3.0.12", default-features = false, features = ["rustls", "platform-verifier"] }
+vigia-inflate = { path = "../inflate" }
 vigia-session = { path = "../session" }
+vigia-tls = { path = "../tls" }
+vigia-url = { path = "../url" }

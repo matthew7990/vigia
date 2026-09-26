@@ -3,9 +3,13 @@ resolver = "2"
 members = [
     "crates/dom",
     "crates/html",
+    "crates/inflate",
+    "crates/mem",
     "crates/net",
     "crates/session",
     "crates/snapshot",
+    "crates/tls",
+    "crates/url",
     "crates/cli",
 ]
 

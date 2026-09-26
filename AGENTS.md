@@ -1,8 +1,8 @@
-# vigia — agent guide
+# vigia - agent guide
 
 ## Project context
 
-Open-source AI-native browser written **from scratch in Rust** — no Chromium/WebKit. Purpose: scraping, authenticated access, reviewable automation for AI agents. Design constraint #1: minimum, measurable memory. No render pipeline exists by design.
+Open-source AI-native browser written **from scratch in Rust** — no Chromium/WebKit. Purpose: scraping, authenticated access, reviewable automation for AI agents. Target metrics: token cost per page + bytes of RAM per session + human-speed step latency. No render pipeline exists by design.
 
 ## Commands
 
@@ -14,8 +14,9 @@ Open-source AI-native browser written **from scratch in Rust** — no Chromium/W
 
 ## Conventions
 
-- One crate per layer under `crates/`. Dependencies point inward: `cli -> snapshot/html/net -> dom/session`. `vigia-dom` has zero deps and stays that way.
+- One crate per layer under `crates/`. Dependencies point inward: `cli -> snapshot/html/net -> dom/session/url`. `vigia-dom` has zero deps and stays that way.
 - No async runtime. `vigia-net` is sync on purpose; parallelism, if added, is a thread pool — not tokio.
-- New deps need justification against the memory floor. Parser code is ours; third-party parser crates (html5ever, cssparser) are acceptable as *reference*, not as dependencies, unless explicitly decided.
-- Unsafe code: none in v0.1.
+- **Everything is ours**: std + OS only. The single declared exception is `crates/tls` (`rustls`+`ring`+`webpki-roots`), isolated behind `vigia_tls::connect`, pending own TLS 1.3. Any other crate needs an explicit decision documented in the README.
+- Third-party specs (RFCs, WHATWG) are reference material; implementations are ours.
+- Unsafe code: only inside `vigia-mem` (the allocator shim). Nowhere else in v0.1.
 - Code and docs in English. UI strings in Spanish only if/when a UI exists.

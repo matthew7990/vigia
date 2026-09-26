@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 vigia-dom = { path = "../dom" }
 vigia-html = { path = "../html" }
+vigia-mem = { path = "../mem" }
 vigia-net = { path = "../net" }
 vigia-session = { path = "../session" }
 vigia-snapshot = { path = "../snapshot" }

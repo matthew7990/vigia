@@ -1,0 +1,6 @@
+[package]
+name = "vigia-mem"
+description = "Counting allocator: live/peak heap + Linux RSS peak. The total-load meter."
+version.workspace = true
+edition.workspace = true
+license.workspace = true

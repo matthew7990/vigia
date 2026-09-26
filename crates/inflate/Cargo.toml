@@ -1,0 +1,6 @@
+[package]
+name = "vigia-inflate"
+description = "Own DEFLATE/zlib/gzip decoder (RFC 1951/1950/1952). No zlib, no miniz."
+version.workspace = true
+edition.workspace = true
+license.workspace = true

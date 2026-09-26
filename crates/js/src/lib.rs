@@ -1,5 +1,6 @@
 //! vigia-js: own JavaScript interpreter core (lexer, parser, tree-walk eval).
-//! Pragmatic ES5-ish subset, no DOM bindings, no prototypes, no async.
+//! Pragmatic ES5-ish subset with DOM bindings (bindings.rs), no prototypes,
+//! no async.
 //!
 //! Values live in flat arenas (Heap::strs, Heap::objs, Interp::envs) so a
 //! later mark-sweep GC can find roots without walking pointer graphs. Rc
@@ -18,7 +19,10 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use vigia_dom::NodeId;
+
 mod ast;
+mod bindings;
 mod eval;
 mod lex;
 mod parse;
@@ -63,6 +67,8 @@ pub enum Obj {
     /// def carries params+body shared via Rc; env is the captured EnvId
     Func { def: Rc<FnDef>, env: u32 },
     Native(&'static str, NativeFn),
+    /// JS handle over a DOM node; valid only while Interp.dom is installed.
+    Dom(NodeId),
 }
 
 /// Value arena. `cap` is a hard limit on live slots (objs + strs).
@@ -148,6 +154,10 @@ pub struct Interp {
     pub heap: Heap,
     /// env 0 is global
     pub(crate) envs: Vec<Env>,
+    /// Page DOM installed by set_dom; Obj::Dom indices point into it.
+    pub dom: Option<vigia_dom::Dom>,
+    /// node -> wrapper obj cache so `a === b` identity holds per node
+    pub(crate) dom_objs: HashMap<NodeId, u32>,
     pub(crate) out: String,
     pub(crate) last: Value,
     pub(crate) steps: u64,
@@ -168,6 +178,8 @@ impl Interp {
         Interp {
             heap: Heap::with_cap(cap),
             envs: vec![Env { vars: HashMap::new(), parent: None }],
+            dom: None,
+            dom_objs: HashMap::new(),
             out: String::new(),
             last: Value::Undef,
             steps: 0,

@@ -213,9 +213,17 @@ struct Page {
     status: u16,
 }
 
-fn load(res: vigia_net::Response) -> Page {
+fn load(res: vigia_net::Response, js: bool) -> Page {
     let mut dom = Dom::new();
     vigia_html::parse(&res.text(), &mut dom);
+    if js {
+        let mut it = vigia_js::Interp::new();
+        let (d, errs) = it.run_scripts(dom);
+        dom = d;
+        for e in errs {
+            eprintln!("warn: js: {e}");
+        }
+    }
     Page {
         dom,
         url: res.final_url,
@@ -236,11 +244,12 @@ fn exec(
     page: &mut Option<Page>,
     jar: &mut CookieJar,
     out: &mut dyn FnMut(&str),
+    js: bool,
 ) -> Result<(), String> {
     match &stmt.op {
         Op::Snap(url) => {
             let res = vigia_net::fetch(url, jar).map_err(|e| format!("fetch failed: {e}"))?;
-            let p = load(res);
+            let p = load(res, js);
             out(&vigia_snapshot::snapshot(&p.dom));
             *page = Some(p);
         }
@@ -248,13 +257,13 @@ fn exec(
             let p = page.as_ref().ok_or(NO_PAGE)?;
             let res = vigia_actions::click(&p.dom, &p.url, *n, &[], jar)
                 .map_err(|e| format!("click failed: {e}"))?;
-            *page = Some(load(res));
+            *page = Some(load(res, js));
         }
         Op::Submit { form, data } => {
             let p = page.as_ref().ok_or(NO_PAGE)?;
             let res = vigia_actions::submit_form(&p.dom, &p.url, form.as_deref(), data, jar)
                 .map_err(|e| format!("submit failed: {e}"))?;
-            *page = Some(load(res));
+            *page = Some(load(res, js));
         }
         Op::Fill(n, value) => {
             let p = page.as_mut().ok_or(NO_PAGE)?;
@@ -316,10 +325,22 @@ pub fn run(
     audit: &mut Vec<AuditEntry>,
     out: &mut dyn FnMut(&str),
 ) -> Result<(), RunError> {
+    run_with(stmts, jar, audit, out, false)
+}
+
+/// `run` + `js`: when true, every page load (snap/click/submit) first runs
+/// the page's inline <script>s; per-script errors warn to stderr.
+pub fn run_with(
+    stmts: &[Stmt],
+    jar: &mut CookieJar,
+    audit: &mut Vec<AuditEntry>,
+    out: &mut dyn FnMut(&str),
+    js: bool,
+) -> Result<(), RunError> {
     let mut page = None;
     for stmt in stmts {
         let t0 = Instant::now();
-        let r = exec(stmt, &mut page, jar, out);
+        let r = exec(stmt, &mut page, jar, out, js);
         audit.push(AuditEntry {
             line: stmt.line,
             op: stmt.op.name(),

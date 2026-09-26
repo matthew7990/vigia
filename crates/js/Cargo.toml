@@ -6,4 +6,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+vigia-actions = { path = "../actions" }
+vigia-css = { path = "../css" }
+vigia-dom = { path = "../dom" }
+vigia-html = { path = "../html" }
 vigia-json = { path = "../json" }

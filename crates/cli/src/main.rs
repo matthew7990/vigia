@@ -21,6 +21,7 @@ const USAGE: &str = "vigia - AI-native browser runtime
   vigia run <file.vig> [--audit log.jsonl]  multi-step script + audit trail
 
   --profile <name>                       persistent cookie jar (~/.vigia/profiles)
+  --js                                   run page <script>s before reading the DOM
 
 Own HTTP/1.1 + URL parser + inflate + HTML parser + arena DOM.
 Metrics on stderr: bytes in/out, ~tokens, ms per phase, heap peak, RSS peak.
@@ -95,10 +96,18 @@ fn report_fetch(res: &vigia_net::Response) {
     );
 }
 
-fn parse_dom(res: &vigia_net::Response) -> (Dom, std::time::Duration) {
+fn parse_dom(res: &vigia_net::Response, js: bool) -> (Dom, std::time::Duration) {
     let t0 = Instant::now();
     let mut dom = Dom::new();
     vigia_html::parse(&res.text(), &mut dom);
+    if js {
+        let mut it = vigia_js::Interp::new();
+        let (d, errs) = it.run_scripts(dom);
+        dom = d;
+        for e in errs {
+            eprintln!("warn: js: {e}");
+        }
+    }
     (dom, t0.elapsed())
 }
 
@@ -126,6 +135,14 @@ fn main() {
         }
     }
 
+    // --js anywhere: run page scripts after every parse.
+    let js = if let Some(i) = args.iter().position(|a| a == "--js") {
+        args.remove(i);
+        true
+    } else {
+        false
+    };
+
     if args.len() < 2 {
         eprint!("{USAGE}");
         std::process::exit(1);
@@ -148,7 +165,7 @@ fn main() {
         "snap" | "dom" => {
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, parse_ms) = parse_dom(&res);
+            let (dom, parse_ms) = parse_dom(&res, js);
             if cmd == "dom" {
                 println!(
                     "{} nodes, {} interned strings, {} cookies",
@@ -179,7 +196,7 @@ fn main() {
             });
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, parse_ms) = parse_dom(&res);
+            let (dom, parse_ms) = parse_dom(&res, js);
             let hits = match vigia_css::query(&dom, &sel) {
                 Ok(h) => h,
                 Err(e) => fail(format!("{e}")),
@@ -203,13 +220,13 @@ fn main() {
                 .unwrap_or_else(|| fail("click needs a ref: vigia click <url> <#n>"));
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, _) = parse_dom(&res);
+            let (dom, _) = parse_dom(&res, js);
             let res2 = match vigia_actions::click(&dom, &res.final_url, ref_n, &[], &mut jar) {
                 Ok(r) => r,
                 Err(e) => fail(format!("click failed: {e}")),
             };
             report_fetch(&res2);
-            let (dom2, _) = parse_dom(&res2);
+            let (dom2, _) = parse_dom(&res2, js);
             print!("{}", snapshot(&dom2));
             report("");
         }
@@ -236,7 +253,7 @@ fn main() {
             }
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, _) = parse_dom(&res);
+            let (dom, _) = parse_dom(&res, js);
             let res2 = match vigia_actions::submit_form(
                 &dom,
                 &res.final_url,
@@ -248,7 +265,7 @@ fn main() {
                 Err(e) => fail(format!("submit failed: {e}")),
             };
             report_fetch(&res2);
-            let (dom2, _) = parse_dom(&res2);
+            let (dom2, _) = parse_dom(&res2, js);
             print!("{}", snapshot(&dom2));
             report("");
         }
@@ -256,7 +273,7 @@ fn main() {
             let path = args.first().map(|s| s.as_str());
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, _) = parse_dom(&res);
+            let (dom, _) = parse_dom(&res, js);
             let mut found = 0;
             let mut seen = Vec::new();
             for sel in [
@@ -343,7 +360,7 @@ fn main() {
                     println!();
                 }
             };
-            let result = vigia_run::run(&stmts, &mut jar, &mut audit, &mut emit);
+            let result = vigia_run::run_with(&stmts, &mut jar, &mut audit, &mut emit, js);
             if let Some(p) = &audit_path {
                 let mut text = String::new();
                 for e in &audit {

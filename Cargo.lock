@@ -173,6 +173,10 @@ version = "0.1.0"
 name = "vigia-js"
 version = "0.1.0"
 dependencies = [
+ "vigia-actions",
+ "vigia-css",
+ "vigia-dom",
+ "vigia-html",
  "vigia-json",
 ]
 
@@ -203,6 +207,7 @@ dependencies = [
  "vigia-css",
  "vigia-dom",
  "vigia-html",
+ "vigia-js",
  "vigia-json",
  "vigia-net",
  "vigia-session",

@@ -85,6 +85,7 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
                 format!("function {}() {{ [code] }}", def.name.as_deref().unwrap_or(""))
             }
             Obj::Native(n, _) => format!("function {n}() {{ [native code] }}"),
+            Obj::Dom(_) => "[object Node]".into(),
         },
     }
 }
@@ -482,12 +483,21 @@ impl Interp {
             Expr::Call(c, args) => self.call(env, c, args),
             Expr::Member(o, name) => {
                 let v = self.expr(env, o)?;
-                get_prop(&self.heap, v, name)
+                match self.as_node(v) {
+                    Some(n) => self.dom_get(n, name),
+                    None => get_prop(&self.heap, v, name),
+                }
             }
             Expr::Index(o, ix) => {
                 let v = self.expr(env, o)?;
                 let k = self.expr(env, ix)?;
-                get_index(&mut self.heap, v, k)
+                match self.as_node(v) {
+                    Some(n) => {
+                        let key = to_str(&self.heap, k);
+                        self.dom_get(n, &key)
+                    }
+                    None => get_index(&mut self.heap, v, k),
+                }
             }
             Expr::Func(def) => {
                 Ok(Value::Obj(self.heap.alloc_obj(Obj::Func { def: def.clone(), env })?))
@@ -630,12 +640,21 @@ impl Interp {
                 .ok_or_else(|| err(format!("{n} is not defined"))),
             Expr::Member(o, k) => {
                 let v = self.expr(env, o)?;
-                get_prop(&self.heap, v, k)
+                match self.as_node(v) {
+                    Some(n) => self.dom_get(n, k),
+                    None => get_prop(&self.heap, v, k),
+                }
             }
             Expr::Index(o, ix) => {
                 let v = self.expr(env, o)?;
                 let k = self.expr(env, ix)?;
-                get_index(&mut self.heap, v, k)
+                match self.as_node(v) {
+                    Some(n) => {
+                        let key = to_str(&self.heap, k);
+                        self.dom_get(n, &key)
+                    }
+                    None => get_index(&mut self.heap, v, k),
+                }
             }
             _ => Err(err("bad assignment target")),
         }
@@ -651,18 +670,27 @@ impl Interp {
             }
             Expr::Member(o, k) => {
                 let t = self.expr(env, o)?;
-                set_prop(&mut self.heap, t, k, v)
+                match self.as_node(t) {
+                    Some(n) => self.dom_set(n, k, v),
+                    None => set_prop(&mut self.heap, t, k, v),
+                }
             }
             Expr::Index(o, ix) => {
                 let t = self.expr(env, o)?;
                 let k = self.expr(env, ix)?;
-                set_index(&mut self.heap, t, k, v)
+                match self.as_node(t) {
+                    Some(n) => {
+                        let key = to_str(&self.heap, k);
+                        self.dom_set(n, &key, v)
+                    }
+                    None => set_index(&mut self.heap, t, k, v),
+                }
             }
             _ => Err(err("bad assignment target")),
         }
     }
 
-    fn eval_args(&mut self, env: u32, es: &[Expr]) -> Result<Vec<Value>, JsError> {
+    pub(crate) fn eval_args(&mut self, env: u32, es: &[Expr]) -> Result<Vec<Value>, JsError> {
         let mut v = Vec::with_capacity(es.len());
         for e in es {
             v.push(self.expr(env, e)?);
@@ -682,6 +710,10 @@ impl Interp {
                     }
                     _ => {}
                 }
+                // DOM node methods dispatch like the string/array builtins
+                if let Some(n) = self.as_node(recv) {
+                    return self.call_dom(n, name, env, arg_es);
+                }
                 (get_prop(&self.heap, recv, name)?, recv, Some(name.as_str()))
             }
             Expr::Index(o, ix) => {
@@ -691,6 +723,10 @@ impl Interp {
                     if matches!(self.heap.obj(id), Obj::Arr(_)) {
                         let n = self.heap.get_str(s).to_string();
                         return self.call_arr(id, &n, env, arg_es);
+                    }
+                    if let Obj::Dom(n) = self.heap.obj(id) {
+                        let (n, m) = (*n, self.heap.get_str(s).to_string());
+                        return self.call_dom(n, &m, env, arg_es);
                     }
                 }
                 if let (Value::Str(id), Value::Str(s)) = (recv, k) {
@@ -989,7 +1025,7 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
                     .map(|v| val_to_json(h, *v, depth + 1))
                     .collect::<Result<_, JsError>>()?,
             ),
-            Obj::Func { .. } | Obj::Native(..) => Json::Null,
+            Obj::Func { .. } | Obj::Native(..) | Obj::Dom(_) => Json::Null,
         },
     })
 }

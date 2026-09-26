@@ -1,0 +1,7 @@
+target/
+Cargo.lock
+.vigia/
+recordings/
+*.har
+.env
+node_modules/

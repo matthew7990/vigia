@@ -1,0 +1,9 @@
+[package]
+name = "vigia-html"
+description = "Streaming HTML parser -> vigia-dom arena (pragmatic subset, spec-conforming path is roadmap)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vigia-dom = { path = "../dom" }

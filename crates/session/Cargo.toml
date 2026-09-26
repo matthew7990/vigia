@@ -1,0 +1,6 @@
+[package]
+name = "vigia-session"
+description = "Cookie jar and persistent session state (auth survives runs without Chromium)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

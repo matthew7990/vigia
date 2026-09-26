@@ -1,0 +1,17 @@
+[package]
+name = "vigia"
+description = "AI-native browser runtime CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vigia"
+path = "src/main.rs"
+
+[dependencies]
+vigia-dom = { path = "../dom" }
+vigia-html = { path = "../html" }
+vigia-net = { path = "../net" }
+vigia-session = { path = "../session" }
+vigia-snapshot = { path = "../snapshot" }

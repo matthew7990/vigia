@@ -1,0 +1,11 @@
+[package]
+name = "vigia-net"
+description = "Thin HTTP client: sync, capped body reads, rustls only (no OpenSSL)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2"
+ureq = { version = "3.0.12", default-features = false, features = ["rustls", "platform-verifier"] }
+vigia-session = { path = "../session" }

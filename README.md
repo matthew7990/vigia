@@ -30,6 +30,9 @@ cargo build --release
 ./target/release/vigia json <url> [a.b.0]          # embedded JSON (__NEXT_DATA__, ld+json)
 ./target/release/vigia js <file.js> | -e "<code>"  # run JavaScript (own interpreter)
 ./target/release/vigia run <file.vig> [--audit log.jsonl]  # multi-step script + audit trail
+./target/release/vigia run login.vig --tab alice --tab bob \
+  -D alice.USER=alice -D alice.PASS=x -D bob.USER=bob -D bob.PASS=y
+#   same script in parallel tabs: own profile jar per tab, $VAR per-tab vars
 
 # persistent session (cookies on disk)
 ./target/release/vigia snap <url> --profile work
@@ -115,7 +118,8 @@ Done:
 - Persistent profiles: cookie jars on disk (`--profile`, own TSV format)
 - Embedded-JSON extraction (`__NEXT_DATA__`, `ld+json`): JS-free SPA reads
 - `vigia-js` core: own lexer, parser, tree-walk eval, arena values, step/call/heap guards
-- `vigia --js`: page scripts execute against the live DOM (querySelector, innerHTML, mutation)
+- `vigia --js`: page scripts execute against the live DOM (querySelector, innerHTML, mutation, events, synchronous fetch, external `src=` scripts)
+- `vigia run --tab`: the same script in parallel tabs, one profile jar per tab
 - Replay: `.vig` scripts plus JSONL audit trail (`vigia run`)
 
 Next:

@@ -1,6 +1,6 @@
 //! vigia-js: own JavaScript interpreter core (lexer, parser, tree-walk eval).
-//! Pragmatic ES5-ish subset with DOM bindings (bindings.rs), no prototypes,
-//! no async.
+//! Pragmatic ES5-ish subset with DOM bindings (bindings.rs), prototype-based
+//! property lookup, no async.
 //!
 //! Values live in flat arenas (Heap::strs, Heap::objs, Interp::envs) so a
 //! later mark-sweep GC can find roots without walking pointer graphs. Rc
@@ -12,9 +12,17 @@
 //! - Function declarations hoist within their block.
 //! - `this` bound for `o.m()` and `o[i]()` calls, else undefined.
 //! - Assignment to an undeclared name creates a global (sloppy mode).
-//! - `new F()` gives a fresh Ordinary as `this`; no prototype wiring.
-//! - No regex literals, for-in/of, switch, try, do-while, getters,
-//!   instanceof, delete, void, ?., ??, =>, spread, classes, labels.
+//! - Prototypes: Ordinary/Arr/Func carry `proto`; Native/Dom carry none
+//!   (Native objects reach Function.prototype through a virtual fallback).
+//!   `Func`/`Native` carry `pairs` (own props) so functions can expose
+//!   `.prototype` and constructor globals (Object, Date, ...) their statics;
+//!   every Obj::Func gets a fresh own "prototype" object at creation.
+//! - `new F()`: proto = F.prototype when it's an object else Object's proto;
+//!   `new` on a Native just calls it (ctors allocate their own result).
+//!   `new` callee is primary + member chain: `new a.b()` is New(Member a.b).
+//! - No regex literals: String.replace takes a string/number needle only.
+//! - No for-in/of, switch, try, do-while, getters, delete, void, ?., ??,
+//!   =>, spread, classes, labels, __proto__ accessor.
 //! - Events: addEventListener + inline `on*` attrs, bubble phase only
 //!   (no capture). Dispatch is synchronous.
 //! - fetch() is synchronous: returns a plain response object whose
@@ -78,14 +86,49 @@ pub struct NetCtx {
 
 #[derive(Debug)]
 pub enum Obj {
-    /// property map, insertion order
-    Ordinary(Vec<(String, Value)>),
-    Arr(Vec<Value>),
-    /// def carries params+body shared via Rc; env is the captured EnvId
-    Func { def: Rc<FnDef>, env: u32 },
-    Native(&'static str, NativeFn),
+    /// property map, insertion order; proto = heap obj id, None = null proto
+    Ordinary { pairs: Vec<(String, Value)>, proto: Option<u32> },
+    Arr { items: Vec<Value>, proto: Option<u32> },
+    /// def carries params+body shared via Rc; env is the captured EnvId.
+    /// pairs holds own props ("prototype" is populated at creation).
+    Func { def: Rc<FnDef>, env: u32, proto: Option<u32>, pairs: Vec<(String, Value)> },
+    /// name+f; pairs holds own props (ctor statics, "prototype"). No proto
+    /// field: get_prop falls back to Function.prototype for Natives.
+    Native { name: &'static str, f: NativeFn, pairs: Vec<(String, Value)> },
     /// JS handle over a DOM node; valid only while Interp.dom is installed.
     Dom(NodeId),
+}
+
+/// Well-known prototype objects (heap ids), allocated once per Interp.
+/// u32::MAX = not installed (heap-cap edge during Interp::new).
+/// `number`/`date` go beyond the minimal four so Number.prototype.toFixed
+/// and Date.prototype methods have somewhere to live.
+#[derive(Clone, Copy)]
+pub struct Protos {
+    pub object: u32,
+    pub array: u32,
+    pub function_: u32,
+    pub string: u32,
+    pub number: u32,
+    pub date: u32,
+}
+
+impl Protos {
+    fn none() -> Self {
+        Protos {
+            object: u32::MAX,
+            array: u32::MAX,
+            function_: u32::MAX,
+            string: u32::MAX,
+            number: u32::MAX,
+            date: u32::MAX,
+        }
+    }
+}
+
+/// u32::MAX sentinel -> None (proto not installed).
+pub(crate) fn po(p: u32) -> Option<u32> {
+    if p == u32::MAX { None } else { Some(p) }
 }
 
 /// Value arena. `cap` is a hard limit on live slots (objs + strs).
@@ -183,6 +226,10 @@ pub struct Interp {
     /// Set by click() on <a href> when default isn't prevented. The host
     /// decides whether to follow it (v1 navigation bridge).
     pub pending_nav: Option<String>,
+    /// Well-known prototypes, allocated by install_protos in with_cap.
+    pub protos: Protos,
+    /// Math.random state (xorshift64*; not crypto).
+    pub(crate) rng: u64,
     pub(crate) out: String,
     pub(crate) last: Value,
     pub(crate) steps: u64,
@@ -200,7 +247,13 @@ impl Interp {
     }
 
     pub fn with_cap(cap: usize) -> Self {
-        Interp {
+        // non-crypto rng seed from wall clock
+        let rng = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+            ^ 0x9E3779B97F4A7C15;
+        let mut it = Interp {
             heap: Heap::with_cap(cap),
             envs: vec![Env { vars: HashMap::new(), parent: None }],
             dom: None,
@@ -208,6 +261,8 @@ impl Interp {
             listeners: HashMap::new(),
             net: None,
             pending_nav: None,
+            protos: Protos::none(),
+            rng,
             out: String::new(),
             last: Value::Undef,
             steps: 0,
@@ -216,7 +271,9 @@ impl Interp {
             max_steps: 5_000_000,
             max_call_depth: 1_000,
             max_envs: 200_000,
-        }
+        };
+        it.install_protos();
+        it
     }
 
     /// console.log output accumulated so far.

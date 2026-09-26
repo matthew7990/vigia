@@ -345,7 +345,7 @@ impl P {
     }
 
     fn rel(&mut self) -> R<Expr> {
-        self.binop(Self::shift, &["<", "<=", ">", ">=", "in"])
+        self.binop(Self::shift, &["<", "<=", ">", ">=", "in", "instanceof"])
     }
 
     fn shift(&mut self) -> R<Expr> {

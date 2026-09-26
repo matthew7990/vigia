@@ -8,7 +8,7 @@ use std::rc::Rc;
 use vigia_json::Json;
 
 use crate::ast::{Expr, FnDef, Stmt};
-use crate::{err, Env, Heap, Interp, JsError, Obj, Value};
+use crate::{err, po, Env, Heap, Interp, JsError, NativeFn, Obj, Protos, Value};
 
 pub(crate) enum Flow {
     Normal,
@@ -72,7 +72,7 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
         Value::Num(n) => fmt_num(n),
         Value::Str(id) => h.get_str(id).into(),
         Value::Obj(id) => match h.obj(id) {
-            Obj::Arr(items) => items
+            Obj::Arr { items, .. } => items
                 .iter()
                 .map(|x| match x {
                     Value::Undef | Value::Null => String::new(),
@@ -80,11 +80,11 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(","),
-            Obj::Ordinary(_) => "[object Object]".into(),
+            Obj::Ordinary { .. } => "[object Object]".into(),
             Obj::Func { def, .. } => {
                 format!("function {}() {{ [code] }}", def.name.as_deref().unwrap_or(""))
             }
-            Obj::Native(n, _) => format!("function {n}() {{ [native code] }}"),
+            Obj::Native { name, .. } => format!("function {name}() {{ [native code] }}"),
             Obj::Dom(_) => "[object Node]".into(),
         },
     }
@@ -142,7 +142,7 @@ pub(crate) fn type_str(h: &Heap, v: Value) -> &'static str {
         Value::Num(_) => "number",
         Value::Str(_) => "string",
         Value::Obj(id) => match h.obj(id) {
-            Obj::Func { .. } | Obj::Native(..) => "function",
+            Obj::Func { .. } | Obj::Native { .. } => "function",
             _ => "object",
         },
     }
@@ -159,20 +159,86 @@ fn rel(h: &Heap, l: Value, r: Value, nf: fn(f64, f64) -> bool, sf: fn(&str, &str
 
 // ---- property access ---------------------------------------------------
 
-pub(crate) fn get_prop(h: &Heap, v: Value, key: &str) -> Result<Value, JsError> {
-    match v {
-        Value::Obj(id) => Ok(match h.obj(id) {
-            Obj::Ordinary(pairs) => pairs
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| *v)
-                .unwrap_or(Value::Undef),
-            Obj::Arr(items) if key == "length" => Value::Num(items.len() as f64),
-            _ => Value::Undef,
-        }),
-        Value::Str(id) if key == "length" => {
-            Ok(Value::Num(h.get_str(id).chars().count() as f64))
+/// Max prototype-chain hops per lookup (cycles are impossible since proto
+/// is set at allocation; the cap also bounds absurdly deep chains).
+const MAX_PROTO_HOPS: u32 = 64;
+
+/// An object's own (non-inherited) prop. Arr owns "length" + indices.
+fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
+    match h.obj(id) {
+        Obj::Ordinary { pairs, .. }
+        | Obj::Func { pairs, .. }
+        | Obj::Native { pairs, .. } => {
+            pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
         }
+        Obj::Arr { items, .. } => {
+            if key == "length" {
+                return Some(Value::Num(items.len() as f64));
+            }
+            key.parse::<usize>().ok().and_then(|i| items.get(i)).copied()
+        }
+        Obj::Dom(_) => None,
+    }
+}
+
+/// Heap id of `id`'s prototype. Natives get the Function proto virtually;
+/// Dom has none.
+fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
+    match h.obj(id) {
+        Obj::Ordinary { proto, .. } | Obj::Arr { proto, .. } | Obj::Func { proto, .. } => {
+            *proto
+        }
+        Obj::Native { .. } => po(protos.function_),
+        Obj::Dom(_) => None,
+    }
+}
+
+/// Walk `start` then its proto chain; first own prop wins. Cap hops.
+fn walk_props(h: &Heap, protos: &Protos, start: Option<u32>, key: &str) -> Result<Value, JsError> {
+    let mut cur = start;
+    for _ in 0..MAX_PROTO_HOPS {
+        let Some(id) = cur else { return Ok(Value::Undef) };
+        if let Some(v) = own_prop(h, id, key) {
+            return Ok(v);
+        }
+        cur = proto_of(h, protos, id);
+    }
+    Ok(Value::Undef)
+}
+
+/// `key in v` over the proto chain (rhs must already be an object).
+fn has_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> bool {
+    let mut cur = match v {
+        Value::Obj(id) => Some(id),
+        _ => return false,
+    };
+    for _ in 0..MAX_PROTO_HOPS {
+        let Some(id) = cur else { return false };
+        if own_prop(h, id, key).is_some() {
+            return true;
+        }
+        cur = proto_of(h, protos, id);
+    }
+    false
+}
+
+/// `v[key]`: own props, then proto chain, then Undef. Primitives map to
+/// their protos (Str keeps `length` first).
+pub(crate) fn get_prop(
+    h: &Heap,
+    protos: &Protos,
+    v: Value,
+    key: &str,
+) -> Result<Value, JsError> {
+    match v {
+        Value::Obj(id) => walk_props(h, protos, Some(id), key),
+        Value::Str(id) => {
+            if key == "length" {
+                return Ok(Value::Num(h.get_str(id).chars().count() as f64));
+            }
+            walk_props(h, protos, po(protos.string), key)
+        }
+        Value::Num(_) => walk_props(h, protos, po(protos.number), key),
         Value::Undef | Value::Null => Err(err(format!(
             "cannot read '{key}' of {}",
             if matches!(v, Value::Null) { "null" } else { "undefined" }
@@ -181,10 +247,13 @@ pub(crate) fn get_prop(h: &Heap, v: Value, key: &str) -> Result<Value, JsError> 
     }
 }
 
+/// Writes to own pairs only (Ordinary/Func/Native), like standard JS.
 pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<(), JsError> {
     match v {
         Value::Obj(id) => match h.obj_mut(id) {
-            Obj::Ordinary(pairs) => {
+            Obj::Ordinary { pairs, .. }
+            | Obj::Func { pairs, .. }
+            | Obj::Native { pairs, .. } => {
                 match pairs.iter_mut().find(|(k, _)| k == key) {
                     Some(slot) => slot.1 = val,
                     None => pairs.push((key.to_string(), val)),
@@ -198,21 +267,19 @@ pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<
     }
 }
 
-fn get_index(h: &mut Heap, v: Value, k: Value) -> Result<Value, JsError> {
+fn get_index(h: &mut Heap, protos: &Protos, v: Value, k: Value) -> Result<Value, JsError> {
     match v {
         Value::Obj(id) => {
             let n = to_num(h, k);
             match h.obj(id) {
-                Obj::Arr(items) => Ok(if n >= 0.0 && n.fract() == 0.0 {
-                    items.get(n as usize).copied().unwrap_or(Value::Undef)
-                } else {
-                    Value::Undef
-                }),
-                Obj::Ordinary(_) => {
-                    let key = to_str(h, k);
-                    get_prop(h, v, &key)
+                Obj::Arr { items, .. } if n >= 0.0 && n.fract() == 0.0 => {
+                    Ok(items.get(n as usize).copied().unwrap_or(Value::Undef))
                 }
-                _ => Ok(Value::Undef),
+                Obj::Dom(_) => Ok(Value::Undef),
+                _ => {
+                    let key = to_str(h, k);
+                    get_prop(h, protos, v, &key)
+                }
             }
         }
         Value::Str(id) => {
@@ -224,24 +291,30 @@ fn get_index(h: &mut Heap, v: Value, k: Value) -> Result<Value, JsError> {
             };
             match c {
                 Some(c) => Ok(Value::Str(h.alloc_str(c.to_string())?)),
-                None => Ok(Value::Undef),
+                None => {
+                    let key = to_str(h, k);
+                    get_prop(h, protos, v, &key)
+                }
             }
         }
         Value::Undef | Value::Null => Err(err("cannot index into null/undefined")),
-        _ => Ok(Value::Undef),
+        _ => {
+            let key = to_str(h, k);
+            get_prop(h, protos, v, &key)
+        }
     }
 }
 
 fn set_index(h: &mut Heap, v: Value, k: Value, val: Value) -> Result<(), JsError> {
     match v {
         Value::Obj(id) => {
-            if matches!(h.obj(id), Obj::Arr(_)) {
+            if matches!(h.obj(id), Obj::Arr { .. }) {
                 let n = to_num(h, k);
                 if !(n >= 0.0 && n.fract() == 0.0 && n <= 10_000_000.0) {
                     return Err(err("bad array index"));
                 }
                 let i = n as usize;
-                if let Obj::Arr(items) = h.obj_mut(id) {
+                if let Obj::Arr { items, .. } = h.obj_mut(id) {
                     if i >= items.len() {
                         items.resize(i + 1, Value::Undef);
                     }
@@ -260,28 +333,225 @@ fn set_index(h: &mut Heap, v: Value, k: Value, val: Value) -> Result<(), JsError
 // ---- evaluator -----------------------------------------------------------
 
 impl Interp {
+    // ---- object allocation helpers (proto wiring lives here) ----------
+
+    /// Fresh Ordinary under Object.prototype.
+    pub(crate) fn obj_plain(&mut self) -> Result<u32, JsError> {
+        let proto = po(self.protos.object);
+        self.heap.alloc_obj(Obj::Ordinary { pairs: Vec::new(), proto })
+    }
+
+    /// Fresh Ordinary with props, under Object.prototype.
+    pub(crate) fn obj_pairs(&mut self, pairs: Vec<(String, Value)>) -> Result<u32, JsError> {
+        let proto = po(self.protos.object);
+        self.heap.alloc_obj(Obj::Ordinary { pairs, proto })
+    }
+
+    /// Fresh Arr under Array.prototype.
+    pub(crate) fn arr_obj(&mut self, items: Vec<Value>) -> Result<u32, JsError> {
+        let proto = po(self.protos.array);
+        self.heap.alloc_obj(Obj::Arr { items, proto })
+    }
+
+    /// Fresh Func under Function.prototype, with an own "prototype" object
+    /// (fresh Ordinary under Object's proto) like real JS.
+    pub(crate) fn func_obj(&mut self, def: Rc<FnDef>, env: u32) -> Result<u32, JsError> {
+        let pt = self.obj_plain()?;
+        let proto = po(self.protos.function_);
+        self.heap.alloc_obj(Obj::Func {
+            def,
+            env,
+            proto,
+            pairs: vec![("prototype".into(), Value::Obj(pt))],
+        })
+    }
+
+    /// push a Native method onto a pairs-holding obj (proto bag or ctor).
+    /// Heap-cap edge: skips silently when there's no room.
+    fn put(&mut self, on: u32, name: &'static str, f: NativeFn) {
+        let Ok(n) = self.heap.alloc_obj(nat(name, f)) else { return };
+        match self.heap.obj_mut(on) {
+            Obj::Ordinary { pairs, .. }
+            | Obj::Func { pairs, .. }
+            | Obj::Native { pairs, .. } => pairs.push((name.into(), Value::Obj(n))),
+            _ => {}
+        }
+    }
+
+    /// A constructor global: Native with own statics + "prototype" pair.
+    fn ctor(
+        &mut self,
+        name: &'static str,
+        f: NativeFn,
+        proto: u32,
+        statics: &[(&'static str, NativeFn)],
+    ) {
+        let mut pairs = Vec::with_capacity(statics.len() + 1);
+        for (n, m) in statics {
+            let Ok(id) = self.heap.alloc_obj(nat(n, *m)) else { return };
+            pairs.push((n.to_string(), Value::Obj(id)));
+        }
+        if let Some(pt) = po(proto) {
+            pairs.push(("prototype".into(), Value::Obj(pt)));
+        }
+        if let Ok(id) = self.heap.alloc_obj(Obj::Native { name, f, pairs }) {
+            self.env_declare(0, name, Value::Obj(id));
+        }
+    }
+
+    /// Alloc a proto bag under Object's proto, filled with `methods`.
+    /// u32::MAX on heap-cap failure.
+    fn proto_bag(&mut self, methods: &[(&'static str, NativeFn)]) -> u32 {
+        let proto = po(self.protos.object);
+        let Ok(id) = self.heap.alloc_obj(Obj::Ordinary { pairs: vec![], proto }) else {
+            return u32::MAX;
+        };
+        for (n, f) in methods {
+            self.put(id, n, *f);
+        }
+        id
+    }
+
+    /// Allocate the shared prototype objects once (called from with_cap).
+    /// Cap edge: protos left as u32::MAX when there's no room - property
+    /// lookup then degrades to own props only.
+    pub(crate) fn install_protos(&mut self) {
+        let Ok(object) = self.heap.alloc_obj(Obj::Ordinary { pairs: vec![], proto: None })
+        else {
+            return;
+        };
+        self.protos.object = object;
+        self.put(object, "hasOwnProperty", n_has_own);
+        self.put(object, "toString", n_obj_to_string);
+
+        self.protos.function_ =
+            self.proto_bag(&[("call", n_fn_call), ("apply", n_fn_apply)]);
+        self.protos.array = self.proto_bag(&[
+            ("push", n_arr_push),
+            ("pop", n_arr_pop),
+            ("shift", n_arr_shift),
+            ("unshift", n_arr_unshift),
+            ("map", n_arr_map),
+            ("filter", n_arr_filter),
+            ("forEach", n_arr_for_each),
+            ("reduce", n_arr_reduce),
+            ("join", n_arr_join),
+            ("indexOf", n_arr_index_of),
+            ("lastIndexOf", n_arr_last_index_of),
+            ("includes", n_arr_includes),
+            ("slice", n_arr_slice),
+            ("concat", n_arr_concat),
+            ("find", n_arr_find),
+            ("findIndex", n_arr_find_index),
+            ("some", n_arr_some),
+            ("every", n_arr_every),
+            ("reverse", n_arr_reverse),
+            ("sort", n_arr_sort),
+            ("splice", n_arr_splice),
+            ("flat", n_arr_flat),
+        ]);
+        self.protos.string = self.proto_bag(&[
+            ("split", n_str_split),
+            ("indexOf", n_str_index_of),
+            ("lastIndexOf", n_str_last_index_of),
+            ("slice", n_str_slice),
+            ("substring", n_str_substring),
+            ("trim", n_str_trim),
+            ("trimStart", n_str_trim_start),
+            ("trimEnd", n_str_trim_end),
+            ("toUpperCase", n_str_to_upper),
+            ("toLowerCase", n_str_to_lower),
+            ("includes", n_str_includes),
+            ("startsWith", n_str_starts_with),
+            ("endsWith", n_str_ends_with),
+            ("charAt", n_str_char_at),
+            ("charCodeAt", n_str_char_code_at),
+            ("replace", n_str_replace),
+            ("concat", n_str_concat),
+            ("repeat", n_str_repeat),
+            ("padStart", n_str_pad_start),
+            ("padEnd", n_str_pad_end),
+        ]);
+        self.protos.number = self.proto_bag(&[("toFixed", n_num_to_fixed)]);
+        self.protos.date = self.proto_bag(&[
+            ("getTime", n_date_get_time),
+            ("toISOString", n_date_iso),
+            ("valueOf", n_date_get_time),
+        ]);
+    }
+
     pub(crate) fn install_builtins(&mut self) {
         if self.builtins {
             return;
         }
         self.builtins = true;
+        let pr = self.protos;
         // cap edge: installs silently skip when there's no room
-        if let Ok(log) = self.heap.alloc_obj(Obj::Native("log", n_console_log)) {
-            if let Ok(c) = self.heap.alloc_obj(Obj::Ordinary(vec![("log".into(), Value::Obj(log))]))
-            {
+        self.ctor(
+            "Object",
+            n_object,
+            pr.object,
+            &[
+                ("keys", n_obj_keys),
+                ("values", n_obj_values),
+                ("entries", n_obj_entries),
+                ("assign", n_obj_assign),
+                ("create", n_obj_create),
+            ],
+        );
+        self.ctor("Array", n_array, pr.array, &[("isArray", n_is_array), ("of", n_array_of)]);
+        self.ctor("String", n_string_cast, pr.string, &[]);
+        self.ctor("Number", n_number_cast, pr.number, &[]);
+        self.ctor("Boolean", n_boolean_cast, u32::MAX, &[]);
+        self.ctor("Date", n_date, pr.date, &[("now", n_date_now)]);
+        for (n, f) in [
+            ("parseInt", n_parse_int as NativeFn),
+            ("parseFloat", n_parse_float),
+            ("isNaN", n_is_nan),
+            ("isFinite", n_is_finite),
+        ] {
+            if let Ok(id) = self.heap.alloc_obj(nat(n, f)) {
+                self.env_declare(0, n, Value::Obj(id));
+            }
+        }
+        // Math: plain object of fns + constants
+        let mut mp: Vec<(String, Value)> = Vec::new();
+        for (n, f) in [
+            ("floor", n_math_floor as NativeFn),
+            ("ceil", n_math_ceil),
+            ("round", n_math_round),
+            ("random", n_math_random),
+            ("max", n_math_max),
+            ("min", n_math_min),
+            ("abs", n_math_abs),
+            ("pow", n_math_pow),
+            ("sqrt", n_math_sqrt),
+        ] {
+            match self.heap.alloc_obj(nat(n, f)) {
+                Ok(id) => mp.push((n.into(), Value::Obj(id))),
+                Err(_) => break,
+            }
+        }
+        mp.push(("PI".into(), Value::Num(std::f64::consts::PI)));
+        mp.push(("E".into(), Value::Num(std::f64::consts::E)));
+        if let Ok(m) = self.obj_pairs(mp) {
+            self.env_declare(0, "Math", Value::Obj(m));
+        }
+        if let Ok(log) = self.heap.alloc_obj(nat("log", n_console_log)) {
+            if let Ok(c) = self.obj_pairs(vec![("log".into(), Value::Obj(log))]) {
                 self.env_declare(0, "console", Value::Obj(c));
             }
         }
-        if let Ok(p) = self.heap.alloc_obj(Obj::Native("parse", n_json_parse)) {
-            if let Ok(s) = self.heap.alloc_obj(Obj::Native("stringify", n_json_stringify)) {
-                let pairs =
-                    vec![("parse".into(), Value::Obj(p)), ("stringify".into(), Value::Obj(s))];
-                if let Ok(j) = self.heap.alloc_obj(Obj::Ordinary(pairs)) {
+        if let Ok(p) = self.heap.alloc_obj(nat("parse", n_json_parse)) {
+            if let Ok(s) = self.heap.alloc_obj(nat("stringify", n_json_stringify)) {
+                if let Ok(j) =
+                    self.obj_pairs(vec![("parse".into(), Value::Obj(p)), ("stringify".into(), Value::Obj(s))])
+                {
                     self.env_declare(0, "JSON", Value::Obj(j));
                 }
             }
         }
-        if let Ok(f) = self.heap.alloc_obj(Obj::Native("fetch", n_fetch)) {
+        if let Ok(f) = self.heap.alloc_obj(nat("fetch", n_fetch)) {
             self.env_declare(0, "fetch", Value::Obj(f));
         }
         self.env_declare(0, "this", Value::Undef);
@@ -337,7 +607,7 @@ impl Interp {
     pub(crate) fn exec_block(&mut self, stmts: &[Stmt], env: u32) -> Result<Flow, JsError> {
         for s in stmts {
             if let Stmt::FnDecl(def) = s {
-                let f = self.heap.alloc_obj(Obj::Func { def: def.clone(), env })?;
+                let f = self.func_obj(def.clone(), env)?;
                 if let Some(n) = &def.name {
                     self.env_declare(env, n, Value::Obj(f));
                 }
@@ -458,7 +728,7 @@ impl Interp {
                 for it in items {
                     v.push(self.expr(env, it)?);
                 }
-                Ok(Value::Obj(self.heap.alloc_obj(Obj::Arr(v))?))
+                Ok(Value::Obj(self.arr_obj(v)?))
             }
             Expr::ObjLit(ps) => {
                 let mut pairs: Vec<(String, Value)> = Vec::new();
@@ -469,7 +739,7 @@ impl Interp {
                         None => pairs.push((k.clone(), v)),
                     }
                 }
-                Ok(Value::Obj(self.heap.alloc_obj(Obj::Ordinary(pairs))?))
+                Ok(Value::Obj(self.obj_pairs(pairs)?))
             }
             Expr::Unary(op, e) => self.unary(env, op, e),
             Expr::Postfix(op, e) => self.bump(env, e, if *op == "++" { 1.0 } else { -1.0 }, true),
@@ -488,7 +758,7 @@ impl Interp {
                 let v = self.expr(env, o)?;
                 match self.as_node(v) {
                     Some(n) => self.dom_get(n, name),
-                    None => get_prop(&self.heap, v, name),
+                    None => get_prop(&self.heap, &self.protos, v, name),
                 }
             }
             Expr::Index(o, ix) => {
@@ -499,16 +769,20 @@ impl Interp {
                         let key = to_str(&self.heap, k);
                         self.dom_get(n, &key)
                     }
-                    None => get_index(&mut self.heap, v, k),
+                    None => get_index(&mut self.heap, &self.protos, v, k),
                 }
             }
-            Expr::Func(def) => {
-                Ok(Value::Obj(self.heap.alloc_obj(Obj::Func { def: def.clone(), env })?))
-            }
+            Expr::Func(def) => Ok(Value::Obj(self.func_obj(def.clone(), env)?)),
             Expr::New(c, args) => {
                 let f = self.expr(env, c)?;
                 let args = self.eval_args(env, args)?;
-                let obj = self.heap.alloc_obj(Obj::Ordinary(vec![]))?;
+                // proto = callee.prototype when it's an object (JS); natives
+                // may ignore `this` and return their own object anyway.
+                let proto = match get_prop(&self.heap, &self.protos, f, "prototype")? {
+                    Value::Obj(p) => Some(p),
+                    _ => po(self.protos.object),
+                };
+                let obj = self.heap.alloc_obj(Obj::Ordinary { pairs: vec![], proto })?;
                 let r = self.call_value(f, Value::Obj(obj), &args, None)?;
                 Ok(match r {
                     Value::Obj(_) => r,
@@ -610,15 +884,40 @@ impl Interp {
             "in" => {
                 let key = to_str(h, l);
                 match r {
-                    Value::Obj(id) => Value::Bool(match h.obj(id) {
-                        Obj::Ordinary(ps) => ps.iter().any(|(k, _)| *k == key),
-                        Obj::Arr(v) => {
-                            key.parse::<usize>().map(|i| i < v.len()).unwrap_or(false)
-                        }
-                        _ => false,
-                    }),
+                    Value::Obj(_) => Value::Bool(has_prop(h, &self.protos, r, &key)),
                     _ => return Err(err("'in' needs an object on the right")),
                 }
+            }
+            "instanceof" => {
+                // target = rhs.prototype (rhs must be callable); lhs chain
+                // walk answers whether target sits on it.
+                let target = match r {
+                    Value::Obj(id)
+                        if matches!(h.obj(id), Obj::Func { .. } | Obj::Native { .. }) =>
+                    {
+                        get_prop(h, &self.protos, r, "prototype")?
+                    }
+                    _ => return Err(err("instanceof: right side is not a function")),
+                };
+                let Value::Obj(tid) = target else {
+                    return Ok(Value::Bool(false));
+                };
+                let mut cur = match l {
+                    Value::Obj(id) => proto_of(h, &self.protos, id),
+                    _ => None,
+                };
+                let mut hit = false;
+                for _ in 0..MAX_PROTO_HOPS {
+                    match cur {
+                        Some(c) if c == tid => {
+                            hit = true;
+                            break;
+                        }
+                        Some(c) => cur = proto_of(h, &self.protos, c),
+                        None => break,
+                    }
+                }
+                Value::Bool(hit)
             }
             _ => return Err(err(format!("bad op {op}"))),
         })
@@ -645,7 +944,7 @@ impl Interp {
                 let v = self.expr(env, o)?;
                 match self.as_node(v) {
                     Some(n) => self.dom_get(n, k),
-                    None => get_prop(&self.heap, v, k),
+                    None => get_prop(&self.heap, &self.protos, v, k),
                 }
             }
             Expr::Index(o, ix) => {
@@ -656,7 +955,7 @@ impl Interp {
                         let key = to_str(&self.heap, k);
                         self.dom_get(n, &key)
                     }
-                    None => get_index(&mut self.heap, v, k),
+                    None => get_index(&mut self.heap, &self.protos, v, k),
                 }
             }
             _ => Err(err("bad assignment target")),
@@ -705,38 +1004,24 @@ impl Interp {
         let (f, this, hint) = match callee {
             Expr::Member(o, name) => {
                 let recv = self.expr(env, o)?;
-                // string/array builtin methods live outside the property map
-                match recv {
-                    Value::Str(id) => return self.call_str(id, name, env, arg_es),
-                    Value::Obj(id) if matches!(self.heap.obj(id), Obj::Arr(_)) => {
-                        return self.call_arr(id, name, env, arg_es)
-                    }
-                    _ => {}
-                }
-                // DOM node methods dispatch like the string/array builtins
+                // DOM node methods dispatch on the node, not the property map
                 if let Some(n) = self.as_node(recv) {
                     return self.call_dom(n, name, env, arg_es);
                 }
-                (get_prop(&self.heap, recv, name)?, recv, Some(name.as_str()))
+                // proto chains resolve string/array/etc methods to Natives;
+                // `this` = the receiver
+                (get_prop(&self.heap, &self.protos, recv, name)?, recv, Some(name.as_str()))
             }
             Expr::Index(o, ix) => {
                 let recv = self.expr(env, o)?;
                 let k = self.expr(env, ix)?;
                 if let (Value::Obj(id), Value::Str(s)) = (recv, k) {
-                    if matches!(self.heap.obj(id), Obj::Arr(_)) {
-                        let n = self.heap.get_str(s).to_string();
-                        return self.call_arr(id, &n, env, arg_es);
-                    }
                     if let Obj::Dom(n) = self.heap.obj(id) {
                         let (n, m) = (*n, self.heap.get_str(s).to_string());
                         return self.call_dom(n, &m, env, arg_es);
                     }
                 }
-                if let (Value::Str(id), Value::Str(s)) = (recv, k) {
-                    let n = self.heap.get_str(s).to_string();
-                    return self.call_str(id, &n, env, arg_es);
-                }
-                (get_index(&mut self.heap, recv, k)?, recv, None)
+                (get_index(&mut self.heap, &self.protos, recv, k)?, recv, None)
             }
             Expr::Ident(n) => (self.expr(env, callee)?, Value::Undef, Some(n.as_str())),
             _ => (self.expr(env, callee)?, Value::Undef, None),
@@ -766,8 +1051,8 @@ impl Interp {
             }
         };
         let c = match self.heap.obj(id) {
-            Obj::Func { def, env } => C::Fn(def.clone(), *env),
-            Obj::Native(_, nf) => C::Nat(*nf),
+            Obj::Func { def, env, .. } => C::Fn(def.clone(), *env),
+            Obj::Native { f, .. } => C::Nat(*f),
             _ => return Err(err(format!("{} is not a function", hint.unwrap_or("object")))),
         };
         self.tick()?;
@@ -799,144 +1084,6 @@ impl Interp {
         r
     }
 
-    /// String builtin methods (`.charAt` etc). `.length` is a prop.
-    fn call_str(&mut self, id: u32, name: &str, env: u32, arg_es: &[Expr]) -> Result<Value, JsError> {
-        let args = self.eval_args(env, arg_es)?;
-        let s = self.heap.get_str(id).to_string();
-        let chars: Vec<char> = s.chars().collect();
-        let len = chars.len() as i64;
-        let arg = |i: usize| args.get(i).copied().unwrap_or(Value::Undef);
-        match name {
-            "charAt" => {
-                let i = to_num(&self.heap, arg(0));
-                let t = if i >= 0.0 {
-                    chars.get(i as usize).map(|c| c.to_string()).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                Ok(Value::Str(self.heap.alloc_str(t)?))
-            }
-            "charCodeAt" => {
-                let i = to_num(&self.heap, arg(0));
-                Ok(Value::Num(if i >= 0.0 {
-                    chars.get(i as usize).map(|c| *c as u32 as f64).unwrap_or(f64::NAN)
-                } else {
-                    f64::NAN
-                }))
-            }
-            "indexOf" => {
-                let needle = to_str(&self.heap, arg(0));
-                Ok(Value::Num(
-                    s.find(&needle).map(|p| s[..p].chars().count() as f64).unwrap_or(-1.0),
-                ))
-            }
-            "slice" => {
-                let a = to_num(&self.heap, arg(0)) as i64;
-                let b = match args.get(1) {
-                    Some(v) => to_num(&self.heap, *v) as i64,
-                    None => len,
-                };
-                let lo = (if a < 0 { len + a } else { a }).clamp(0, len) as usize;
-                let hi = (if b < 0 { len + b } else { b }).clamp(0, len) as usize;
-                let t: String = if hi > lo { chars[lo..hi].iter().collect() } else { String::new() };
-                Ok(Value::Str(self.heap.alloc_str(t)?))
-            }
-            "substring" => {
-                let mut a = (to_num(&self.heap, arg(0)) as i64).clamp(0, len);
-                let mut b = match args.get(1) {
-                    Some(v) => (to_num(&self.heap, *v) as i64).clamp(0, len),
-                    None => len,
-                };
-                if a > b {
-                    std::mem::swap(&mut a, &mut b);
-                }
-                let t: String = chars[a as usize..b as usize].iter().collect();
-                Ok(Value::Str(self.heap.alloc_str(t)?))
-            }
-            "split" => {
-                let sep = to_str(&self.heap, arg(0));
-                let parts: Vec<String> = if sep.is_empty() {
-                    s.chars().map(|c| c.to_string()).collect()
-                } else {
-                    s.split(&sep).map(|p| p.to_string()).collect()
-                };
-                let mut vals = Vec::with_capacity(parts.len());
-                for p in parts {
-                    vals.push(Value::Str(self.heap.alloc_str(p)?));
-                }
-                Ok(Value::Obj(self.heap.alloc_obj(Obj::Arr(vals))?))
-            }
-            "toUpperCase" => Ok(Value::Str(self.heap.alloc_str(s.to_uppercase())?)),
-            "toLowerCase" => Ok(Value::Str(self.heap.alloc_str(s.to_lowercase())?)),
-            "trim" => Ok(Value::Str(self.heap.alloc_str(s.trim().to_string())?)),
-            _ => Err(err(format!("{name} is not a function"))),
-        }
-    }
-
-    /// Array builtin methods. `.length` is a prop; index ops are Index.
-    fn call_arr(&mut self, id: u32, name: &str, env: u32, arg_es: &[Expr]) -> Result<Value, JsError> {
-        let args = self.eval_args(env, arg_es)?;
-        match name {
-            "push" => {
-                if let Obj::Arr(v) = self.heap.obj_mut(id) {
-                    v.extend_from_slice(&args);
-                    return Ok(Value::Num(v.len() as f64));
-                }
-                Err(err("internal: not an array"))
-            }
-            "pop" => {
-                if let Obj::Arr(v) = self.heap.obj_mut(id) {
-                    return Ok(v.pop().unwrap_or(Value::Undef));
-                }
-                Err(err("internal: not an array"))
-            }
-            "join" => {
-                let sep = match args.first() {
-                    None | Some(Value::Undef) => ",".to_string(),
-                    Some(v) => to_str(&self.heap, *v),
-                };
-                let items = match self.heap.obj(id) {
-                    Obj::Arr(v) => v.clone(),
-                    _ => Vec::new(),
-                };
-                let s = items
-                    .iter()
-                    .map(|v| to_str(&self.heap, *v))
-                    .collect::<Vec<_>>()
-                    .join(&sep);
-                Ok(Value::Str(self.heap.alloc_str(s)?))
-            }
-            "indexOf" => {
-                let needle = args.first().copied().unwrap_or(Value::Undef);
-                if let Obj::Arr(v) = self.heap.obj(id) {
-                    let pos = v
-                        .iter()
-                        .position(|x| strict_eq(&self.heap, *x, needle))
-                        .map(|i| i as f64)
-                        .unwrap_or(-1.0);
-                    return Ok(Value::Num(pos));
-                }
-                Err(err("internal: not an array"))
-            }
-            "slice" => {
-                let items = match self.heap.obj(id) {
-                    Obj::Arr(v) => v.clone(),
-                    _ => Vec::new(),
-                };
-                let len = items.len() as i64;
-                let a = to_num(&self.heap, args.first().copied().unwrap_or(Value::Undef)) as i64;
-                let b = match args.get(1) {
-                    Some(v) => to_num(&self.heap, *v) as i64,
-                    None => len,
-                };
-                let lo = (if a < 0 { len + a } else { a }).clamp(0, len) as usize;
-                let hi = (if b < 0 { len + b } else { b }).clamp(0, len) as usize;
-                let sub = if hi > lo { items[lo..hi].to_vec() } else { Vec::new() };
-                Ok(Value::Obj(self.heap.alloc_obj(Obj::Arr(sub))?))
-            }
-            _ => Err(err(format!("{name} is not a function"))),
-        }
-    }
 
     /// REPL-style display: objects as JSON, scalars via ToString.
     pub fn inspect(&self, v: Value) -> String {
@@ -967,7 +1114,7 @@ fn n_console_log(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value,
 fn n_json_parse(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     let src = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
     let j = Json::parse(&src).map_err(|e| err(e.to_string()))?;
-    json_to_val(&mut it.heap, &j)
+    json_to_val(it, &j)
 }
 
 fn n_json_stringify(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
@@ -993,49 +1140,49 @@ fn n_fetch(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsErr
         ("redirected".into(), Value::Bool(res.redirects > 0)),
         ("url".into(), Value::Str(it.heap.alloc_str(res.final_url.to_string())?)),
         ("__body".into(), Value::Str(it.heap.alloc_str(res.text())?)),
-        ("text".into(), Value::Obj(it.heap.alloc_obj(Obj::Native("text", n_res_text))?)),
-        ("json".into(), Value::Obj(it.heap.alloc_obj(Obj::Native("json", n_res_json))?)),
+        ("text".into(), Value::Obj(it.heap.alloc_obj(nat("text", n_res_text))?)),
+        ("json".into(), Value::Obj(it.heap.alloc_obj(nat("json", n_res_json))?)),
     ];
-    Ok(Value::Obj(it.heap.alloc_obj(Obj::Ordinary(pairs))?))
+    Ok(Value::Obj(it.obj_pairs(pairs)?))
 }
 
-fn res_body(h: &Heap, this: Value) -> Result<String, JsError> {
-    match get_prop(h, this, "__body")? {
-        Value::Str(s) => Ok(h.get_str(s).to_string()),
+fn res_body(it: &Interp, this: Value) -> Result<String, JsError> {
+    match get_prop(&it.heap, &it.protos, this, "__body")? {
+        Value::Str(s) => Ok(it.heap.get_str(s).to_string()),
         _ => Err(err("response method called on a non-response object")),
     }
 }
 
 fn n_res_text(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
-    let b = res_body(&it.heap, this)?;
+    let b = res_body(it, this)?;
     Ok(Value::Str(it.heap.alloc_str(b)?))
 }
 
 fn n_res_json(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
-    let b = res_body(&it.heap, this)?;
+    let b = res_body(it, this)?;
     let j = Json::parse(&b).map_err(|e| err(e.to_string()))?;
-    json_to_val(&mut it.heap, &j)
+    json_to_val(it, &j)
 }
 
-fn json_to_val(h: &mut Heap, j: &Json) -> Result<Value, JsError> {
+fn json_to_val(it: &mut Interp, j: &Json) -> Result<Value, JsError> {
     Ok(match j {
         Json::Null => Value::Null,
         Json::Bool(b) => Value::Bool(*b),
         Json::Num(n) => Value::Num(*n),
-        Json::Str(s) => Value::Str(h.alloc_str(s.clone())?),
+        Json::Str(s) => Value::Str(it.heap.alloc_str(s.clone())?),
         Json::Arr(items) => {
             let mut v = Vec::with_capacity(items.len());
-            for it in items {
-                v.push(json_to_val(h, it)?);
+            for i in items {
+                v.push(json_to_val(it, i)?);
             }
-            Value::Obj(h.alloc_obj(Obj::Arr(v))?)
+            Value::Obj(it.arr_obj(v)?)
         }
         Json::Obj(pairs) => {
             let mut v = Vec::new();
             for (k, jv) in pairs {
-                v.push((k.clone(), json_to_val(h, jv)?));
+                v.push((k.clone(), json_to_val(it, jv)?));
             }
-            Value::Obj(h.alloc_obj(Obj::Ordinary(v))?)
+            Value::Obj(it.obj_pairs(v)?)
         }
     })
 }
@@ -1058,21 +1205,982 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
         }
         Value::Str(id) => Json::Str(h.get_str(id).to_string()),
         Value::Obj(id) => match h.obj(id) {
-            Obj::Ordinary(pairs) => Json::Obj(
+            Obj::Ordinary { pairs, .. } => Json::Obj(
                 pairs
                     .iter()
                     .map(|(k, v)| Ok((k.clone(), val_to_json(h, *v, depth + 1)?)))
                     .collect::<Result<_, JsError>>()?,
             ),
-            Obj::Arr(items) => Json::Arr(
+            Obj::Arr { items, .. } => Json::Arr(
                 items
                     .iter()
                     .map(|v| val_to_json(h, *v, depth + 1))
                     .collect::<Result<_, JsError>>()?,
             ),
-            Obj::Func { .. } | Obj::Native(..) | Obj::Dom(_) => Json::Null,
+            Obj::Func { .. } | Obj::Native { .. } | Obj::Dom(_) => Json::Null,
         },
     })
+}
+
+// ---- prototype natives -------------------------------------------------------
+
+/// Native fn object with an empty own-props bag.
+pub(crate) fn nat(name: &'static str, f: NativeFn) -> Obj {
+    Obj::Native { name, f, pairs: Vec::new() }
+}
+
+fn arg(args: &[Value], i: usize) -> Value {
+    args.get(i).copied().unwrap_or(Value::Undef)
+}
+
+/// `this` as an Arr heap id; natives below error out on other receivers.
+fn this_arr(it: &Interp, this: Value) -> Result<u32, JsError> {
+    match this {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Arr { .. }) => Ok(id),
+        _ => Err(err("array method needs an array receiver")),
+    }
+}
+
+fn arr_items(it: &Interp, id: u32) -> Vec<Value> {
+    match it.heap.obj(id) {
+        Obj::Arr { items, .. } => items.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// callback args per spec: (item, idx, arr); thisArg = the method's arg1.
+fn cb_args(item: Value, idx: usize, arr: Value) -> [Value; 3] {
+    [item, Value::Num(idx as f64), arr]
+}
+
+// -- Object.prototype + statics ------------------------------------------------
+
+fn n_has_own(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let key = to_str(&it.heap, arg(args, 0));
+    let hit = match this {
+        Value::Obj(id) => own_prop(&it.heap, id, &key).is_some(),
+        _ => false,
+    };
+    Ok(Value::Bool(hit))
+}
+
+fn n_obj_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let tag = match this {
+        Value::Undef => "[object Undefined]",
+        Value::Null => "[object Null]",
+        Value::Bool(_) => "[object Boolean]",
+        Value::Num(_) => "[object Number]",
+        Value::Str(_) => "[object String]",
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Arr { .. } => "[object Array]",
+            Obj::Func { .. } | Obj::Native { .. } => "[object Function]",
+            Obj::Dom(_) => "[object Node]",
+            Obj::Ordinary { .. } => "[object Object]",
+        },
+    };
+    Ok(Value::Str(it.heap.alloc_str(tag.into())?))
+}
+
+/// Object(x): pass objects through; else (and under `new`) a fresh Ordinary.
+fn n_object(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    if let Some(v @ Value::Obj(_)) = args.first().copied() {
+        return Ok(v);
+    }
+    if let Value::Obj(_) = this {
+        return Ok(this);
+    }
+    Ok(Value::Obj(it.obj_plain()?))
+}
+
+/// Own enumerable (key, value) pairs; arrays enumerate as index strings.
+fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
+    match v {
+        Value::Obj(id) => match h.obj(id) {
+            Obj::Ordinary { pairs, .. }
+            | Obj::Func { pairs, .. }
+            | Obj::Native { pairs, .. } => pairs.clone(),
+            Obj::Arr { items, .. } => {
+                items.iter().enumerate().map(|(i, x)| (i.to_string(), *x)).collect()
+            }
+            Obj::Dom(_) => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn n_obj_keys(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let pairs = own_pairs(&it.heap, arg(args, 0));
+    let mut out = Vec::with_capacity(pairs.len());
+    for (k, _) in pairs {
+        out.push(Value::Str(it.heap.alloc_str(k)?));
+    }
+    Ok(Value::Obj(it.arr_obj(out)?))
+}
+
+fn n_obj_values(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let pairs = own_pairs(&it.heap, arg(args, 0));
+    let out: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
+    Ok(Value::Obj(it.arr_obj(out)?))
+}
+
+fn n_obj_entries(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let pairs = own_pairs(&it.heap, arg(args, 0));
+    let mut out = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        let k = Value::Str(it.heap.alloc_str(k)?);
+        out.push(Value::Obj(it.arr_obj(vec![k, v])?));
+    }
+    Ok(Value::Obj(it.arr_obj(out)?))
+}
+
+fn n_obj_assign(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let target = arg(args, 0);
+    if !matches!(target, Value::Obj(_)) {
+        return Err(err("assign: target must be an object"));
+    }
+    for src in &args[1.min(args.len())..] {
+        for (k, v) in own_pairs(&it.heap, *src) {
+            set_prop(&mut it.heap, target, &k, v)?;
+        }
+    }
+    Ok(target)
+}
+
+fn n_obj_create(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let proto = match arg(args, 0) {
+        Value::Obj(id) => Some(id),
+        Value::Null => None,
+        _ => return Err(err("create: proto must be an object or null")),
+    };
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Ordinary { pairs: vec![], proto })?))
+}
+
+// -- Array ctor + statics --------------------------------------------------------
+
+/// Array(...): one numeric arg = length; anything else = the items.
+/// `new` ignores the Ordinary `this` and returns a real Arr.
+fn n_array(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let items = if args.len() == 1 {
+        match args[0] {
+            Value::Num(n) if n >= 0.0 && n.fract() == 0.0 && n <= 10_000_000.0 => {
+                vec![Value::Undef; n as usize]
+            }
+            v => vec![v],
+        }
+    } else {
+        args.to_vec()
+    };
+    Ok(Value::Obj(it.arr_obj(items)?))
+}
+
+fn n_is_array(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let b = match arg(args, 0) {
+        Value::Obj(id) => matches!(it.heap.obj(id), Obj::Arr { .. }),
+        _ => false,
+    };
+    Ok(Value::Bool(b))
+}
+
+fn n_array_of(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Obj(it.arr_obj(args.to_vec())?))
+}
+
+// -- primitive casts + number globals -------------------------------------------
+
+fn n_string_cast(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = match args.first() {
+        Some(v) => to_str(&it.heap, *v),
+        None => String::new(),
+    };
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+fn n_number_cast(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(to_num(&it.heap, arg(args, 0))))
+}
+
+fn n_boolean_cast(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Bool(truthy(&it.heap, arg(args, 0))))
+}
+
+fn n_parse_int(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = to_str(&it.heap, arg(args, 0));
+    let t = s.trim_start();
+    let (neg, t) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let mut radix = match args.get(1) {
+        Some(v) => to_num(&it.heap, *v) as u32,
+        None => 0,
+    };
+    let mut t = t;
+    if radix == 0 {
+        if let Some(r) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            radix = 16;
+            t = r;
+        } else {
+            radix = 10;
+        }
+    } else if radix == 16 {
+        t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    }
+    let mut n: f64 = 0.0;
+    let mut any = false;
+    for c in t.chars() {
+        match c.to_digit(radix) {
+            Some(d) => {
+                any = true;
+                n = n * radix as f64 + d as f64;
+            }
+            None => break,
+        }
+    }
+    Ok(Value::Num(if any {
+        if neg {
+            -n
+        } else {
+            n
+        }
+    } else {
+        f64::NAN
+    }))
+}
+
+fn n_parse_float(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = to_str(&it.heap, arg(args, 0));
+    let t = s.trim_start();
+    // longest valid float prefix: [+-] digits [. digits] [(e|E)[+-]digits]
+    let b = t.as_bytes();
+    let mut i = 0;
+    if matches!(b.get(i), Some(b'+') | Some(b'-')) {
+        i += 1;
+    }
+    let d0 = i;
+    while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+        i += 1;
+    }
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+            i += 1;
+        }
+    }
+    if i == d0 || (i == d0 + 1 && t.as_bytes()[d0] == b'.') {
+        return Ok(Value::Num(f64::NAN)); // no mantissa digits
+    }
+    if matches!(b.get(i), Some(b'e') | Some(b'E')) {
+        let save = i;
+        i += 1;
+        if matches!(b.get(i), Some(b'+') | Some(b'-')) {
+            i += 1;
+        }
+        let e0 = i;
+        while matches!(b.get(i), Some(c) if c.is_ascii_digit()) {
+            i += 1;
+        }
+        if i == e0 {
+            i = save; // bare 'e' doesn't count
+        }
+    }
+    Ok(Value::Num(t[..i].parse().unwrap_or(f64::NAN)))
+}
+
+fn n_is_nan(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Bool(to_num(&it.heap, arg(args, 0)).is_nan()))
+}
+
+fn n_is_finite(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Bool(to_num(&it.heap, arg(args, 0)).is_finite()))
+}
+
+// -- Function.prototype ------------------------------------------------------------
+
+fn n_fn_call(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let t = arg(args, 0);
+    it.call_value(this, t, &args[1.min(args.len())..], None)
+}
+
+fn n_fn_apply(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let t = arg(args, 0);
+    let argv = match arg(args, 1) {
+        Value::Obj(id) => arr_items(it, id),
+        Value::Undef | Value::Null => Vec::new(),
+        _ => return Err(err("apply: arg list must be an array")),
+    };
+    it.call_value(this, t, &argv, None)
+}
+
+// -- Array.prototype -------------------------------------------------------------
+// `this` is the receiver (an Arr); callbacks get (item, idx, arr) and the
+// optional thisArg in arg position 1 where real JS takes one.
+
+fn n_arr_push(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    if let Obj::Arr { items, .. } = it.heap.obj_mut(id) {
+        items.extend_from_slice(args);
+        return Ok(Value::Num(items.len() as f64));
+    }
+    Err(err("internal: not an array"))
+}
+
+fn n_arr_pop(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    if let Obj::Arr { items, .. } = it.heap.obj_mut(id) {
+        return Ok(items.pop().unwrap_or(Value::Undef));
+    }
+    Err(err("internal: not an array"))
+}
+
+fn n_arr_shift(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    if let Obj::Arr { items, .. } = it.heap.obj_mut(id) {
+        return Ok(if items.is_empty() { Value::Undef } else { items.remove(0) });
+    }
+    Err(err("internal: not an array"))
+}
+
+fn n_arr_unshift(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    if let Obj::Arr { items, .. } = it.heap.obj_mut(id) {
+        items.splice(0..0, args.iter().copied());
+        return Ok(Value::Num(items.len() as f64));
+    }
+    Err(err("internal: not an array"))
+}
+
+fn n_arr_map(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let f = arg(args, 0);
+    let t = arg(args, 1);
+    let items = arr_items(it, id);
+    let mut out = Vec::with_capacity(items.len());
+    for (i, x) in items.iter().enumerate() {
+        out.push(it.call_value(f, t, &cb_args(*x, i, this), None)?);
+    }
+    Ok(Value::Obj(it.arr_obj(out)?))
+}
+
+fn n_arr_filter(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let f = arg(args, 0);
+    let t = arg(args, 1);
+    let items = arr_items(it, id);
+    let mut out = Vec::new();
+    for (i, x) in items.iter().enumerate() {
+        let r = it.call_value(f, t, &cb_args(*x, i, this), None)?;
+        if truthy(&it.heap, r) {
+            out.push(*x);
+        }
+    }
+    Ok(Value::Obj(it.arr_obj(out)?))
+}
+
+fn n_arr_for_each(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let f = arg(args, 0);
+    let t = arg(args, 1);
+    let items = arr_items(it, id);
+    for (i, x) in items.iter().enumerate() {
+        it.call_value(f, t, &cb_args(*x, i, this), None)?;
+    }
+    Ok(Value::Undef)
+}
+
+fn n_arr_reduce(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let f = arg(args, 0);
+    let items = arr_items(it, id);
+    let (mut acc, start) = if args.len() > 1 {
+        (args[1], 0)
+    } else {
+        if items.is_empty() {
+            return Err(err("reduce of empty array"));
+        }
+        (items[0], 1)
+    };
+    for (i, x) in items.iter().enumerate().skip(start) {
+        acc = it.call_value(f, Value::Undef, &[acc, *x, Value::Num(i as f64), this], None)?;
+    }
+    Ok(acc)
+}
+
+fn n_arr_join(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let sep = match args.first() {
+        None | Some(Value::Undef) => ",".to_string(),
+        Some(v) => to_str(&it.heap, *v),
+    };
+    let s = arr_items(it, id)
+        .iter()
+        .map(|v| match v {
+            Value::Undef | Value::Null => String::new(),
+            _ => to_str(&it.heap, *v),
+        })
+        .collect::<Vec<_>>()
+        .join(&sep);
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+/// clamp a JS fromIndex: negative counts from the end.
+fn from_idx(n: f64, len: usize) -> usize {
+    let l = len as i64;
+    (if n < 0.0 { l + n as i64 } else { n as i64 }).clamp(0, l) as usize
+}
+
+fn n_arr_index_of(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let needle = arg(args, 0);
+    let items = arr_items(it, id);
+    let from = from_idx(to_num(&it.heap, arg(args, 1)), items.len());
+    Ok(Value::Num(
+        items[from..]
+            .iter()
+            .position(|x| strict_eq(&it.heap, *x, needle))
+            .map(|p| (p + from) as f64)
+            .unwrap_or(-1.0),
+    ))
+}
+
+fn n_arr_last_index_of(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let needle = arg(args, 0);
+    let items = arr_items(it, id);
+    let hi = match args.get(1) {
+        Some(v) => from_idx(to_num(&it.heap, *v) + 1.0, items.len()),
+        None => items.len(),
+    };
+    Ok(Value::Num(
+        items[..hi]
+            .iter()
+            .rposition(|x| strict_eq(&it.heap, *x, needle))
+            .map(|p| p as f64)
+            .unwrap_or(-1.0),
+    ))
+}
+
+fn n_arr_includes(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let needle = arg(args, 0);
+    let items = arr_items(it, id);
+    let from = from_idx(to_num(&it.heap, arg(args, 1)), items.len());
+    Ok(Value::Bool(items[from..].iter().any(|x| strict_eq(&it.heap, *x, needle))))
+}
+
+fn n_arr_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let items = arr_items(it, id);
+    let len = items.len() as i64;
+    let a = to_num(&it.heap, arg(args, 0)) as i64;
+    let b = match args.get(1) {
+        Some(v) => to_num(&it.heap, *v) as i64,
+        None => len,
+    };
+    let lo = (if a < 0 { len + a } else { a }).clamp(0, len) as usize;
+    let hi = (if b < 0 { len + b } else { b }).clamp(0, len) as usize;
+    let sub = if hi > lo { items[lo..hi].to_vec() } else { Vec::new() };
+    Ok(Value::Obj(it.arr_obj(sub)?))
+}
+
+fn n_arr_concat(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let mut out = arr_items(it, id);
+    for a in args {
+        match a {
+            Value::Obj(o) if matches!(it.heap.obj(*o), Obj::Arr { .. }) => {
+                out.extend(arr_items(it, *o));
+            }
+            v => out.push(*v),
+        }
+    }
+    Ok(Value::Obj(it.arr_obj(out)?))
+}
+
+fn n_arr_find(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let f = arg(args, 0);
+    let t = arg(args, 1);
+    let items = arr_items(it, id);
+    for (i, x) in items.iter().enumerate() {
+        let r = it.call_value(f, t, &cb_args(*x, i, this), None)?;
+        if truthy(&it.heap, r) {
+            return Ok(*x);
+        }
+    }
+    Ok(Value::Undef)
+}
+
+fn n_arr_find_index(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let f = arg(args, 0);
+    let t = arg(args, 1);
+    let items = arr_items(it, id);
+    for (i, x) in items.iter().enumerate() {
+        let r = it.call_value(f, t, &cb_args(*x, i, this), None)?;
+        if truthy(&it.heap, r) {
+            return Ok(Value::Num(i as f64));
+        }
+    }
+    Ok(Value::Num(-1.0))
+}
+
+fn n_arr_some(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let f = arg(args, 0);
+    let t = arg(args, 1);
+    let items = arr_items(it, id);
+    for (i, x) in items.iter().enumerate() {
+        let r = it.call_value(f, t, &cb_args(*x, i, this), None)?;
+        if truthy(&it.heap, r) {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn n_arr_every(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let f = arg(args, 0);
+    let t = arg(args, 1);
+    let items = arr_items(it, id);
+    for (i, x) in items.iter().enumerate() {
+        let r = it.call_value(f, t, &cb_args(*x, i, this), None)?;
+        if !truthy(&it.heap, r) {
+            return Ok(Value::Bool(false));
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+fn n_arr_reverse(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    if let Obj::Arr { items, .. } = it.heap.obj_mut(id) {
+        items.reverse();
+    }
+    Ok(this)
+}
+
+fn n_arr_sort(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let mut items = arr_items(it, id);
+    match args.first() {
+        Some(f @ Value::Obj(_)) => {
+            // insertion sort: the comparator can fail mid-way
+            for i in 1..items.len() {
+                let mut j = i;
+                while j > 0 {
+                    let c = it.call_value(*f, Value::Undef, &[items[j - 1], items[j]], None)?;
+                    if to_num(&it.heap, c) > 0.0 {
+                        items.swap(j - 1, j);
+                        j -= 1;
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+        // default: ascending ToString order
+        _ => {
+            let mut keyed: Vec<(String, usize)> = items
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (to_str(&it.heap, *v), i))
+                .collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            items = keyed.into_iter().map(|(_, i)| items[i]).collect();
+        }
+    }
+    if let Obj::Arr { items: dst, .. } = it.heap.obj_mut(id) {
+        *dst = items;
+    }
+    Ok(this)
+}
+
+fn n_arr_splice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let len = arr_items(it, id).len() as i64;
+    let start = {
+        let a = to_num(&it.heap, arg(args, 0)) as i64;
+        (if a < 0 { len + a } else { a.min(len) }).clamp(0, len) as usize
+    };
+    let del = match args.get(1) {
+        Some(v) => (to_num(&it.heap, *v) as i64).clamp(0, len - start as i64) as usize,
+        None => len as usize - start,
+    };
+    let ins: Vec<Value> = args[2.min(args.len())..].to_vec();
+    let removed = match it.heap.obj_mut(id) {
+        Obj::Arr { items, .. } => items.splice(start..start + del, ins).collect(),
+        _ => Vec::new(),
+    };
+    Ok(Value::Obj(it.arr_obj(removed)?))
+}
+
+fn flat_into(h: &Heap, out: &mut Vec<Value>, items: &[Value], depth: i64) {
+    for v in items {
+        match v {
+            Value::Obj(id) if depth > 0 && matches!(h.obj(*id), Obj::Arr { .. }) => {
+                if let Obj::Arr { items: inner, .. } = h.obj(*id) {
+                    let inner = inner.clone();
+                    flat_into(h, out, &inner, depth - 1);
+                }
+            }
+            _ => out.push(*v),
+        }
+    }
+}
+
+fn n_arr_flat(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let depth = match args.first() {
+        Some(v) => to_num(&it.heap, *v) as i64,
+        None => 1,
+    };
+    let items = arr_items(it, id);
+    let mut out = Vec::new();
+    flat_into(&it.heap, &mut out, &items, depth);
+    Ok(Value::Obj(it.arr_obj(out)?))
+}
+
+// -- String.prototype -------------------------------------------------------------
+// `this` is usually a Str; anything else goes through ToString first.
+
+fn this_str(it: &Interp, this: Value) -> String {
+    to_str(&it.heap, this)
+}
+
+/// JS-style slice bounds over a char vec.
+fn char_slice(chars: &[char], a: i64, b: i64) -> String {
+    let len = chars.len() as i64;
+    let lo = (if a < 0 { len + a } else { a }).clamp(0, len) as usize;
+    let hi = (if b < 0 { len + b } else { b }).clamp(0, len) as usize;
+    if hi > lo {
+        chars[lo..hi].iter().collect()
+    } else {
+        String::new()
+    }
+}
+
+fn n_str_split(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let parts: Vec<String> = match arg(args, 0) {
+        Value::Undef => vec![s],
+        sep => {
+            let sep = to_str(&it.heap, sep);
+            if sep.is_empty() {
+                s.chars().map(|c| c.to_string()).collect()
+            } else {
+                s.split(&sep).map(|p| p.to_string()).collect()
+            }
+        }
+    };
+    let parts = match args.get(1) {
+        Some(v) => {
+            let n = to_num(&it.heap, *v);
+            if n >= 0.0 {
+                parts.into_iter().take(n as usize).collect()
+            } else {
+                parts
+            }
+        }
+        None => parts,
+    };
+    let mut vals = Vec::with_capacity(parts.len());
+    for p in parts {
+        vals.push(Value::Str(it.heap.alloc_str(p)?));
+    }
+    Ok(Value::Obj(it.arr_obj(vals)?))
+}
+
+fn n_str_index_of(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let needle = to_str(&it.heap, arg(args, 0));
+    let chars: Vec<char> = s.chars().collect();
+    let from = from_idx(to_num(&it.heap, arg(args, 1)), chars.len());
+    let hay: String = chars[from..].iter().collect();
+    Ok(Value::Num(
+        hay.find(&needle).map(|p| (hay[..p].chars().count() + from) as f64).unwrap_or(-1.0),
+    ))
+}
+
+fn n_str_last_index_of(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let needle = to_str(&it.heap, arg(args, 0));
+    Ok(Value::Num(s.rfind(&needle).map(|p| s[..p].chars().count() as f64).unwrap_or(-1.0)))
+}
+
+fn n_str_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let chars: Vec<char> = s.chars().collect();
+    let a = to_num(&it.heap, arg(args, 0)) as i64;
+    let b = match args.get(1) {
+        Some(v) => to_num(&it.heap, *v) as i64,
+        None => chars.len() as i64,
+    };
+    Ok(Value::Str(it.heap.alloc_str(char_slice(&chars, a, b))?))
+}
+
+fn n_str_substring(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
+    let mut a = (to_num(&it.heap, arg(args, 0)) as i64).clamp(0, len);
+    let mut b = match args.get(1) {
+        Some(v) => (to_num(&it.heap, *v) as i64).clamp(0, len),
+        None => len,
+    };
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
+    }
+    Ok(Value::Str(it.heap.alloc_str(chars[a as usize..b as usize].iter().collect())?))
+}
+
+fn n_str_trim(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this).trim().to_string();
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+fn n_str_trim_start(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this).trim_start().to_string();
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+fn n_str_trim_end(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this).trim_end().to_string();
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+fn n_str_to_upper(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this).to_uppercase();
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+fn n_str_to_lower(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this).to_lowercase();
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+fn n_str_includes(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let needle = to_str(&it.heap, arg(args, 0));
+    Ok(Value::Bool(s.contains(&needle)))
+}
+
+fn n_str_starts_with(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let needle = to_str(&it.heap, arg(args, 0));
+    let chars: Vec<char> = s.chars().collect();
+    let from = from_idx(to_num(&it.heap, arg(args, 1)), chars.len());
+    let t: String = chars[from..].iter().collect();
+    Ok(Value::Bool(t.starts_with(&needle)))
+}
+
+fn n_str_ends_with(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let needle = to_str(&it.heap, arg(args, 0));
+    Ok(Value::Bool(s.ends_with(&needle)))
+}
+
+fn n_str_char_at(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let i = to_num(&it.heap, arg(args, 0));
+    let t = if i >= 0.0 {
+        s.chars().nth(i as usize).map(|c| c.to_string()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    Ok(Value::Str(it.heap.alloc_str(t)?))
+}
+
+fn n_str_char_code_at(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let i = to_num(&it.heap, arg(args, 0));
+    Ok(Value::Num(if i >= 0.0 {
+        s.chars().nth(i as usize).map(|c| c as u32 as f64).unwrap_or(f64::NAN)
+    } else {
+        f64::NAN
+    }))
+}
+
+/// replace(needle, repl): literal string/number needle, first occurrence,
+/// no $-patterns (no regex in this engine).
+fn n_str_replace(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let needle = to_str(&it.heap, arg(args, 0));
+    let repl = to_str(&it.heap, arg(args, 1));
+    Ok(Value::Str(it.heap.alloc_str(s.replacen(&needle, &repl, 1))?))
+}
+
+fn n_str_concat(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let mut s = this_str(it, this);
+    for a in args {
+        s.push_str(&to_str(&it.heap, *a));
+    }
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+fn n_str_repeat(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let n = to_num(&it.heap, arg(args, 0));
+    if !(n >= 0.0) || s.len().saturating_mul(n as usize) > 16_000_000 {
+        return Err(err("repeat: bad count"));
+    }
+    Ok(Value::Str(it.heap.alloc_str(s.repeat(n as usize))?))
+}
+
+fn pad_to(it: &mut Interp, this: Value, args: &[Value], start: bool) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let len = to_num(&it.heap, arg(args, 0)) as usize;
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() >= len || len > 1_000_000 {
+        return Ok(Value::Str(it.heap.alloc_str(s)?));
+    }
+    let pad = match args.get(1) {
+        Some(Value::Undef) | None => " ".to_string(),
+        Some(v) => to_str(&it.heap, *v),
+    };
+    let mut fill: Vec<char> = Vec::with_capacity(len - chars.len());
+    while fill.len() < len - chars.len() {
+        fill.extend(pad.chars());
+    }
+    fill.truncate(len - chars.len());
+    let mut out: String = if start {
+        fill.iter().collect::<String>() + &s
+    } else {
+        s.clone() + &fill.iter().collect::<String>()
+    };
+    if pad.is_empty() {
+        out = s; // real JS returns the string unpadded
+    }
+    Ok(Value::Str(it.heap.alloc_str(out)?))
+}
+
+fn n_str_pad_start(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    pad_to(it, this, args, true)
+}
+
+fn n_str_pad_end(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    pad_to(it, this, args, false)
+}
+
+// -- Number.prototype --------------------------------------------------------------
+
+fn n_num_to_fixed(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = to_num(&it.heap, this);
+    let s = if !n.is_finite() {
+        fmt_num(n)
+    } else {
+        let d = (to_num(&it.heap, arg(args, 0)) as i64).clamp(0, 20) as usize;
+        format!("{n:.d$}")
+    };
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+// -- Date ---------------------------------------------------------------------------
+
+fn now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as f64)
+        .unwrap_or(0.0)
+}
+
+/// Date(ms?) - `new Date` hands us a fresh Ordinary whose proto is already
+/// the Date proto (via Date.prototype); plain Date() allocates one. Epoch
+/// ms lives in the `__ms` prop. Date-only subset: no locale parsing.
+fn n_date(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let ms = match args.first() {
+        Some(v) if !matches!(v, Value::Undef) => to_num(&it.heap, *v),
+        _ => now_ms(),
+    };
+    if let Value::Obj(id) = this {
+        if matches!(it.heap.obj(id), Obj::Ordinary { .. }) {
+            set_prop(&mut it.heap, this, "__ms", Value::Num(ms))?;
+            return Ok(this);
+        }
+    }
+    let proto = po(it.protos.date);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Ordinary {
+        pairs: vec![("__ms".into(), Value::Num(ms))],
+        proto,
+    })?))
+}
+
+fn n_date_now(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(Value::Num(now_ms()))
+}
+
+fn n_date_get_time(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    Ok(match get_prop(&it.heap, &it.protos, this, "__ms")? {
+        Value::Num(n) => Value::Num(n),
+        _ => Value::Num(f64::NAN),
+    })
+}
+
+/// days since epoch -> (year, month, day); civil_from_days (Hinnant).
+fn civil(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m as u32, d as u32)
+}
+
+fn n_date_iso(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let ms = match get_prop(&it.heap, &it.protos, this, "__ms")? {
+        Value::Num(n) => n as i64,
+        _ => return Err(err("toISOString on a non-Date")),
+    };
+    let days = ms.div_euclid(86_400_000);
+    let rem = ms.rem_euclid(86_400_000);
+    let (y, mo, d) = civil(days);
+    let (h, mi, s, ms3) =
+        (rem / 3_600_000, rem % 3_600_000 / 60_000, rem % 60_000 / 1000, rem % 1000);
+    let t = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms3:03}Z");
+    Ok(Value::Str(it.heap.alloc_str(t)?))
+}
+
+// -- Math ----------------------------------------------------------------------------
+
+fn n_math_floor(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(to_num(&it.heap, arg(args, 0)).floor()))
+}
+fn n_math_ceil(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(to_num(&it.heap, arg(args, 0)).ceil()))
+}
+fn n_math_round(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    // JS rounds half toward +inf: floor(n + 0.5)
+    Ok(Value::Num((to_num(&it.heap, arg(args, 0)) + 0.5).floor()))
+}
+fn n_math_random(it: &mut Interp, _t: Value, _a: &[Value]) -> Result<Value, JsError> {
+    // xorshift64*; seed fixed at Interp::with_cap
+    it.rng ^= it.rng >> 12;
+    it.rng ^= it.rng << 25;
+    it.rng ^= it.rng >> 27;
+    let x = it.rng.wrapping_mul(0x2545F4914F6CDD1D);
+    Ok(Value::Num((x >> 11) as f64 / 9007199254740992.0))
+}
+fn n_math_max(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(
+        args.iter().fold(f64::NEG_INFINITY, |m, v| m.max(to_num(&it.heap, *v))),
+    ))
+}
+fn n_math_min(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(args.iter().fold(f64::INFINITY, |m, v| m.min(to_num(&it.heap, *v)))))
+}
+fn n_math_abs(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(to_num(&it.heap, arg(args, 0)).abs()))
+}
+fn n_math_pow(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(to_num(&it.heap, arg(args, 0)).powf(to_num(&it.heap, arg(args, 1)))))
+}
+fn n_math_sqrt(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(to_num(&it.heap, arg(args, 0)).sqrt()))
 }
 
 #[cfg(test)]
@@ -1316,5 +2424,210 @@ mod tests {
         let mut it = Interp::new();
         it.max_steps = 100;
         assert!(it.run("while(1){}").unwrap_err().0.contains("step"));
+    }
+
+    // ---- prototypes -----------------------------------------------------
+
+    #[test]
+    fn proto_lookup() {
+        // two levels: c -> b -> a
+        assert_eq!(
+            num("var a={x:1};var b=Object.create(a);var c=Object.create(b);c.x"),
+            1.0
+        );
+        // own prop shadows proto prop
+        assert_eq!(num("var b=Object.create({x:1});b.x=2;b.x"), 2.0);
+        // hasOwnProperty is own-only; the method itself comes via the chain
+        assert!(boolean("var b=Object.create({x:1});b.hasOwnProperty('x') === false"));
+        assert!(boolean("({a:1}).hasOwnProperty('a')"));
+        assert!(!boolean("({a:1}).hasOwnProperty('toString')"));
+        // 'in' walks the chain
+        assert!(boolean("'x' in Object.create({x:1})"));
+        assert!(boolean("'hasOwnProperty' in {}"));
+        assert!(!boolean("'zzz' in {}"));
+        // literals get Object.prototype
+        assert_eq!(disp("var o={a:1};o.toString()"), "[object Object]");
+        assert_eq!(disp("[1].toString()"), "[object Array]");
+        // null-proto object has nothing
+        assert_eq!(disp("typeof Object.create(null).hasOwnProperty"), "undefined");
+    }
+
+    #[test]
+    fn array_methods() {
+        assert_eq!(disp("[1,2,3].map(function(x){return x*2})"), "[2,4,6]");
+        // callback args: (item, idx, arr)
+        assert_eq!(
+            disp("[7,8].map(function(x,i,a){return i+':'+a.length}).join(',')"),
+            "0:2,1:2"
+        );
+        assert_eq!(disp("[1,2,3,4].filter(function(x){return x%2==0})"), "[2,4]");
+        assert_eq!(num("[1,2,3,4].reduce(function(a,b){return a+b})"), 10.0);
+        assert_eq!(num("[1,2,3,4].reduce(function(a,b){return a+b},10)"), 20.0);
+        assert!(errmsg("[].reduce(function(a,b){return a+b})").contains("empty"));
+        assert_eq!(disp("[1,2,3].join('-')"), "1-2-3");
+        assert_eq!(disp("[1,null,3].join('-')"), "1--3");
+        assert_eq!(num("var n=0;[1,2].forEach(function(x){n+=x});n"), 3.0);
+        assert_eq!(num("[5,6,5].indexOf(5)"), 0.0);
+        assert_eq!(num("[5,6,5].lastIndexOf(5)"), 2.0);
+        assert_eq!(num("[5,6,5].indexOf(5,1)"), 2.0);
+        assert!(boolean("[1,2].includes(2)"));
+        assert!(!boolean("[1,2].includes(9)"));
+        assert_eq!(disp("[9,8,7].slice(1)"), "[8,7]");
+        assert_eq!(disp("[1].concat([2,3],4)"), "[1,2,3,4]");
+        assert_eq!(num("[3,7,9].find(function(x){return x>4})"), 7.0);
+        assert_eq!(num("[3,7,9].findIndex(function(x){return x>4})"), 1.0);
+        assert!(boolean("[1,3].some(function(x){return x>2})"));
+        assert!(!boolean("[1,3].every(function(x){return x>2})"));
+        assert_eq!(disp("var a=[1,2,3];a.reverse();a"), "[3,2,1]");
+        // sort: default string order, or a comparator
+        assert_eq!(disp("[3,1,2].sort()"), "[1,2,3]");
+        assert_eq!(disp("[10,9,1].sort()"), "[1,10,9]");
+        assert_eq!(
+            disp("[10,9,1].sort(function(a,b){return a-b})"),
+            "[1,9,10]"
+        );
+        // splice: remove + insert, returns removed
+        assert_eq!(disp("var a=[1,2,3,4];var r=a.splice(1,2);r"), "[2,3]");
+        assert_eq!(disp("var a=[1,2,3,4];a.splice(1,2,'x');a"), "[1,\"x\",4]");
+        assert_eq!(disp("var a=[1,2];a.splice(1,0,'x','y');a"), "[1,\"x\",\"y\",2]");
+        assert_eq!(disp("[[1,2],[3]].flat()"), "[1,2,3]");
+        assert_eq!(disp("[[1,[2]]].flat()"), "[1,[2]]");
+        assert_eq!(disp("[[1,[2]]].flat(2)"), "[1,2]");
+        // mutating basics still mutate the same vec
+        assert_eq!(num("var a=[1];a.push(2,3);a.length"), 3.0);
+        assert_eq!(num("var a=[1,2];a.shift()"), 1.0);
+        assert_eq!(num("var a=[3];a.unshift(1,2);a[0]"), 1.0);
+        // index-syntax method call resolves through the proto too
+        assert_eq!(disp("var a=[1];a['push'](9);a"), "[1,9]");
+        assert!(boolean("Array.isArray([1])"));
+        assert!(!boolean("Array.isArray({})"));
+        assert_eq!(disp("Array.of(1,2,3)"), "[1,2,3]");
+        assert_eq!(num("new Array(3).length"), 3.0);
+        assert_eq!(disp("Array(1,2)"), "[1,2]");
+    }
+
+    #[test]
+    fn string_methods() {
+        assert_eq!(disp("' a,b '.trim().split(',')[1]"), "b");
+        assert_eq!(disp("'a,b,c'.split(',',2).join('|')"), "a|b");
+        assert_eq!(disp("'abc'.split('').length"), "3");
+        assert_eq!(disp("'x'.repeat(3)"), "xxx");
+        assert_eq!(disp("'5'.padStart(3,'0')"), "005");
+        assert_eq!(disp("'5'.padEnd(3,'0')"), "500");
+        assert_eq!(disp("'abc'.replace('b','X')"), "aXc");
+        assert_eq!(disp("'abab'.replace('b','X')"), "aXab");
+        assert_eq!(num("'abcabc'.lastIndexOf('b')"), 4.0);
+        assert_eq!(disp("'abcdef'.substring(4,2)"), "cd");
+        assert_eq!(disp("'  x'.trimStart()"), "x");
+        assert_eq!(disp("'x  '.trimEnd()"), "x");
+        assert!(boolean("'abc'.startsWith('ab')"));
+        assert!(boolean("'abc'.endsWith('bc')"));
+        assert!(boolean("'abc'.includes('b')"));
+        assert_eq!(disp("'a'.concat('b','c')"), "abc");
+        // via proto on a variable too
+        assert_eq!(disp("var s='hi';s.toUpperCase()"), "HI");
+    }
+
+    #[test]
+    fn object_statics() {
+        // insertion order kept
+        assert_eq!(disp("Object.keys({b:1,a:2}).join(',')"), "b,a");
+        assert_eq!(disp("Object.values({b:1,a:2}).join(',')"), "1,2");
+        assert_eq!(disp("Object.entries({a:1})[0].join('=')"), "a=1");
+        assert_eq!(disp("Object.keys([7,8])"), "[\"0\",\"1\"]");
+        // assign merges left to right
+        assert_eq!(disp("Object.assign({a:1},{b:2},{a:3})"), "{\"a\":3,\"b\":2}");
+        // create sets proto
+        assert_eq!(num("var o=Object.create({m:5});o.m"), 5.0);
+        // Number.prototype + globals
+        assert_eq!(disp("(3.14159).toFixed(2)"), "3.14");
+        assert_eq!(disp("var n=2;n.toFixed(3)"), "2.000");
+        assert_eq!(num("parseInt('42px')"), 42.0);
+        assert_eq!(num("parseInt('0x10')"), 16.0);
+        assert_eq!(num("parseInt('11',2)"), 3.0);
+        assert_eq!(num("parseFloat('1.5x')"), 1.5);
+        assert!(boolean("isNaN(parseFloat('x'))"));
+        assert_eq!(num("Number('12')+Number('3')"), 15.0);
+        assert_eq!(disp("String(9)+String(1)"), "91");
+        assert!(boolean("Boolean('x')"));
+        assert!(!boolean("Boolean(0)"));
+        assert!(boolean("isNaN(0/0)"));
+        assert!(boolean("isFinite(1/2)"));
+        assert!(!boolean("isFinite(1/0)"));
+    }
+
+    #[test]
+    fn new_and_instanceof() {
+        // proto wiring: instance sees F.prototype methods
+        assert_eq!(
+            num("function P(){this.x=3}P.prototype.m=function(){return this.x*2};var p=new P();p.m()"),
+            6.0
+        );
+        // no-paren form parses
+        assert_eq!(num("function P(){this.x=4}var p=new P;p.x"), 4.0);
+        // instanceof on both sides of true
+        assert!(boolean("function P(){}var p=new P();p instanceof P"));
+        assert!(boolean("function P(){}new P() instanceof Object"));
+        assert!(boolean("[1] instanceof Array"));
+        assert!(boolean("[] instanceof Object"));
+        assert!(!boolean("var q={};q instanceof Array"));
+        assert!(!boolean("5 instanceof Number"));
+        // functions chain through Function.prototype to Object.prototype
+        assert!(boolean("function f(){}f instanceof Object"));
+        // error on non-callable rhs
+        assert!(errmsg("1 instanceof {}").contains("not a function"));
+        // native ctor under new works and instanceof resolves
+        assert!(boolean("new Object() instanceof Object"));
+        assert!(boolean("new Date() instanceof Date"));
+        // explicit object return still wins
+        assert_eq!(num("function P(){return {y:8}}new P().y"), 8.0);
+        // replaced prototype is honored
+        assert!(boolean(
+            "function P(){}P.prototype={tag:9};var p=new P();p.tag===9 && p instanceof P"
+        ));
+    }
+
+    #[test]
+    fn fn_call_apply() {
+        assert_eq!(num("function f(a,b){return this.k+a+b}f.call({k:1},2,3)"), 6.0);
+        assert_eq!(num("function f(a,b){return this.k+a+b}f.apply({k:1},[2,3])"), 6.0);
+        assert_eq!(num("var o={k:10};function g(){return this.k}g.call(o)"), 10.0);
+        // call/apply reach Native fns too (String cast via call)
+        assert_eq!(disp("String.call(null,5)"), "5");
+    }
+
+    #[test]
+    fn math_and_date() {
+        assert_eq!(num("Math.floor(1.9)+Math.ceil(1.1)"), 3.0);
+        assert_eq!(num("Math.round(1.5)+Math.round(-1.5)"), 1.0); // 2 + -1
+        assert_eq!(num("Math.max(3,7,2)+Math.min(3,7,2)+Math.abs(-4)"), 13.0);
+        assert_eq!(num("Math.pow(2,10)+Math.sqrt(9)"), 1027.0);
+        assert!(boolean("Math.random()>=0 && Math.random()<1"));
+        assert!(boolean("Math.PI>3.14 && Math.E>2.7"));
+        assert_eq!(disp("typeof Date.now()"), "number");
+        assert_eq!(disp("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+        assert_eq!(num("new Date(0).getTime()"), 0.0);
+        assert_eq!(num("new Date(1234).valueOf()"), 1234.0);
+        assert_eq!(disp("Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+        // day math sanity: 86400000ms = next day
+        assert_eq!(disp("new Date(86400000).toISOString()"), "1970-01-02T00:00:00.000Z");
+    }
+
+    #[test]
+    fn proto_chain_guard() {
+        // deep chain: lookups cap at 64 hops, no hang
+        assert_eq!(
+            disp("var p={x:1};for(var i=0;i<200;i++){p=Object.create(p)}typeof p.zzz"),
+            "undefined"
+        );
+        assert_eq!(
+            num("var p={x:1};for(var i=0;i<200;i++){p=Object.create(p)}p.x === undefined ? 7 : p.x"),
+            7.0 // x sits deeper than the 64-hop cap
+        );
+        assert_eq!(num("var p={x:1};for(var i=0;i<10;i++){p=Object.create(p)}p.x"), 1.0);
+        // tight heap: proto/builtin installs hit the cap and skip; plain
+        // own-prop objects still work
+        let mut it = Interp::with_cap(128);
+        assert_eq!(it.run("var o={a:1};o.a").unwrap(), Value::Num(1.0));
     }
 }

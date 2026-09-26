@@ -10,7 +10,7 @@ use vigia_dom::{Dom, NodeData, NodeId};
 use vigia_session::CookieJar;
 
 use crate::ast::{Expr, Stmt};
-use crate::eval::{get_prop, set_prop, to_str, truthy};
+use crate::eval::{get_prop, nat, set_prop, to_str, truthy};
 use crate::{err, Interp, JsError, NetCtx, Obj, Value};
 
 /// Same list as vigia-html: these never get a close tag when serializing.
@@ -186,22 +186,20 @@ impl Interp {
         };
         self.env_declare(0, "document", doc);
         let (Ok(nav), Ok(loc)) = (
-            self.heap
-                .alloc_obj(Obj::Ordinary(vec![("userAgent".into(), Value::Str(ua))])),
-            self.heap
-                .alloc_obj(Obj::Ordinary(vec![("href".into(), Value::Str(href))])),
+            self.obj_pairs(vec![("userAgent".into(), Value::Str(ua))]),
+            self.obj_pairs(vec![("href".into(), Value::Str(href))]),
         ) else {
             return;
         };
         self.env_declare(0, "navigator", Value::Obj(nav));
         self.env_declare(0, "location", Value::Obj(loc));
-        if let Ok(w) = self.heap.alloc_obj(Obj::Ordinary(vec![
+        if let Ok(w) = self.obj_pairs(vec![
             ("document".into(), doc),
             ("navigator".into(), Value::Obj(nav)),
             ("location".into(), Value::Obj(loc)),
-        ])) {
-            if let Obj::Ordinary(ps) = self.heap.obj_mut(w) {
-                ps.push(("window".into(), Value::Obj(w)));
+        ]) {
+            if let Obj::Ordinary { pairs, .. } = self.heap.obj_mut(w) {
+                pairs.push(("window".into(), Value::Obj(w)));
             }
             self.env_declare(0, "window", Value::Obj(w));
         }
@@ -337,7 +335,7 @@ impl Interp {
         for n in ids {
             vals.push(self.dom_wrap(n)?);
         }
-        Ok(Value::Obj(self.heap.alloc_obj(Obj::Arr(vals))?))
+        Ok(Value::Obj(self.arr_obj(vals)?))
     }
 
     // ---- events --------------------------------------------------------
@@ -407,7 +405,7 @@ impl Interp {
         let Some(Stmt::Expr(Expr::Func(def))) = stmts.into_iter().next() else {
             return Err(err(format!("on{ty}: bad handler")));
         };
-        let f = Value::Obj(self.heap.alloc_obj(Obj::Func { def, env: 0 })?);
+        let f = Value::Obj(self.func_obj(def, 0)?);
         let this = self.dom_wrap(n)?;
         self.call_value(f, this, &[ev], None)?;
         Ok(())
@@ -417,20 +415,16 @@ impl Interp {
     fn new_event(&mut self, ty: &str, target: NodeId) -> Result<Value, JsError> {
         let ty = Value::Str(self.heap.alloc_str(ty.to_string())?);
         let tgt = self.dom_wrap(target)?;
-        let pd = self
-            .heap
-            .alloc_obj(Obj::Native("preventDefault", n_event_prevent_default))?;
-        let sp = self
-            .heap
-            .alloc_obj(Obj::Native("stopPropagation", n_event_stop_propagation))?;
-        Ok(Value::Obj(self.heap.alloc_obj(Obj::Ordinary(vec![
+        let pd = self.heap.alloc_obj(nat("preventDefault", n_event_prevent_default))?;
+        let sp = self.heap.alloc_obj(nat("stopPropagation", n_event_stop_propagation))?;
+        Ok(Value::Obj(self.obj_pairs(vec![
             ("type".into(), ty),
             ("target".into(), tgt),
             ("currentTarget".into(), Value::Null),
             ("defaultPrevented".into(), Value::Bool(false)),
             ("preventDefault".into(), Value::Obj(pd)),
             ("stopPropagation".into(), Value::Obj(sp)),
-        ]))?))
+        ])?))
     }
 
     /// A user-built object passed to dispatchEvent: overwrite `target` and
@@ -438,19 +432,15 @@ impl Interp {
     fn normalize_event(&mut self, ev: Value, target: NodeId) -> Result<(), JsError> {
         let tgt = self.dom_wrap(target)?;
         set_prop(&mut self.heap, ev, "target", tgt)?;
-        let pd = self
-            .heap
-            .alloc_obj(Obj::Native("preventDefault", n_event_prevent_default))?;
-        let sp = self
-            .heap
-            .alloc_obj(Obj::Native("stopPropagation", n_event_stop_propagation))?;
+        let pd = self.heap.alloc_obj(nat("preventDefault", n_event_prevent_default))?;
+        let sp = self.heap.alloc_obj(nat("stopPropagation", n_event_stop_propagation))?;
         for (k, v) in [
             ("currentTarget", Value::Null),
             ("defaultPrevented", Value::Bool(false)),
             ("preventDefault", Value::Obj(pd)),
             ("stopPropagation", Value::Obj(sp)),
         ] {
-            if matches!(get_prop(&self.heap, ev, k)?, Value::Undef) {
+            if matches!(get_prop(&self.heap, &self.protos, ev, k)?, Value::Undef) {
                 set_prop(&mut self.heap, ev, k, v)?;
             }
         }
@@ -464,12 +454,12 @@ impl Interp {
     }
 
     fn event_stopped(&self, ev: Value) -> bool {
-        matches!(get_prop(&self.heap, ev, "__stopped"), Ok(Value::Bool(true)))
+        matches!(get_prop(&self.heap, &self.protos, ev, "__stopped"), Ok(Value::Bool(true)))
     }
 
     fn event_prevented(&self, ev: Value) -> bool {
         matches!(
-            get_prop(&self.heap, ev, "defaultPrevented"),
+            get_prop(&self.heap, &self.protos, ev, "defaultPrevented"),
             Ok(Value::Bool(true))
         )
     }
@@ -497,7 +487,7 @@ impl Interp {
                 let ty = to_str(&self.heap, arg(0));
                 let f = arg(1);
                 let ok = matches!(f, Value::Obj(o)
-                    if matches!(self.heap.obj(o), Obj::Func { .. } | Obj::Native(..)));
+                    if matches!(self.heap.obj(o), Obj::Func { .. } | Obj::Native { .. }));
                 if !ok {
                     return Err(err("addEventListener needs a function"));
                 }
@@ -521,8 +511,8 @@ impl Interp {
             "dispatchEvent" => {
                 let ev = arg(0);
                 let ty = match ev {
-                    Value::Obj(o) if matches!(self.heap.obj(o), Obj::Ordinary(_)) => {
-                        match get_prop(&self.heap, ev, "type")? {
+                    Value::Obj(o) if matches!(self.heap.obj(o), Obj::Ordinary { .. }) => {
+                        match get_prop(&self.heap, &self.protos, ev, "type")? {
                             Value::Str(s) => self.heap.get_str(s).to_string(),
                             _ => return Err(err("dispatchEvent: event needs a type")),
                         }

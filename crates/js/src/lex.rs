@@ -25,7 +25,7 @@ pub struct Token {
 
 const KWS: &[&str] = &[
     "var", "let", "const", "function", "return", "if", "else", "while", "for", "break", "continue",
-    "true", "false", "null", "undefined", "typeof", "new", "in",
+    "true", "false", "null", "undefined", "typeof", "new", "in", "instanceof",
 ];
 
 /// Longest first: prefix order decides `>>>=` vs `>>>` vs `>>` vs `>`.

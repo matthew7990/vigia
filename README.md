@@ -96,13 +96,12 @@ Run it: `python3 bench/gen_corpus.py`, serve `bench/corpus/` on :8899, `python3 
 - [x] Persistent profiles: cookie jars on disk (`--profile`, own TSV format)
 - [ ] Own TLS 1.3 (replace the rustls exception)
 - [ ] HTML5 tree-construction hardening (implied end tags, adoption agency)
-- [ ] `vigia fill` + extended actions (select options, multi-step flows)
-- [ ] Embedded-JSON extraction (`__NEXT_DATA__`, `ld+json`) — JS-free SPA reads
+- [x] Embedded-JSON extraction (`__NEXT_DATA__`, `ld+json`) — JS-free SPA reads
 - [x] `vigia-js` core: own lexer + parser + tree-walking eval (ES5-ish subset, arena values, step/call/heap guards)
+- [x] Action layer: click/fill/submit resolved by snapshot ref against the live DOM
+- [x] Replay: `.vig` scripts + JSONL audit trail (`vigia run`)
 - [ ] JS <-> DOM bindings (execute page scripts, document.querySelector, mutation)
 - [ ] JS mark-sweep GC over the value arenas (hard cap already enforced)
-- [ ] Action layer: semantic click/fill resolved against the DOM
-- [ ] Recorder + replay artifacts for review
 - [ ] `vigia serve`: HTTP/MCP control surface for agent frameworks
 - [ ] Keep-alive pooling; parallel fetch engine (thread pool, RSS budget)
 

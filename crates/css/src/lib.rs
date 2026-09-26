@@ -361,11 +361,13 @@ fn parse_an_plus_b(s: &str) -> Result<(i32, i32), CssError> {
 }
 
 /// All element nodes matching any selector group, in document order.
+/// Detached/orphaned nodes never match: the arena never frees, so matches
+/// must be reachable from the root.
 pub fn query(dom: &Dom, input: &str) -> Result<Vec<NodeId>, CssError> {
     let groups = parse(input)?;
     let mut out = Vec::new();
     for id in 1..dom.nodes.len() as NodeId {
-        if !matches!(dom.node(id).data, NodeData::Element(_)) {
+        if !matches!(dom.node(id).data, NodeData::Element(_)) || !attached(dom, id) {
             continue;
         }
         if groups.iter().any(|g| matches_at(dom, id, g, g.compounds.len() - 1)) {
@@ -373,6 +375,18 @@ pub fn query(dom: &Dom, input: &str) -> Result<Vec<NodeId>, CssError> {
         }
     }
     Ok(out)
+}
+
+/// True when `id`'s ancestor chain reaches the document root.
+fn attached(dom: &Dom, id: NodeId) -> bool {
+    let mut cur = Some(id);
+    while let Some(p) = cur {
+        if p == dom.root() {
+            return true;
+        }
+        cur = dom.parent(p);
+    }
+    false
 }
 
 fn matches_at(dom: &Dom, id: NodeId, sel: &Selector, i: usize) -> bool {

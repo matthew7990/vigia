@@ -202,6 +202,57 @@ impl Dom {
         };
         el.attrs.retain(|(k, _)| self.interner.resolve(*k) != name);
     }
+
+    /// Unlink `id` from its parent (children list + parent pointer). The
+    /// node and its subtree stay in the arena.
+    pub fn detach(&mut self, id: NodeId) {
+        if let Some(p) = self.nodes[id as usize].parent.take() {
+            self.nodes[p as usize].children.retain(|&c| c != id);
+        }
+    }
+
+    /// Link an existing node under `parent`. Caller must detach first if
+    /// the node is already linked.
+    pub fn append_child_node(&mut self, parent: NodeId, id: NodeId) {
+        self.nodes[id as usize].parent = Some(parent);
+        self.nodes[parent as usize].children.push(id);
+    }
+
+    /// Drop all children links; the child nodes stay in the arena, orphaned.
+    pub fn clear_children(&mut self, id: NodeId) {
+        for c in std::mem::take(&mut self.nodes[id as usize].children) {
+            self.nodes[c as usize].parent = None;
+        }
+    }
+
+    /// Deep-copy src's children under `dst_parent`, re-interning names.
+    /// src and self must be different arenas (build a scratch Dom to parse
+    /// fragments, then adopt).
+    pub fn adopt_children(&mut self, src: &Dom, src_parent: NodeId, dst_parent: NodeId) {
+        for &c in src.children(src_parent) {
+            self.copy_subtree(src, c, dst_parent);
+        }
+    }
+
+    fn copy_subtree(&mut self, src: &Dom, src_id: NodeId, dst_parent: NodeId) {
+        match &src.node(src_id).data {
+            NodeData::Element(el) => {
+                let tag = src.interner.resolve(el.tag).to_string();
+                let attrs: Vec<(String, String)> = el
+                    .attrs
+                    .iter()
+                    .map(|(k, v)| (src.interner.resolve(*k).to_string(), v.clone()))
+                    .collect();
+                let new = self.element(dst_parent, &tag, attrs);
+                for &c in src.children(src_id) {
+                    self.copy_subtree(src, c, new);
+                }
+            }
+            NodeData::Text(t) => self.text(dst_parent, t),
+            NodeData::Comment(t) => self.comment(dst_parent, t),
+            NodeData::Document => {}
+        }
+    }
 }
 
 #[cfg(test)]

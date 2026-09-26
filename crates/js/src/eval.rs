@@ -9,8 +9,8 @@ use vigia_json::Json;
 
 use crate::ast::{Expr, FnDef, Stmt};
 use crate::{
-    err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, Obj, PromiseState, Protos,
-    ThenHandler, Timer, Value,
+    err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
+    Protos, ThenHandler, Timer, Value,
 };
 
 pub(crate) enum Flow {
@@ -1440,11 +1440,43 @@ fn n_json_stringify(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Val
 /// throwing (real fetch semantics). The response carries status/ok/
 /// redirected/url plus the body under `__body`; text()/json() read it off
 /// `this` and return resolved Promises like real Response methods.
+/// Truncate a body for the net trace - discovery needs the payload's
+/// shape, not megabytes of it.
+fn trunc_body(s: &str) -> String {
+    s.chars().take(4096).collect()
+}
+
+/// Read {method, headers, body} off a fetch() init object.
+fn fetch_init(it: &Interp, v: Value) -> (String, Vec<(String, String)>, Option<String>) {
+    let mut method = "GET".to_string();
+    let mut headers = Vec::new();
+    let mut body = None;
+    if let Value::Obj(_) = v {
+        if let Ok(Value::Str(s)) = get_prop(&it.heap, &it.protos, v, "method") {
+            method = it.heap.get_str(s).to_uppercase();
+        }
+        if let Ok(Value::Obj(o)) = get_prop(&it.heap, &it.protos, v, "headers") {
+            if let Obj::Ordinary { pairs, .. } = &it.heap.objs[o as usize] {
+                for (k, val) in pairs {
+                    if let Value::Str(s) = val {
+                        headers.push((k.clone(), it.heap.get_str(*s).to_string()));
+                    }
+                }
+            }
+        }
+        if let Ok(Value::Str(s)) = get_prop(&it.heap, &it.protos, v, "body") {
+            body = Some(it.heap.get_str(s).to_string());
+        }
+    }
+    (method, headers, body)
+}
+
 fn n_fetch(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     let raw = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
     if it.net.is_none() {
         return Err(err("fetch needs a page context"));
     }
+    let (method, headers, body) = fetch_init(it, args.get(1).copied().unwrap_or(Value::Undef));
     // ctx borrow ends before heap allocs below
     let res = {
         let ctx = it.net.as_mut().unwrap();
@@ -1452,7 +1484,33 @@ fn n_fetch(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsErr
             .base
             .join(&raw)
             .map_err(|e| err(format!("fetch: {e}")))?;
-        vigia_net::fetch(&url.to_string(), &mut ctx.jar).map_err(|e| format!("fetch: {e}"))
+        let res = vigia_net::req(
+            &url.to_string(),
+            &method,
+            &headers,
+            body.as_deref().map(str::as_bytes),
+            &mut ctx.jar,
+        )
+        .map_err(|e| format!("fetch: {e}"));
+        if let Some(trace) = &ctx.trace {
+            let mut ev = NetEvent {
+                method: method.clone(),
+                url: url.to_string(),
+                status: 0,
+                req_body: body.as_deref().map(trunc_body),
+                resp_body: None,
+                error: None,
+            };
+            match &res {
+                Ok(r) => {
+                    ev.status = r.status;
+                    ev.resp_body = Some(trunc_body(&r.text()));
+                }
+                Err(e) => ev.error = Some(e.clone()),
+            }
+            trace.borrow_mut().push(ev);
+        }
+        res
     };
     let p = promise_new(it)?;
     match res {

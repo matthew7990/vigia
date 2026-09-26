@@ -318,7 +318,7 @@ fn mcp_roundtrip() {
     let Json::Arr(tools) = j.get("result").unwrap().get("tools").unwrap() else {
         panic!("no tools")
     };
-    assert_eq!(tools.len(), 8);
+    assert_eq!(tools.len(), 9);
 
     // create a session via tools/call
     let (st, j) = http(

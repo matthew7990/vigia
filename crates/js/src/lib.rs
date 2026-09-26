@@ -132,13 +132,30 @@ pub enum Value {
 /// and already-evaled args.
 pub type NativeFn = fn(&mut Interp, this: Value, &[Value]) -> Result<Value, JsError>;
 
+/// One page-JS fetch() call, as Puppeteer's page.on('request'/'response')
+/// pair collapses into here: method + resolved url going out, status +
+/// bodies coming back. Bodies are truncated - the trace is for endpoint
+/// discovery and payload shape, not bulk capture.
+#[derive(Debug, Clone)]
+pub struct NetEvent {
+    pub method: String,
+    pub url: String,
+    /// HTTP status; 0 when the request never got a response.
+    pub status: u16,
+    pub req_body: Option<String>,
+    pub resp_body: Option<String>,
+    pub error: Option<String>,
+}
+
 /// Page network context for a script run: the URL the DOM came from
 /// (resolves relative fetch()/click() targets) plus the cookie jar. The
 /// jar is moved in for the run and handed back through ScriptsOutcome -
-/// no pointers, no lifetimes.
+/// no pointers, no lifetimes. `trace`, when installed, records every
+/// fetch() the page's JS makes so the host can list them.
 pub struct NetCtx {
     pub base: vigia_url::Url,
     pub jar: vigia_session::CookieJar,
+    pub trace: Option<std::rc::Rc<std::cell::RefCell<Vec<NetEvent>>>>,
 }
 
 #[derive(Debug)]

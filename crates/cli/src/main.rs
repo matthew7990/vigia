@@ -17,6 +17,7 @@ const USAGE: &str = "vigia - AI-native browser runtime
   vigia click <url> <#n>                 follow snapshot ref (link/submit)
   vigia submit <url> [-f css] -d k=v..   fill + submit a form (login flows)
   vigia req <url> [-X M] [-H 'K: V'].. [-d body]   raw API call on the session jar
+  vigia net <url>                        run page JS, list every fetch() it made
   vigia json <url> [a.b.0]               embedded JSON (__NEXT_DATA__, ld+json)
   vigia js <file.js> | -e \"<code>\"     run JavaScript (own interpreter)
   vigia run <file.vig> [--audit log.jsonl]  multi-step script + audit trail
@@ -107,22 +108,31 @@ fn parse_dom(
     res: &vigia_net::Response,
     js: bool,
     jar: &mut CookieJar,
-) -> (Dom, std::time::Duration, Option<String>) {
+) -> (
+    Dom,
+    std::time::Duration,
+    Option<String>,
+    Vec<vigia_js::NetEvent>,
+) {
     let t0 = Instant::now();
     let mut dom = Dom::new();
     vigia_html::parse(&res.text(), &mut dom);
     let mut nav = None;
+    let mut events = Vec::new();
     if js {
         let mut it = vigia_js::Interp::new();
+        let trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let out = it.run_scripts(
             dom,
             Some(vigia_js::NetCtx {
                 base: res.final_url.clone(),
                 jar: std::mem::take(jar),
+                trace: Some(trace.clone()),
             }),
         );
         dom = out.dom;
         nav = out.pending_nav;
+        events = trace.borrow().clone();
         if let Some(j) = out.jar {
             *jar = j;
         }
@@ -130,7 +140,7 @@ fn parse_dom(
             eprintln!("warn: js: {e}");
         }
     }
-    (dom, t0.elapsed(), nav)
+    (dom, t0.elapsed(), nav, events)
 }
 
 /// `vigia serve [--bind host:port]` - block forever on the HTTP+MCP API.
@@ -155,7 +165,7 @@ fn serve(args: Vec<String>) -> ! {
     eprintln!("vigia serve listening on http://{}", srv.addr());
     eprintln!(
         "endpoints: POST /session | GET /sessions | DELETE /session/:id | \
-         POST /session/:id/{{snap,click,fill,submit,extract,eval,run}} | POST /mcp | GET /health"
+         POST /session/:id/{{snap,click,fill,submit,extract,eval,run,net}} | POST /mcp | GET /health"
     );
     if !srv.addr().ip().is_loopback() {
         eprintln!("warn: no auth - a non-loopback bind is remote code execution");
@@ -265,13 +275,13 @@ fn main() {
         "snap" | "dom" => {
             let mut res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (mut dom, mut parse_ms, nav) = parse_dom(&res, js, &mut jar);
+            let (mut dom, mut parse_ms, nav, _events) = parse_dom(&res, js, &mut jar);
             if let Some(u) = nav {
                 // v1 navigation bridge: a script's click() asked for a
                 // page - follow it once, no chains.
                 res = fetch_page(&u, &mut jar);
                 report_fetch(&res);
-                let (d, ms, _) = parse_dom(&res, js, &mut jar);
+                let (d, ms, _, _) = parse_dom(&res, js, &mut jar);
                 dom = d;
                 parse_ms += ms;
             }
@@ -305,7 +315,7 @@ fn main() {
             });
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, parse_ms, _) = parse_dom(&res, js, &mut jar);
+            let (dom, parse_ms, _, _) = parse_dom(&res, js, &mut jar);
             let hits = match vigia_css::query(&dom, &sel) {
                 Ok(h) => h,
                 Err(e) => fail(format!("{e}")),
@@ -329,13 +339,13 @@ fn main() {
                 .unwrap_or_else(|| fail("click needs a ref: vigia click <url> <#n>"));
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, _, _) = parse_dom(&res, js, &mut jar);
+            let (dom, _, _, _) = parse_dom(&res, js, &mut jar);
             let res2 = match vigia_actions::click(&dom, &res.final_url, ref_n, &[], &mut jar) {
                 Ok(r) => r,
                 Err(e) => fail(format!("click failed: {e}")),
             };
             report_fetch(&res2);
-            let (dom2, _, _) = parse_dom(&res2, js, &mut jar);
+            let (dom2, _, _, _) = parse_dom(&res2, js, &mut jar);
             print!("{}", snapshot(&dom2));
             report("");
         }
@@ -362,7 +372,7 @@ fn main() {
             }
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, _, _) = parse_dom(&res, js, &mut jar);
+            let (dom, _, _, _) = parse_dom(&res, js, &mut jar);
             let res2 = match vigia_actions::submit_form(
                 &dom,
                 &res.final_url,
@@ -374,8 +384,38 @@ fn main() {
                 Err(e) => fail(format!("submit failed: {e}")),
             };
             report_fetch(&res2);
-            let (dom2, _, _) = parse_dom(&res2, js, &mut jar);
+            let (dom2, _, _, _) = parse_dom(&res2, js, &mut jar);
             print!("{}", snapshot(&dom2));
+            report("");
+        }
+        "net" => {
+            // Endpoint discovery: run the page's JS, list every fetch().
+            let res = fetch_page(&url, &mut jar);
+            report_fetch(&res);
+            let (dom, _, nav, mut events) = parse_dom(&res, true, &mut jar);
+            if let Some(u) = nav {
+                let res2 = fetch_page(&u, &mut jar);
+                report_fetch(&res2);
+                let (_, _, _, ev2) = parse_dom(&res2, true, &mut jar);
+                events.extend(ev2);
+            }
+            let _ = dom;
+            if events.is_empty() {
+                println!("(no fetch() calls recorded)");
+            }
+            for ev in &events {
+                let status = match &ev.error {
+                    Some(e) => format!("ERR {e}"),
+                    None => ev.status.to_string(),
+                };
+                println!("== {} {} -> {}", ev.method, ev.url, status);
+                if let Some(b) = &ev.req_body {
+                    println!("  send: {b}");
+                }
+                if let Some(b) = &ev.resp_body {
+                    println!("  got:  {b}");
+                }
+            }
             report("");
         }
         "req" => {
@@ -425,7 +465,7 @@ fn main() {
             let path = args.first().map(|s| s.as_str());
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, _, _) = parse_dom(&res, js, &mut jar);
+            let (dom, _, _, _) = parse_dom(&res, js, &mut jar);
             let mut found = 0;
             let mut seen = Vec::new();
             for sel in [

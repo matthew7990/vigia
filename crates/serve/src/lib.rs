@@ -37,6 +37,8 @@ struct Page {
     dom: Dom,
     url: Url,
     status: u16,
+    /// fetch() calls the page's JS made (load + later eval calls).
+    net_events: Vec<vigia_js::NetEvent>,
 }
 
 /// Owned by its worker thread end to end - nothing here crosses threads.
@@ -193,8 +195,9 @@ impl Server {
                             if m != "POST" {
                                 return jsend(405, err_json("method not allowed"));
                             }
-                            const OPS: &[&str] =
-                                &["snap", "click", "fill", "submit", "extract", "eval", "run"];
+                            const OPS: &[&str] = &[
+                                "snap", "click", "fill", "submit", "extract", "eval", "run", "net",
+                            ];
                             if !OPS.contains(op) {
                                 return jsend(404, err_json("unknown op"));
                             }
@@ -440,6 +443,35 @@ fn op(sess: &mut Session, name: &str, args: &Json) -> OpResult {
         }
         "eval" => op_eval(sess, arg_str(args, "code")?),
         "run" => op_run(sess, arg_str(args, "script")?),
+        "net" => {
+            // fetch() calls the page's JS made, Puppeteer
+            // page.on('request'/'response') style - endpoint discovery.
+            let p = sess.page.as_ref().ok_or((400, NO_PAGE.to_string()))?;
+            let events = p
+                .net_events
+                .iter()
+                .map(|e| {
+                    Json::Obj(vec![
+                        ("method".into(), Json::Str(e.method.clone())),
+                        ("url".into(), Json::Str(e.url.clone())),
+                        ("status".into(), Json::Num(e.status as f64)),
+                        (
+                            "req_body".into(),
+                            e.req_body.clone().map(Json::Str).unwrap_or(Json::Null),
+                        ),
+                        (
+                            "resp_body".into(),
+                            e.resp_body.clone().map(Json::Str).unwrap_or(Json::Null),
+                        ),
+                        (
+                            "error".into(),
+                            e.error.clone().map(Json::Str).unwrap_or(Json::Null),
+                        ),
+                    ])
+                })
+                .collect();
+            Ok(Json::Obj(vec![("events".into(), Json::Arr(events))]))
+        }
         _ => Err((404, "unknown op".into())),
     }
 }
@@ -466,8 +498,10 @@ fn load_follow(
     vigia_html::parse(&res.text(), &mut dom);
     let mut errs = Vec::new();
     let mut interp = None;
+    let mut net_events = Vec::new();
     if js {
         let mut it = vigia_js::Interp::new();
+        let trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         // The jar moves in for the script run and comes back in the outcome,
         // so page fetch() calls share cookies.
         let out = it.run_scripts(
@@ -475,9 +509,11 @@ fn load_follow(
             Some(vigia_js::NetCtx {
                 base: res.final_url.clone(),
                 jar: std::mem::take(jar),
+                trace: Some(trace.clone()),
             }),
         );
         dom = out.dom;
+        net_events = trace.borrow().clone();
         if let Some(j) = out.jar {
             *jar = j;
         }
@@ -505,6 +541,7 @@ fn load_follow(
             dom,
             url: res.final_url,
             status: res.status,
+            net_events,
         },
         interp,
         errs,
@@ -556,9 +593,11 @@ fn op_eval(sess: &mut Session, code: &str) -> OpResult {
             it.set_dom(dom);
             sess.interp_globals = true;
         }
+        let trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         it.net = Some(vigia_js::NetCtx {
             base: p.url.clone(),
             jar: std::mem::take(&mut sess.jar),
+            trace: Some(trace.clone()),
         });
     }
     let r = it.run(code);
@@ -567,6 +606,10 @@ fn op_eval(sess: &mut Session, code: &str) -> OpResult {
         p.dom = it.take_dom();
         if let Some(ctx) = it.net.take() {
             sess.jar = ctx.jar;
+            // fetch() calls made during eval join the page's trace.
+            if let Some(t) = ctx.trace {
+                p.net_events.extend(t.borrow().iter().cloned());
+            }
         }
     }
     match r {
@@ -704,6 +747,7 @@ fn subst_stmts(stmts: &[vigia_run::Stmt], vars: &[(String, String)]) -> Vec<vigi
                 vigia_run::Op::Extract(sel) => vigia_run::Op::Extract(resolve(sel, vars)),
                 vigia_run::Op::Json(p) => vigia_run::Op::Json(p.as_ref().map(|p| resolve(p, vars))),
                 vigia_run::Op::Expect(t) => vigia_run::Op::Expect(resolve(t, vars)),
+                vigia_run::Op::Net => vigia_run::Op::Net,
                 vigia_run::Op::Req {
                     url,
                     method,

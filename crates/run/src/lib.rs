@@ -26,6 +26,8 @@ pub enum Op {
     Extract(String),
     Json(Option<String>),
     Expect(String),
+    /// List the fetch() calls the page's JS made on load.
+    Net,
     /// Raw request against the session jar: the API-replay op.
     Req {
         url: String,
@@ -45,6 +47,7 @@ impl Op {
             Self::Extract(_) => "extract",
             Self::Json(_) => "json",
             Self::Expect(_) => "expect",
+            Self::Net => "net",
             Self::Req { .. } => "req",
         }
     }
@@ -68,6 +71,7 @@ impl Op {
             Self::Extract(sel) => sel.clone(),
             Self::Json(path) => path.clone().unwrap_or_default(),
             Self::Expect(sub) => sub.clone(),
+            Self::Net => String::new(),
             Self::Req { method, url, .. } => format!("{method} {url}"),
         }
     }
@@ -208,6 +212,7 @@ pub fn parse_script(src: &str) -> Result<Vec<Stmt>, RunError> {
                 _ => return Err(RunError(line, "json takes at most one argument".into())),
             },
             "expect" => Op::Expect(one_arg(&toks, line, "expect")?),
+            "net" if toks.len() == 1 => Op::Net,
             "req" => {
                 if toks.len() < 2 {
                     return Err(RunError(line, "req takes a url".into()));
@@ -260,6 +265,8 @@ struct Page {
     dom: Dom,
     url: Url,
     status: u16,
+    /// fetch() calls the page's JS made during load (`net` op reads this).
+    net_events: Vec<vigia_js::NetEvent>,
 }
 
 fn load(res: vigia_net::Response, js: bool, jar: &mut CookieJar) -> Page {
@@ -269,8 +276,10 @@ fn load(res: vigia_net::Response, js: bool, jar: &mut CookieJar) -> Page {
 fn load_follow(res: vigia_net::Response, js: bool, jar: &mut CookieJar, follow: bool) -> Page {
     let mut dom = Dom::new();
     vigia_html::parse(&res.text(), &mut dom);
+    let mut net_events = Vec::new();
     if js {
         let mut it = vigia_js::Interp::new();
+        let trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         // The jar moves in for the script run and comes back with any
         // cookies the page's fetch() calls picked up.
         let out = it.run_scripts(
@@ -278,9 +287,11 @@ fn load_follow(res: vigia_net::Response, js: bool, jar: &mut CookieJar, follow: 
             Some(vigia_js::NetCtx {
                 base: res.final_url.clone(),
                 jar: std::mem::take(jar),
+                trace: Some(trace.clone()),
             }),
         );
         dom = out.dom;
+        net_events = trace.borrow().clone();
         if let Some(j) = out.jar {
             *jar = j;
         }
@@ -304,6 +315,7 @@ fn load_follow(res: vigia_net::Response, js: bool, jar: &mut CookieJar, follow: 
         dom,
         url: res.final_url,
         status: res.status,
+        net_events,
     }
 }
 
@@ -385,6 +397,32 @@ fn exec(
             let p = page.as_ref().ok_or(NO_PAGE)?;
             if !vigia_snapshot::snapshot(&p.dom).contains(sub.as_str()) {
                 return Err(format!("expect failed: '{sub}' not in snapshot"));
+            }
+        }
+        Op::Net => {
+            let p = page.as_ref().ok_or(NO_PAGE)?;
+            if p.net_events.is_empty() {
+                out("(no fetch() calls recorded on this page)");
+            }
+            for ev in &p.net_events {
+                let status = match &ev.error {
+                    Some(e) => format!("ERR {e}"),
+                    None => ev.status.to_string(),
+                };
+                out(&format!("== {} {} -> {}", ev.method, ev.url, status));
+                if let Some(b) = &ev.req_body {
+                    out(&format!("  send: {b}"));
+                }
+                if let Some(b) = &ev.resp_body {
+                    out(&format!("  got:  {b}"));
+                }
+                // The copy-pasteable replay line - the agent's whole
+                // discovery->replay loop collapses into this.
+                let mut replay = format!("replay: req {} -X {}", ev.url, ev.method);
+                if let Some(b) = &ev.req_body {
+                    replay.push_str(&format!(" -d \"{}\"", b.replace('"', "\\\"")));
+                }
+                out(&replay);
             }
         }
         Op::Req {
@@ -551,6 +589,7 @@ fn subst_stmts(stmts: &[Stmt], vars: &[(String, String)]) -> Vec<Stmt> {
                 Op::Extract(sel) => Op::Extract(resolve(sel, vars)),
                 Op::Json(p) => Op::Json(p.as_ref().map(|p| resolve(p, vars))),
                 Op::Expect(t) => Op::Expect(resolve(t, vars)),
+                Op::Net => Op::Net,
                 Op::Req {
                     url,
                     method,

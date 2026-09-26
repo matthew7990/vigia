@@ -105,6 +105,7 @@ impl Server {
             "vigia_submit" => Some("submit"),
             "vigia_extract" => Some("extract"),
             "vigia_eval" => Some("eval"),
+            "vigia_net" => Some("net"),
             _ => return Err(McpFail::Rpc(-32602, format!("unknown tool: {name}"))),
         };
         let (status, j) = match op {
@@ -265,6 +266,12 @@ fn tools() -> Json {
             "evaluate javascript in the session's live page context",
             vec![sid(), ("code", prop("string", "javascript source"))],
             &["session_id", "code"],
+        ),
+        tool(
+            "vigia_net",
+            "list the fetch() calls the page's JS made (endpoint discovery)",
+            vec![sid()],
+            &["session_id"],
         ),
         tool(
             "vigia_session_close",

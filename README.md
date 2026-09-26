@@ -97,6 +97,7 @@ fill #2 "my password"
 click #3
 expect "Dashboard"
 extract li.item
+net    # every fetch() the page's JS fired (endpoint discovery)
 req https://api.example.com/data -H "Content-Type: application/json" -d "{\"a\":1}"
 ```
 

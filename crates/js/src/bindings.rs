@@ -1251,12 +1251,29 @@ mod tests {
                         Ok(n) => req.extend_from_slice(&chunk[..n]),
                     }
                 }
-                let line = String::from_utf8_lossy(&req)
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-                log2.lock().unwrap().push(line);
+                // read the body too (content-length) so tests can assert
+                // on the payload that hit the wire
+                let head = String::from_utf8_lossy(&req).to_string();
+                if let Some(n) = head.lines().find_map(|l| {
+                    l.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                }) {
+                    while req
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|i| req.len() - i - 4)
+                        < Some(n)
+                    {
+                        match s.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(m) => req.extend_from_slice(&chunk[..m]),
+                        }
+                    }
+                }
+                log2.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req).to_string());
                 let _ = s.write_all(body.as_bytes());
             }
         });
@@ -1468,6 +1485,7 @@ mod tests {
             Some(NetCtx {
                 base: vigia_url::Url::parse("http://a.com/dir/p").unwrap(),
                 jar: CookieJar::new(),
+                trace: None,
             }),
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
@@ -1519,17 +1537,56 @@ mod tests {
             Some(NetCtx {
                 base: vigia_url::Url::parse(&format!("http://127.0.0.1:{port}/dir/page")).unwrap(),
                 jar: CookieJar::new(),
+                trace: None,
             }),
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(page_title(&out.dom), "200:true:x:{\"name\":\"x\"}");
         // relative url resolved against the page url
-        assert_eq!(log.lock().unwrap()[0], "GET /api?x=1 HTTP/1.1");
+        assert!(log.lock().unwrap()[0].starts_with("GET /api?x=1 HTTP/1.1"));
         // Set-Cookie landed in the jar that came back out
         let jar = out.jar.unwrap();
         assert_eq!(jar.len(), 1);
         let u = vigia_url::Url::parse(&format!("http://127.0.0.1:{port}/other")).unwrap();
         assert_eq!(jar.header_for(&u).as_deref(), Some("sid=7"));
+    }
+
+    #[test]
+    fn fetch_post_init_and_net_trace() {
+        // fetch(url, {method,headers,body}) sends a real POST and the
+        // NetEvent trace captures it - the API-discovery primitive.
+        let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\n{\"r\":1}";
+        let (port, log) = serve(vec![resp.to_string()]);
+        let mut d = Dom::new();
+        vigia_html::parse(
+            "<html><body><script>\
+             fetch('/api', {method:'POST', headers:{'Content-Type':'application/json','X-A':'b'}, body:'{\"x\":9}'})\
+             .then(function(r){document.body.textContent=r.status})\
+             </script></body></html>",
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let out = it.run_scripts(
+            d,
+            Some(NetCtx {
+                base: vigia_url::Url::parse(&format!("http://127.0.0.1:{port}/dir/page")).unwrap(),
+                jar: CookieJar::new(),
+                trace: Some(trace.clone()),
+            }),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let wire = log.lock().unwrap()[0].clone();
+        assert!(wire.starts_with("POST /api "), "{wire}");
+        assert!(wire.contains("Content-Type: application/json"), "{wire}");
+        assert!(wire.contains("X-A: b"), "{wire}");
+        assert!(wire.contains("{\"x\":9}"), "{wire}");
+        let events = trace.borrow().clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].method, "POST");
+        assert!(events[0].url.ends_with("/api"));
+        assert_eq!(events[0].status, 200);
+        assert_eq!(events[0].req_body.as_deref(), Some("{\"x\":9}"));
     }
 
     #[test]
@@ -1557,6 +1614,7 @@ mod tests {
             Some(NetCtx {
                 base: vigia_url::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
                 jar: CookieJar::new(),
+                trace: None,
             }),
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
@@ -1584,6 +1642,7 @@ mod tests {
             Some(NetCtx {
                 base: vigia_url::Url::parse("http://127.0.0.1:1/").unwrap(),
                 jar: CookieJar::new(),
+                trace: None,
             }),
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
@@ -1601,6 +1660,7 @@ mod tests {
             Some(NetCtx {
                 base: vigia_url::Url::parse("http://127.0.0.1:1/").unwrap(),
                 jar: CookieJar::new(),
+                trace: None,
             }),
         );
         assert_eq!(out.errors.len(), 1);
@@ -1673,6 +1733,7 @@ mod tests {
             Some(NetCtx {
                 base: vigia_url::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
                 jar: CookieJar::new(),
+                trace: None,
             }),
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
@@ -1703,6 +1764,7 @@ mod tests {
             Some(NetCtx {
                 base: vigia_url::Url::parse(base).unwrap(),
                 jar: CookieJar::new(),
+                trace: None,
             }),
         )
     }
@@ -1724,7 +1786,7 @@ mod tests {
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         // relative src resolved against the page url
-        assert_eq!(log.lock().unwrap()[0], "GET /ext.js HTTP/1.1");
+        assert!(log.lock().unwrap()[0].starts_with("GET /ext.js HTTP/1.1"));
         // the external's global is visible to the later inline script
         assert_eq!(page_title(&out.dom), "EXT");
         assert!(out.jar.is_some());

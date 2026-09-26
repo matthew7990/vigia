@@ -7,6 +7,7 @@ members = [
     "crates/dom",
     "crates/html",
     "crates/inflate",
+    "crates/json",
     "crates/mem",
     "crates/net",
     "crates/session",

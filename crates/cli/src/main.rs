@@ -16,6 +16,7 @@ const USAGE: &str = "vigia - AI-native browser runtime
   vigia extract <url> <css>              elements matching a CSS selector
   vigia click <url> <#n>                 follow snapshot ref (link/submit)
   vigia submit <url> [-f css] -d k=v..   fill + submit a form (login flows)
+  vigia json <url> [a.b.0]               embedded JSON (__NEXT_DATA__, ld+json)
 
   --profile <name>                       persistent cookie jar (~/.vigia/profiles)
 
@@ -248,6 +249,46 @@ fn main() {
             let (dom2, _) = parse_dom(&res2);
             print!("{}", snapshot(&dom2));
             report("");
+        }
+        "json" => {
+            let path = args.first().map(|s| s.as_str());
+            let res = fetch_page(&url, &mut jar);
+            report_fetch(&res);
+            let (dom, _) = parse_dom(&res);
+            let mut found = 0;
+            let mut seen = Vec::new();
+            for sel in [
+                "script#__NEXT_DATA__",
+                "script[type=\"application/ld+json\"]",
+                "script[type=\"application/json\"]",
+            ] {
+                let hits = vigia_css::query(&dom, sel).unwrap_or_default();
+                for id in hits {
+                    if seen.contains(&id) {
+                        continue;
+                    }
+                    seen.push(id);
+                    let raw = vigia_actions::text_content(&dom, id);
+                    match vigia_json::Json::parse(raw.trim()) {
+                        Ok(v) => {
+                            found += 1;
+                            let out = match path {
+                                Some(p) => v.get(p).map(|x| x.to_string()),
+                                None => Some(v.to_string()),
+                            };
+                            match out {
+                                Some(s) => println!("== {sel}\n{s}"),
+                                None => println!("== {sel}\n(no match for path)"),
+                            }
+                        }
+                        Err(e) => eprintln!("warn: {sel}: {e}"),
+                    }
+                }
+            }
+            if found == 0 {
+                eprintln!("no embedded JSON blocks found");
+            }
+            report(&format!("{} blocks", found));
         }
         _ => {
             eprint!("{USAGE}");

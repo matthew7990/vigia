@@ -121,6 +121,7 @@ dependencies = [
  "vigia-css",
  "vigia-dom",
  "vigia-html",
+ "vigia-json",
  "vigia-mem",
  "vigia-net",
  "vigia-session",
@@ -164,6 +165,10 @@ dependencies = [
 
 [[package]]
 name = "vigia-inflate"
+version = "0.1.0"
+
+[[package]]
+name = "vigia-json"
 version = "0.1.0"
 
 [[package]]

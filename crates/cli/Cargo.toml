@@ -14,6 +14,7 @@ vigia-actions = { path = "../actions" }
 vigia-css = { path = "../css" }
 vigia-dom = { path = "../dom" }
 vigia-html = { path = "../html" }
+vigia-json = { path = "../json" }
 vigia-mem = { path = "../mem" }
 vigia-net = { path = "../net" }
 vigia-session = { path = "../session" }

@@ -71,15 +71,23 @@ pub struct ScriptsOutcome {
     pub pending_nav: Option<String>,
 }
 
-/// Inline <script> bodies in document order. Skipped: `src` (external) and
-/// `type` values that are not javascript-ish (ld+json, templates, ...).
-fn collect_scripts(dom: &Dom) -> Vec<String> {
+/// Most external <script src> fetches one page run may do (runaway guard).
+const MAX_EXT_SCRIPTS: u32 = 32;
+
+/// One runnable <script> in document order: inline source, or an external
+/// `src` attr value (raw - resolving needs the page URL out of NetCtx).
+enum ScriptSource {
+    Inline(String),
+    External(String),
+}
+
+/// Runnable <script> sources in document order. A `src` attr wins over any
+/// inline body, like browsers. Skipped: `type` values that are not
+/// javascript-ish (ld+json, templates, ...).
+fn collect_scripts(dom: &Dom) -> Vec<ScriptSource> {
     let mut out = Vec::new();
     for id in 1..dom.nodes.len() as NodeId {
         if dom.tag_name(id) != Some("script") {
-            continue;
-        }
-        if dom.attr(id, "src").is_some() {
             continue;
         }
         let ty = dom
@@ -90,9 +98,14 @@ fn collect_scripts(dom: &Dom) -> Vec<String> {
         if !matches!(ty.as_str(), "" | "text/javascript" | "application/javascript" | "module") {
             continue;
         }
-        let mut s = String::new();
-        raw_text(dom, id, &mut s);
-        out.push(s);
+        match dom.attr(id, "src") {
+            Some(src) => out.push(ScriptSource::External(src.to_string())),
+            None => {
+                let mut s = String::new();
+                raw_text(dom, id, &mut s);
+                out.push(ScriptSource::Inline(s));
+            }
+        }
     }
     out
 }
@@ -199,11 +212,15 @@ impl Interp {
         self.dom.take().unwrap_or_default()
     }
 
-    /// Run every runnable inline <script> in document order over one shared
-    /// interp (globals persist across tags, like browsers). A script that
-    /// throws does not abort the page: errors collect into the outcome.
-    /// `net` installs the page context for fetch()/click() URL resolution;
-    /// its cookie jar is moved in and handed back in the outcome.
+    /// Run every runnable <script> in document order over one shared
+    /// interp (globals persist across tags, like browsers): inline bodies
+    /// eval directly, `src` bodies fetch through `net` first, so a later
+    /// script sees an earlier external's globals. A script that throws -
+    /// or fails to fetch - does not abort the page: errors collect into
+    /// the outcome.
+    /// `net` installs the page context for fetch()/click() URL resolution
+    /// and external script fetches; its cookie jar is moved in and handed
+    /// back in the outcome. With no `net`, external scripts skip silently.
     /// After the scripts, "DOMContentLoaded" fires on document - the
     /// common SPA boot hook.
     pub fn run_scripts(&mut self, dom: Dom, net: Option<NetCtx>) -> ScriptsOutcome {
@@ -215,9 +232,24 @@ impl Interp {
         }
         self.net = net;
         let mut errs = Vec::new();
-        for src in &scripts {
-            if let Err(e) = self.run(src) {
-                errs.push(e);
+        let mut fetched = 0;
+        for s in &scripts {
+            match s {
+                ScriptSource::Inline(src) => {
+                    if let Err(e) = self.run(src) {
+                        errs.push(e);
+                    }
+                }
+                ScriptSource::External(raw) => match self.fetch_script(raw, &mut fetched) {
+                    Ok(Some(body)) => {
+                        if let Err(e) = self.run(&body) {
+                            errs.push(e);
+                        }
+                    }
+                    // no net ctx installed: skip silently
+                    Ok(None) => {}
+                    Err(e) => errs.push(e),
+                },
             }
         }
         if let Err(e) = self.fire(0, "DOMContentLoaded") {
@@ -229,6 +261,31 @@ impl Interp {
             jar: self.net.take().map(|c| c.jar),
             pending_nav: self.pending_nav.take(),
         }
+    }
+
+    /// Fetch an external <script src> body through the page net ctx.
+    /// Ok(None) = skipped silently (no net ctx). Err = rejected or the
+    /// fetch failed; the caller records it in the outcome.
+    fn fetch_script(&mut self, raw: &str, fetched: &mut u32) -> Result<Option<String>, JsError> {
+        let Some(ctx) = self.net.as_mut() else {
+            return Ok(None);
+        };
+        let url = ctx
+            .base
+            .join(raw)
+            .map_err(|e| err(format!("script src {raw}: {e}")))?;
+        if !matches!(url.scheme.as_str(), "http" | "https") {
+            return Err(err(format!("script src {raw}: {} scheme", url.scheme)));
+        }
+        if *fetched >= MAX_EXT_SCRIPTS {
+            return Err(err(format!(
+                "script src {raw}: over the {MAX_EXT_SCRIPTS}-script cap"
+            )));
+        }
+        *fetched += 1;
+        let res = vigia_net::fetch(&url.to_string(), &mut ctx.jar)
+            .map_err(|e| err(format!("script src {url}: {e}")))?;
+        Ok(Some(res.text()))
     }
 
     pub(crate) fn dom_ref(&self) -> Result<&Dom, JsError> {
@@ -1353,5 +1410,109 @@ mod tests {
         );
         assert_eq!(out.errors.len(), 1);
         assert!(out.errors[0].0.contains("fetch"), "{}", out.errors[0].0);
+    }
+
+    // ---- external <script src> --------------------------------------------
+
+    /// Parse `html` and run its scripts under a NetCtx rooted at `base`.
+    fn run_page(html: &str, base: &str) -> ScriptsOutcome {
+        let mut d = Dom::new();
+        vigia_html::parse(html, &mut d);
+        Interp::new().run_scripts(
+            d,
+            Some(NetCtx {
+                base: vigia_url::Url::parse(base).unwrap(),
+                jar: CookieJar::new(),
+            }),
+        )
+    }
+
+    #[test]
+    fn external_script_runs_in_document_order() {
+        let js = "function fromExt(){return 'EXT'}";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\n\r\n{}",
+            js.len(),
+            js
+        );
+        let (port, log) = serve(vec![resp]);
+        let out = run_page(
+            "<html><head><title>o</title>\
+             <script src=\"/ext.js\"></script>\
+             <script>document.title = fromExt()</script></head><body></body></html>",
+            &format!("http://127.0.0.1:{port}/dir/page"),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        // relative src resolved against the page url
+        assert_eq!(log.lock().unwrap()[0], "GET /ext.js HTTP/1.1");
+        // the external's global is visible to the later inline script
+        assert_eq!(page_title(&out.dom), "EXT");
+        assert!(out.jar.is_some());
+    }
+
+    #[test]
+    fn external_script_fetch_failure_collects() {
+        // port 1 is closed: the io failure lands as a page error and the
+        // later inline script still runs
+        let out = run_page(
+            "<html><head><title>o</title>\
+             <script src=\"http://127.0.0.1:1/dead.js\"></script>\
+             <script>document.title = 'alive'</script></head><body></body></html>",
+            "http://127.0.0.1:1/",
+        );
+        assert_eq!(out.errors.len(), 1);
+        assert!(out.errors[0].0.contains("dead.js"), "{}", out.errors[0].0);
+        assert_eq!(page_title(&out.dom), "alive");
+    }
+
+    #[test]
+    fn external_script_eval_failure_collects() {
+        // fetched fine but doesn't parse - error recorded, page survives
+        let js = "this is not js {{{";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\n\r\n{}",
+            js.len(),
+            js
+        );
+        let (port, _log) = serve(vec![resp]);
+        let out = run_page(
+            "<html><head><title>o</title>\
+             <script src=\"bad.js\"></script>\
+             <script>document.title = 'alive'</script></head><body></body></html>",
+            &format!("http://127.0.0.1:{port}/"),
+        );
+        assert_eq!(out.errors.len(), 1);
+        assert_eq!(page_title(&out.dom), "alive");
+    }
+
+    #[test]
+    fn external_script_non_http_scheme_skipped() {
+        let out = run_page(
+            "<html><head><title>o</title>\
+             <script src=\"data:text/javascript,var z=1\"></script>\
+             <script src=\"javascript:void 0\"></script>\
+             <script>document.title = 'ok'</script></head><body></body></html>",
+            "http://a.com/",
+        );
+        // skipped, but each leaves an error entry as the signal
+        assert_eq!(out.errors.len(), 2);
+        assert!(out.errors[0].0.contains("data scheme"), "{}", out.errors[0].0);
+        assert!(out.errors[1].0.contains("javascript scheme"), "{}", out.errors[1].0);
+        assert_eq!(page_title(&out.dom), "ok");
+    }
+
+    #[test]
+    fn external_script_no_net_skipped_silently() {
+        let mut d = Dom::new();
+        vigia_html::parse(
+            "<html><head><title>o</title>\
+             <script src=\"http://127.0.0.1:1/dead.js\"></script>\
+             <script>document.title = 'ok'</script></head><body></body></html>",
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(d, None);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(page_title(&out.dom), "ok");
     }
 }

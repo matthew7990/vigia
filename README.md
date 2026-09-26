@@ -54,9 +54,34 @@ status 200 | 341 B wire -> 236 B body | connect 0ms tls 0ms ttfb 1ms total 1ms
 [metrics] parse 0ms snap 0ms | nodes 20 | ~59 -> ~70 tokens | heap peak 7.9 KB | rss peak 2.6 MB
 ```
 
+## Benchmark: vigia vs lightpanda
+
+The comparison target is [lightpanda](https://github.com/lightpanda-io/browser) —
+the only other from-scratch AI browser. `bench/` generates a deterministic
+corpus and measures wall time, peak RSS (wait4), and output size of the
+agent-facing dump (`vigia snap` vs `lightpanda fetch --dump semantic_tree_text`).
+
+```
+page             tool              ms   rss_mb    out_b  ~tokens rc
+article.html     vigia            5.3      9.6    54815    13703  0
+article.html     lightpanda     325.4     22.2   232208    58052  0
+small.html       vigia            3.2      9.6      172       43  0
+small.html       lightpanda     295.4     21.8      152       38  0
+table.html       vigia           10.5      9.6   188537    47134  0
+table.html       lightpanda     452.0     26.3   100008    25002  0
+```
+
+- **Speed: vigia is ~40-90x faster.** Lightpanda boots a JS runtime per page; vigia has nothing to boot.
+- **Memory: vigia uses ~2.3x less RSS** (9.6 MB vs ~22 MB).
+- **Tokens: vigia wins on content-heavy pages** (4x smaller on article) and carries `-> href` / `#n` refs that lightpanda's text dump omits. On link/table-heavy pages lightpanda is smaller precisely because it drops link targets — a second CDP call is needed to actually navigate.
+
+Run it: `python3 bench/gen_corpus.py`, serve `bench/corpus/` on :8899, `python3 bench/run.py`.
+
 ## Roadmap
 
 - [x] Own HTTP/1.1 + URL parser + inflate + TLS boundary
+- [x] Semantic snapshot v2: roles, inlined names, `#n` interactive refs, collapsed wrappers
+- [x] Benchmark harness vs lightpanda (`bench/`)
 - [ ] Own TLS 1.3 (replace the rustls exception)
 - [ ] HTML entities + charset decoding (latin-1/win-1252 -> UTF-8)
 - [ ] HTML5 tree-construction hardening (implied end tags, adoption agency)

@@ -105,30 +105,43 @@ pub fn form_fields(dom: &Dom, form: NodeId) -> Vec<(String, String)> {
                 }
             }
             "select" => {
-                let mut opts = Vec::new();
-                descendants(dom, id, &mut opts);
-                let mut value = None;
-                let mut first = None;
-                for o in opts {
-                    if dom.tag_name(o) != Some("option") {
-                        continue;
+                // A `value` on the select itself (set by fill) wins over
+                // the option markup.
+                let v = match dom.attr(id, "value") {
+                    Some(v) => v.to_string(),
+                    None => {
+                        let mut opts = Vec::new();
+                        descendants(dom, id, &mut opts);
+                        let mut picked = None;
+                        let mut first = None;
+                        for o in opts {
+                            if dom.tag_name(o) != Some("option") {
+                                continue;
+                            }
+                            let ov = dom
+                                .attr(o, "value")
+                                .map(str::to_string)
+                                .unwrap_or_else(|| text_content(dom, o));
+                            if first.is_none() {
+                                first = Some(ov.clone());
+                            }
+                            if dom.attr(o, "selected").is_some() {
+                                picked = Some(ov);
+                                break;
+                            }
+                        }
+                        picked.or(first).unwrap_or_default()
                     }
-                    let v = dom
-                        .attr(o, "value")
-                        .map(str::to_string)
-                        .unwrap_or_else(|| text_content(dom, o));
-                    if first.is_none() {
-                        first = Some(v.clone());
-                    }
-                    if dom.attr(o, "selected").is_some() {
-                        value = Some(v);
-                        break;
-                    }
-                }
-                fields.push((name.to_string(), value.or(first).unwrap_or_default()));
+                };
+                fields.push((name.to_string(), v));
             }
             "textarea" => {
-                fields.push((name.to_string(), text_content(dom, id)));
+                // A `value` attr (set by fill) wins over the initial text.
+                let v = dom
+                    .attr(id, "value")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| text_content(dom, id));
+                fields.push((name.to_string(), v));
             }
             _ => {}
         }
@@ -242,6 +255,35 @@ pub fn submit_node(
     }
 }
 
+/// Set the value of form control `#n` (the ref shown in the snapshot), in
+/// place. input/textarea get a `value` attr; checkbox/radio also toggle
+/// `checked` (""/"off"/"false"/"0" uncheck); select records `value`, which
+/// form_fields prefers over `selected` options.
+pub fn fill(dom: &mut Dom, ref_n: usize, value: &str) -> Result<NodeId, ActionError> {
+    let node = vigia_snapshot::interactive_refs(dom)
+        .get(ref_n.saturating_sub(1))
+        .copied()
+        .ok_or(ActionError::NotFound("no element for ref"))?;
+
+    match dom.tag_name(node) {
+        Some("input") => {
+            if matches!(dom.attr(node, "type").unwrap_or("text"), "checkbox" | "radio") {
+                // checkable inputs keep their markup `value`; fill only toggles
+                if matches!(value, "" | "off" | "false" | "0") {
+                    dom.remove_attr(node, "checked");
+                } else {
+                    dom.set_attr(node, "checked", "checked");
+                }
+            } else {
+                dom.set_attr(node, "value", value);
+            }
+        }
+        Some("textarea") | Some("select") => dom.set_attr(node, "value", value),
+        _ => return Err(ActionError::Unsupported("fill needs input/textarea/select")),
+    }
+    Ok(node)
+}
+
 /// Follow interactive element `#n` (the ref shown in the snapshot).
 /// link -> navigate; button/submit-input inside a form -> submit it.
 pub fn click(
@@ -325,6 +367,73 @@ mod tests {
                 ("n".into(), "hello".into())
             ]
         );
+    }
+
+    #[test]
+    fn fill_updates_form_fields() {
+        // The contract: what fill() writes is what form_fields() reports.
+        let mut dom = Dom::new();
+        let form = dom.element(dom.root(), "form", vec![]);
+        dom.element(
+            form,
+            "input",
+            vec![("name".into(), "u".into()), ("value".into(), "x".into())],
+        );
+        let ta = dom.element(form, "textarea", vec![("name".into(), "n".into())]);
+        dom.text(ta, "initial");
+        let sel = dom.element(form, "select", vec![("name".into(), "s".into())]);
+        dom.element(sel, "option", vec![("value".into(), "a".into())]);
+        dom.element(
+            sel,
+            "option",
+            vec![("value".into(), "b".into()), ("selected".into(), "".into())],
+        );
+        // Refs: #1 input, #2 textarea, #3 select.
+        assert_eq!(
+            fill(&mut dom, 9, "v").unwrap_err().to_string(),
+            "not found: no element for ref"
+        );
+        fill(&mut dom, 1, "new").unwrap();
+        fill(&mut dom, 2, "filled").unwrap();
+        fill(&mut dom, 3, "a").unwrap();
+        assert_eq!(
+            form_fields(&dom, form),
+            vec![
+                ("u".into(), "new".into()),
+                ("n".into(), "filled".into()),
+                ("s".into(), "a".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn fill_checkbox_toggle() {
+        let mut dom = Dom::new();
+        let form = dom.element(dom.root(), "form", vec![]);
+        let cb = dom.element(
+            form,
+            "input",
+            vec![
+                ("name".into(), "c".into()),
+                ("type".into(), "checkbox".into()),
+                ("value".into(), "1".into()),
+            ],
+        );
+        assert_eq!(fill(&mut dom, 1, "yes").unwrap(), cb);
+        assert!(dom.attr(cb, "checked").is_some());
+        // checked submits the markup value, not the fill text
+        assert_eq!(form_fields(&dom, form), vec![("c".into(), "1".into())]);
+        fill(&mut dom, 1, "off").unwrap();
+        assert!(dom.attr(cb, "checked").is_none());
+        assert!(form_fields(&dom, form).is_empty());
+    }
+
+    #[test]
+    fn fill_rejects_non_control() {
+        let mut dom = Dom::new();
+        let body = dom.element(dom.root(), "body", vec![]);
+        dom.element(body, "a", vec![("href".into(), "/x".into())]);
+        assert!(fill(&mut dom, 1, "v").is_err());
     }
 
     #[test]

@@ -178,4 +178,51 @@ impl Dom {
             _ => None,
         }
     }
+
+    /// Set an attribute on an element, replacing the value of the existing
+    /// attr with the same name. No-op on non-element nodes.
+    pub fn set_attr(&mut self, id: NodeId, name: &str, value: &str) {
+        if !matches!(self.nodes[id as usize].data, NodeData::Element(_)) {
+            return;
+        }
+        let key = self.interner.intern(name);
+        let NodeData::Element(el) = &mut self.nodes[id as usize].data else {
+            return;
+        };
+        match el.attrs.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => *v = value.to_string(),
+            None => el.attrs.push((key, value.to_string())),
+        }
+    }
+
+    /// Remove an attribute by name. No-op on non-elements / missing names.
+    pub fn remove_attr(&mut self, id: NodeId, name: &str) {
+        let NodeData::Element(el) = &mut self.nodes[id as usize].data else {
+            return;
+        };
+        el.attrs.retain(|(k, _)| self.interner.resolve(*k) != name);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_and_remove_attr() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let el = dom.element(root, "input", vec![("name".into(), "q".into())]);
+        dom.set_attr(el, "value", "a");
+        assert_eq!(dom.attr(el, "value"), Some("a"));
+        dom.set_attr(el, "value", "b");
+        assert_eq!(dom.attr(el, "value"), Some("b"));
+        assert_eq!(dom.attr(el, "name"), Some("q"));
+        dom.set_attr(el, "checked", "checked");
+        dom.remove_attr(el, "checked");
+        assert_eq!(dom.attr(el, "checked"), None);
+        // Non-element nodes are a no-op.
+        dom.set_attr(root, "value", "x");
+        dom.remove_attr(root, "value");
+    }
 }

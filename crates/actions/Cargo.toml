@@ -10,4 +10,5 @@ vigia-css = { path = "../css" }
 vigia-dom = { path = "../dom" }
 vigia-net = { path = "../net" }
 vigia-session = { path = "../session" }
+vigia-snapshot = { path = "../snapshot" }
 vigia-url = { path = "../url" }

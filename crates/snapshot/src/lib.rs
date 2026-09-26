@@ -96,6 +96,30 @@ fn collect_inline(dom: &Dom, id: NodeId, out: &mut String) {
     }
 }
 
+/// Interactive elements in the same order as `#n` refs appear in the
+/// snapshot: document order, skipping SKIP_TAGS subtrees entirely. The
+/// action layer resolves `#n` through this — both sides must stay aligned.
+pub fn interactive_refs(dom: &Dom) -> Vec<NodeId> {
+    let mut out = Vec::new();
+    collect_refs(dom, dom.root(), &mut out);
+    out
+}
+
+fn collect_refs(dom: &Dom, id: NodeId, out: &mut Vec<NodeId>) {
+    if let NodeData::Element(el) = &dom.node(id).data {
+        let tag = dom.interner.resolve(el.tag);
+        if SKIP_TAGS.contains(&tag) {
+            return;
+        }
+        if INTERACTIVE.contains(&tag) {
+            out.push(id);
+        }
+    }
+    for &c in dom.children(id) {
+        collect_refs(dom, c, out);
+    }
+}
+
 /// First <title> text in the document, if any.
 fn find_title(dom: &Dom, id: NodeId, out: &mut Option<String>) {
     if out.is_some() {
@@ -279,6 +303,23 @@ mod tests {
         dom.text(a, "click me");
         let out = snapshot(&dom);
         assert!(out.contains("link #1 'click me' -> /x"), "got:\n{out}");
+    }
+
+    #[test]
+    fn refs_match_snapshot_order() {
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let body = dom.element(root, "body", vec![]);
+        dom.element(body, "a", vec![("href".into(), "/1".into())]);
+        let ns = dom.element(body, "noscript", vec![]);
+        dom.element(ns, "a", vec![("href".into(), "/hidden".into())]); // skipped
+        dom.element(body, "input", vec![("name".into(), "q".into())]);
+        dom.element(body, "button", vec![]);
+        let refs = interactive_refs(&dom);
+        assert_eq!(refs.len(), 3); // the noscript link is unreachable
+        let out = snapshot(&dom);
+        assert!(out.contains("#3"), "got:\n{out}");
+        assert!(!out.contains("/hidden"), "got:\n{out}");
     }
 
     #[test]

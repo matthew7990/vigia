@@ -14,7 +14,10 @@ const USAGE: &str = "vigia - AI-native browser runtime
   vigia fetch <url>                      raw response body
   vigia dom <url>                        parsed DOM stats
   vigia extract <url> <css>              elements matching a CSS selector
+  vigia click <url> <#n>                 follow snapshot ref (link/submit)
   vigia submit <url> [-f css] -d k=v..   fill + submit a form (login flows)
+
+  --profile <name>                       persistent cookie jar (~/.vigia/profiles)
 
 Own HTTP/1.1 + URL parser + inflate + HTML parser + arena DOM.
 Metrics on stderr: bytes in/out, ~tokens, ms per phase, heap peak, RSS peak.
@@ -96,8 +99,30 @@ fn parse_dom(res: &vigia_net::Response) -> (Dom, std::time::Duration) {
     (dom, t0.elapsed())
 }
 
+fn profile_path(name: &str) -> Option<std::path::PathBuf> {
+    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    Some(std::path::PathBuf::from(home).join(".vigia/profiles").join(format!("{name}.jar")))
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    // --profile <name> anywhere in argv: load jar, save at exit.
+    let mut jar_path = None;
+    if let Some(i) = args.iter().position(|a| a == "--profile") {
+        args.remove(i);
+        match args.get(i).cloned() {
+            Some(name) => {
+                args.remove(i);
+                jar_path = Some(profile_path(&name).unwrap_or_else(|| fail("bad profile name")));
+            }
+            None => fail("--profile needs a name"),
+        }
+    }
+
     if args.len() < 2 {
         eprint!("{USAGE}");
         std::process::exit(1);
@@ -105,7 +130,10 @@ fn main() {
     let cmd = args.remove(0);
     let url = args.remove(0);
 
-    let mut jar = CookieJar::new();
+    let mut jar = jar_path
+        .as_ref()
+        .map(|p| CookieJar::load(p))
+        .unwrap_or_default();
 
     match cmd.as_str() {
         "fetch" => {
@@ -165,6 +193,23 @@ fn main() {
                 hits.len()
             ));
         }
+        "click" => {
+            let ref_n: usize = args
+                .first()
+                .and_then(|s| s.trim_start_matches('#').parse().ok())
+                .unwrap_or_else(|| fail("click needs a ref: vigia click <url> <#n>"));
+            let res = fetch_page(&url, &mut jar);
+            report_fetch(&res);
+            let (dom, _) = parse_dom(&res);
+            let res2 = match vigia_actions::click(&dom, &res.final_url, ref_n, &[], &mut jar) {
+                Ok(r) => r,
+                Err(e) => fail(format!("click failed: {e}")),
+            };
+            report_fetch(&res2);
+            let (dom2, _) = parse_dom(&res2);
+            print!("{}", snapshot(&dom2));
+            report("");
+        }
         "submit" => {
             let mut overrides = Vec::new();
             let mut form_sel = None;
@@ -207,6 +252,12 @@ fn main() {
         _ => {
             eprint!("{USAGE}");
             std::process::exit(1);
+        }
+    }
+
+    if let Some(p) = &jar_path {
+        if let Err(e) = jar.save(p) {
+            eprintln!("warn: profile save failed: {e}");
         }
     }
 }

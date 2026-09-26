@@ -135,6 +135,7 @@ dependencies = [
  "vigia-dom",
  "vigia-net",
  "vigia-session",
+ "vigia-snapshot",
  "vigia-url",
 ]
 

@@ -14,6 +14,8 @@ pub struct Cookie {
     pub secure: bool,
     /// No Domain attribute: cookie goes to the exact host only (RFC 6265 5.3).
     pub host_only: bool,
+    /// HttpOnly: not readable by JS — matters once vigia-js exists.
+    pub http_only: bool,
 }
 
 #[derive(Debug, Default)]
@@ -39,6 +41,7 @@ impl CookieJar {
             path: default_path(&url.path),
             secure: false,
             host_only: true,
+            http_only: false,
         };
         for part in parts {
             let part = part.trim();
@@ -53,6 +56,8 @@ impl CookieJar {
                 }
             } else if part.eq_ignore_ascii_case("secure") {
                 cookie.secure = true;
+            } else if part.eq_ignore_ascii_case("httponly") {
+                cookie.http_only = true;
             }
         }
         self.cookies.retain(|c| !(c.name == cookie.name && c.domain == cookie.domain));
@@ -80,6 +85,83 @@ impl CookieJar {
     pub fn len(&self) -> usize {
         self.cookies.len()
     }
+
+    /// Load a persisted jar. Missing file = empty jar; malformed lines are
+    /// skipped, not fatal.
+    pub fn load(path: &std::path::Path) -> Self {
+        let mut jar = Self::new();
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return jar;
+        };
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() != 7 {
+                continue;
+            }
+            jar.cookies.push(Cookie {
+                name: f[0].to_string(),
+                domain: f[1].to_string(),
+                path: f[2].to_string(),
+                secure: f[3] == "1",
+                host_only: f[4] == "1",
+                http_only: f[5] == "1",
+                value: unescape(f[6]),
+            });
+        }
+        jar
+    }
+
+    /// Persist the jar. Own format: TSV, cookie value percent-escaped.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut out = String::new();
+        for c in &self.cookies {
+            out.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                c.name,
+                c.domain,
+                c.path,
+                c.secure as u8,
+                c.host_only as u8,
+                c.http_only as u8,
+                escape(&c.value),
+            ));
+        }
+        std::fs::write(path, out)
+    }
+}
+
+fn escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'%' | b'\t' | b'\n' | b'\r' | 0x00..=0x1F | 0x7F..=0xFF => {
+                let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{b:02X}"));
+            }
+            _ => out.push(b as char),
+        }
+    }
+    out
+}
+
+fn unescape(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// RFC 6265 5.1.3: string match OR suffix on a label boundary.

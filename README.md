@@ -49,7 +49,9 @@ cargo build --release
 ./target/release/vigia fetch https://example.com   # raw body
 ./target/release/vigia dom https://example.com     # parse stats
 ./target/release/vigia extract <url> "td.price"    # CSS selector extraction
+./target/release/vigia click <url> 3               # follow snapshot ref #3
 ./target/release/vigia submit <url> -d user=x -d pass=y   # form login
+./target/release/vigia snap <url> --profile work   # persistent session (cookies on disk)
 ```
 
 Every command reports cost and latency on stderr:
@@ -90,9 +92,11 @@ Run it: `python3 bench/gen_corpus.py`, serve `bench/corpus/` on :8899, `python3 
 - [x] HTML entities (named + numeric, C1->win1252) + charset decoding (win1252/utf-16/meta sniff)
 - [x] Own CSS selector engine (tag/.class/#id/[attr ops]/pseudos/combinators/groups)
 - [x] Form submission (urlencoded GET/POST, hidden fields, redirects)
+- [x] `vigia click #n` — navigate by snapshot ref (links + form buttons)
+- [x] Persistent profiles: cookie jars on disk (`--profile`, own TSV format)
 - [ ] Own TLS 1.3 (replace the rustls exception)
 - [ ] HTML5 tree-construction hardening (implied end tags, adoption agency)
-- [ ] Persistent profiles on disk (own format, no serde)
+- [ ] `vigia fill` + extended actions (select options, multi-step flows)
 - [ ] Embedded-JSON extraction (`__NEXT_DATA__`, `ld+json`) — JS-free SPA reads
 - [ ] `vigia-js`: own interpreter behind a feature flag, GC with hard cap
 - [ ] Action layer: semantic click/fill resolved against the DOM

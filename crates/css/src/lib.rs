@@ -279,7 +279,7 @@ fn read_attr(chars: &[char], mut i: usize) -> Result<((String, AttrOp, String), 
 }
 
 fn read_pseudo(chars: &[char], mut i: usize) -> Result<(Pseudo, usize), CssError> {
-    let (name, mut next) = read_ident(chars, i)?;
+    let (name, next) = read_ident(chars, i)?;
     i = next;
     let p = match name.to_ascii_lowercase().as_str() {
         "first-child" => Pseudo::FirstChild,

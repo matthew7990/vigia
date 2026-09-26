@@ -194,6 +194,17 @@ pub fn submit_form(
     jar: &mut CookieJar,
 ) -> Result<vigia_net::Response, ActionError> {
     let form = find_form(dom, selector)?.ok_or(ActionError::NotFound("no form"))?;
+    submit_node(dom, page_url, form, overrides, jar)
+}
+
+/// Submit a specific form node.
+pub fn submit_node(
+    dom: &Dom,
+    page_url: &Url,
+    form: NodeId,
+    overrides: &[(String, String)],
+    jar: &mut CookieJar,
+) -> Result<vigia_net::Response, ActionError> {
 
     let enctype = dom.attr(form, "enctype").unwrap_or("application/x-www-form-urlencoded");
     if enctype.to_ascii_lowercase().contains("multipart") {
@@ -228,6 +239,46 @@ pub fn submit_form(
             };
             vigia_net::fetch(&url.to_string(), jar).map_err(Into::into)
         }
+    }
+}
+
+/// Follow interactive element `#n` (the ref shown in the snapshot).
+/// link -> navigate; button/submit-input inside a form -> submit it.
+pub fn click(
+    dom: &Dom,
+    page_url: &Url,
+    ref_n: usize,
+    overrides: &[(String, String)],
+    jar: &mut CookieJar,
+) -> Result<vigia_net::Response, ActionError> {
+    let refs = vigia_snapshot::interactive_refs(dom);
+    let node = refs
+        .get(ref_n.saturating_sub(1))
+        .copied()
+        .ok_or(ActionError::NotFound("no element for ref"))?;
+
+    match dom.tag_name(node) {
+        Some("a") => {
+            let href = dom
+                .attr(node, "href")
+                .ok_or(ActionError::NotFound("link has no href"))?;
+            let target = page_url.join(href)?;
+            vigia_net::fetch(&target.to_string(), jar).map_err(Into::into)
+        }
+        Some("button") | Some("input") | Some("summary") => {
+            let mut cur = dom.parent(node);
+            while let Some(p) = cur {
+                if dom.tag_name(p) == Some("form") {
+                    return submit_node(dom, page_url, p, overrides, jar);
+                }
+                cur = dom.parent(p);
+            }
+            Err(ActionError::NotFound("interactive element outside any form"))
+        }
+        Some("select") | Some("textarea") => {
+            Err(ActionError::Unsupported("select/textarea need fill, not click"))
+        }
+        _ => Err(ActionError::NotFound("not interactive")),
     }
 }
 

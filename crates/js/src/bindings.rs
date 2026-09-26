@@ -7,10 +7,11 @@
 //! mutated) DOM back with take_dom() / run_scripts().
 
 use vigia_dom::{Dom, NodeData, NodeId};
+use vigia_session::CookieJar;
 
-use crate::ast::Expr;
-use crate::eval::{to_str, truthy};
-use crate::{err, Interp, JsError, Obj, Value};
+use crate::ast::{Expr, Stmt};
+use crate::eval::{get_prop, set_prop, to_str, truthy};
+use crate::{err, Interp, JsError, NetCtx, Obj, Value};
 
 /// Same list as vigia-html: these never get a close tag when serializing.
 const VOID: &[&str] = &[
@@ -57,6 +58,17 @@ fn raw_text(dom: &Dom, id: NodeId, out: &mut String) {
             _ => {}
         }
     }
+}
+
+/// What a page script run leaves behind: the (possibly mutated) DOM,
+/// per-script errors, the cookie jar back out of the net context, and a
+/// pending navigation requested by el.click() on <a href>. Following
+/// pending_nav is the host's call (v1 navigation bridge).
+pub struct ScriptsOutcome {
+    pub dom: Dom,
+    pub errors: Vec<JsError>,
+    pub jar: Option<CookieJar>,
+    pub pending_nav: Option<String>,
 }
 
 /// Inline <script> bodies in document order. Skipped: `src` (external) and
@@ -142,10 +154,14 @@ fn serialize_into(dom: &Dom, id: NodeId, out: &mut String) {
 
 impl Interp {
     /// Install `dom` plus the document/window/navigator/location globals.
-    /// Call before run(). Re-installing replaces the DOM and the wrappers.
+    /// Call before run(). Re-installing replaces the DOM, the wrappers,
+    /// the event listeners and any pending navigation - new page, clean
+    /// event state.
     pub fn set_dom(&mut self, dom: Dom) {
         self.dom = Some(dom);
         self.dom_objs.clear();
+        self.listeners.clear();
+        self.pending_nav = None;
         self.install_builtins();
         // Heap-cap edges skip installs silently, same as install_builtins.
         let (Ok(doc), Ok(ua), Ok(href)) = (
@@ -185,17 +201,34 @@ impl Interp {
 
     /// Run every runnable inline <script> in document order over one shared
     /// interp (globals persist across tags, like browsers). A script that
-    /// throws does not abort the page: errors collect into the returned vec.
-    pub fn run_scripts(&mut self, dom: Dom) -> (Dom, Vec<JsError>) {
+    /// throws does not abort the page: errors collect into the outcome.
+    /// `net` installs the page context for fetch()/click() URL resolution;
+    /// its cookie jar is moved in and handed back in the outcome.
+    /// After the scripts, "DOMContentLoaded" fires on document - the
+    /// common SPA boot hook.
+    pub fn run_scripts(&mut self, dom: Dom, net: Option<NetCtx>) -> ScriptsOutcome {
         let scripts = collect_scripts(&dom);
         self.set_dom(dom);
+        if let Some(ctx) = &net {
+            let href = ctx.base.to_string();
+            let _ = self.set_location_href(&href);
+        }
+        self.net = net;
         let mut errs = Vec::new();
         for src in &scripts {
             if let Err(e) = self.run(src) {
                 errs.push(e);
             }
         }
-        (self.take_dom(), errs)
+        if let Err(e) = self.fire(0, "DOMContentLoaded") {
+            errs.push(e);
+        }
+        ScriptsOutcome {
+            dom: self.take_dom(),
+            errors: errs,
+            jar: self.net.take().map(|c| c.jar),
+            pending_nav: self.pending_nav.take(),
+        }
     }
 
     pub(crate) fn dom_ref(&self) -> Result<&Dom, JsError> {
@@ -248,6 +281,243 @@ impl Interp {
             vals.push(self.dom_wrap(n)?);
         }
         Ok(Value::Obj(self.heap.alloc_obj(Obj::Arr(vals))?))
+    }
+
+    // ---- events --------------------------------------------------------
+
+    /// Bubble-path dispatch, simplified DOM Events: at each node on the
+    /// target->document path, the inline `on<ty>` attr handler runs first,
+    /// then listeners registered for `ty`. No capture phase. currentTarget
+    /// updates per node; a handler error aborts dispatch.
+    pub(crate) fn dispatch(
+        &mut self,
+        target: NodeId,
+        ty: &str,
+        ev: Value,
+    ) -> Result<Value, JsError> {
+        let mut path = vec![target];
+        {
+            let dom = self.dom_ref()?;
+            let mut cur = dom.parent(target);
+            while let Some(p) = cur {
+                path.push(p);
+                cur = dom.parent(p);
+            }
+        }
+        for &n in &path {
+            // stopPropagation stops later nodes; same-node handlers still run
+            if self.event_stopped(ev) {
+                break;
+            }
+            let this = self.dom_wrap(n)?;
+            set_prop(&mut self.heap, ev, "currentTarget", this)?;
+            if let Some(code) = self.inline_handler(n, ty) {
+                self.run_inline(n, ty, &code, ev)?;
+            }
+            // snapshot: listeners added/removed mid-dispatch shift nothing here
+            let fns: Vec<Value> = self
+                .listeners
+                .get(&n)
+                .map(|v| v.iter().filter(|(t, _)| t == ty).map(|(_, f)| *f).collect())
+                .unwrap_or_default();
+            for f in fns {
+                self.call_value(f, this, &[ev], None)?;
+            }
+        }
+        set_prop(&mut self.heap, ev, "currentTarget", Value::Null)?;
+        Ok(ev)
+    }
+
+    /// Inline `on<ty>` attr source for node `n`, matched case-insensitively
+    /// (HTML source may write onClick); Document/Text nodes have none.
+    fn inline_handler(&self, n: NodeId, ty: &str) -> Option<String> {
+        let want = format!("on{ty}");
+        let dom = self.dom.as_ref()?;
+        let NodeData::Element(el) = &dom.node(n).data else {
+            return None;
+        };
+        el.attrs
+            .iter()
+            .find(|(k, _)| dom.interner.resolve(*k).eq_ignore_ascii_case(&want))
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Compile an inline `on*` attr and call it: `this` = the element,
+    /// `event` = the event object. The attr source becomes a function body.
+    fn run_inline(&mut self, n: NodeId, ty: &str, code: &str, ev: Value) -> Result<(), JsError> {
+        let src = format!("(function(event){{{code}}})");
+        let stmts = crate::parse(&src).map_err(|e| err(format!("on{ty}: {e}")))?;
+        let Some(Stmt::Expr(Expr::Func(def))) = stmts.into_iter().next() else {
+            return Err(err(format!("on{ty}: bad handler")));
+        };
+        let f = Value::Obj(self.heap.alloc_obj(Obj::Func { def, env: 0 })?);
+        let this = self.dom_wrap(n)?;
+        self.call_value(f, this, &[ev], None)?;
+        Ok(())
+    }
+
+    /// Fresh event object of type `ty` targeted at `target`.
+    fn new_event(&mut self, ty: &str, target: NodeId) -> Result<Value, JsError> {
+        let ty = Value::Str(self.heap.alloc_str(ty.to_string())?);
+        let tgt = self.dom_wrap(target)?;
+        let pd = self
+            .heap
+            .alloc_obj(Obj::Native("preventDefault", n_event_prevent_default))?;
+        let sp = self
+            .heap
+            .alloc_obj(Obj::Native("stopPropagation", n_event_stop_propagation))?;
+        Ok(Value::Obj(self.heap.alloc_obj(Obj::Ordinary(vec![
+            ("type".into(), ty),
+            ("target".into(), tgt),
+            ("currentTarget".into(), Value::Null),
+            ("defaultPrevented".into(), Value::Bool(false)),
+            ("preventDefault".into(), Value::Obj(pd)),
+            ("stopPropagation".into(), Value::Obj(sp)),
+        ]))?))
+    }
+
+    /// A user-built object passed to dispatchEvent: overwrite `target` and
+    /// fill any missing standard props so a bare `{type:'x'}` works fully.
+    fn normalize_event(&mut self, ev: Value, target: NodeId) -> Result<(), JsError> {
+        let tgt = self.dom_wrap(target)?;
+        set_prop(&mut self.heap, ev, "target", tgt)?;
+        let pd = self
+            .heap
+            .alloc_obj(Obj::Native("preventDefault", n_event_prevent_default))?;
+        let sp = self
+            .heap
+            .alloc_obj(Obj::Native("stopPropagation", n_event_stop_propagation))?;
+        for (k, v) in [
+            ("currentTarget", Value::Null),
+            ("defaultPrevented", Value::Bool(false)),
+            ("preventDefault", Value::Obj(pd)),
+            ("stopPropagation", Value::Obj(sp)),
+        ] {
+            if matches!(get_prop(&self.heap, ev, k)?, Value::Undef) {
+                set_prop(&mut self.heap, ev, k, v)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Dispatch a fresh `ty` event at `target`; returns the event object.
+    fn fire(&mut self, target: NodeId, ty: &str) -> Result<Value, JsError> {
+        let ev = self.new_event(ty, target)?;
+        self.dispatch(target, ty, ev)
+    }
+
+    fn event_stopped(&self, ev: Value) -> bool {
+        matches!(get_prop(&self.heap, ev, "__stopped"), Ok(Value::Bool(true)))
+    }
+
+    fn event_prevented(&self, ev: Value) -> bool {
+        matches!(
+            get_prop(&self.heap, ev, "defaultPrevented"),
+            Ok(Value::Bool(true))
+        )
+    }
+
+    /// Reflect a navigation into the JS-visible location.href.
+    fn set_location_href(&mut self, href: &str) -> Result<(), JsError> {
+        if let Some(loc) = self.env_get(0, "location") {
+            let s = self.heap.alloc_str(href.to_string())?;
+            set_prop(&mut self.heap, loc, "href", Value::Str(s))?;
+        }
+        Ok(())
+    }
+
+    /// Event methods shared by elements and document (listeners live on
+    /// node 0 for the latter). Returns None when `name` isn't one.
+    fn event_method(
+        &mut self,
+        id: NodeId,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, JsError> {
+        let arg = |i: usize| args.get(i).copied().unwrap_or(Value::Undef);
+        Ok(Some(match name {
+            "addEventListener" => {
+                let ty = to_str(&self.heap, arg(0));
+                let f = arg(1);
+                let ok = matches!(f, Value::Obj(o)
+                    if matches!(self.heap.obj(o), Obj::Func { .. } | Obj::Native(..)));
+                if !ok {
+                    return Err(err("addEventListener needs a function"));
+                }
+                // dedupe on (type, same handler obj), like the standard
+                let v = self.listeners.entry(id).or_default();
+                if !v.iter().any(|(t, g)| *t == ty && *g == f) {
+                    v.push((ty, f));
+                }
+                Value::Undef
+            }
+            "removeEventListener" => {
+                let ty = to_str(&self.heap, arg(0));
+                let f = arg(1);
+                if let Some(v) = self.listeners.get_mut(&id) {
+                    if let Some(i) = v.iter().position(|(t, g)| *t == ty && *g == f) {
+                        v.remove(i);
+                    }
+                }
+                Value::Undef
+            }
+            "dispatchEvent" => {
+                let ev = arg(0);
+                let ty = match ev {
+                    Value::Obj(o) if matches!(self.heap.obj(o), Obj::Ordinary(_)) => {
+                        match get_prop(&self.heap, ev, "type")? {
+                            Value::Str(s) => self.heap.get_str(s).to_string(),
+                            _ => return Err(err("dispatchEvent: event needs a type")),
+                        }
+                    }
+                    _ => return Err(err("dispatchEvent needs an event object")),
+                };
+                self.normalize_event(ev, id)?;
+                let ev = self.dispatch(id, &ty, ev)?;
+                Value::Bool(!self.event_prevented(ev))
+            }
+            "click" => {
+                let ev = self.fire(id, "click")?;
+                // Default action for <a href>: real navigation would need a
+                // fetch + dom replace mid-eval, so we record pending_nav for
+                // the host and reflect it on location.href.
+                if !self.event_prevented(ev) {
+                    let href = match self.dom_ref() {
+                        Ok(d) if d.tag_name(id) == Some("a") => {
+                            d.attr(id, "href").map(str::to_string)
+                        }
+                        _ => None,
+                    };
+                    if let Some(href) = href {
+                        match &self.net {
+                            Some(ctx) => {
+                                let u = ctx
+                                    .base
+                                    .join(&href)
+                                    .map_err(|e| err(format!("click: {e}")))?;
+                                // javascript:/mailto: etc aren't navigable
+                                if matches!(u.scheme.as_str(), "http" | "https") {
+                                    let s = u.to_string();
+                                    self.set_location_href(&s)?;
+                                    self.pending_nav = Some(s);
+                                }
+                            }
+                            // no base: record the raw href for the host
+                            None => {
+                                self.set_location_href(&href)?;
+                                self.pending_nav = Some(href);
+                            }
+                        }
+                    }
+                }
+                Value::Undef
+            }
+            "focus" | "blur" => {
+                self.fire(id, name)?;
+                Value::Undef
+            }
+            _ => return Ok(None),
+        }))
     }
 
     /// CSS query scoped to the subtree rooted at `id` (id 0 = whole doc).
@@ -436,6 +706,10 @@ impl Interp {
     ) -> Result<Value, JsError> {
         let args = self.eval_args(env, arg_es)?;
         let arg = |i: usize| args.get(i).copied().unwrap_or(Value::Undef);
+        // event methods work on any node, Document (id 0) included
+        if let Some(v) = self.event_method(id, name, &args)? {
+            return Ok(v);
+        }
         if matches!(self.dom_ref()?.node(id).data, NodeData::Document) {
             return match name {
                 "getElementById" => {
@@ -555,11 +829,25 @@ impl Interp {
                 let hits = self.select(id, arg(0))?;
                 self.node_arr(hits)
             }
-            // no form submission / navigation in v1
-            "click" => Ok(Value::Undef),
             _ => Err(err(format!("{name} is not a function"))),
         }
     }
+}
+
+// ---- event natives ------------------------------------------------------
+
+fn n_event_prevent_default(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    set_prop(&mut it.heap, this, "defaultPrevented", Value::Bool(true))
+        .map(|()| Value::Undef)
+}
+
+fn n_event_stop_propagation(
+    it: &mut Interp,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, JsError> {
+    // internal flag the dispatch loop checks between nodes
+    set_prop(&mut it.heap, this, "__stopped", Value::Bool(true)).map(|()| Value::Undef)
 }
 
 #[cfg(test)]
@@ -776,7 +1064,8 @@ mod tests {
             &mut d,
         );
         let mut it = Interp::new();
-        let (dom, errs) = it.run_scripts(d);
+        let out = it.run_scripts(d, None);
+        let (dom, errs) = (out.dom, out.errors);
         assert_eq!(errs.len(), 1);
         assert!(errs[0].0.contains("throwaway"));
         // mutations from the scripts that ran are in the returned dom
@@ -789,5 +1078,280 @@ mod tests {
         assert_eq!(vigia_css::query(&dom, "script").unwrap().len(), 3);
         let ld = vigia_css::query(&dom, "script[type*=json]").unwrap();
         assert_eq!(vigia_actions::text_content(&dom, ld[0]), "{\"skip\":1}");
+    }
+
+    // ---- events + fetch --------------------------------------------------
+
+    /// Serve one response per connection on a throwaway port; returns the
+    /// port and the request lines observed.
+    fn serve(
+        bodies: Vec<String>,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log2 = log.clone();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let Ok((mut s, _)) = l.accept() else { return };
+                let mut req = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match s.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&chunk[..n]),
+                    }
+                }
+                let line = String::from_utf8_lossy(&req)
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                log2.lock().unwrap().push(line);
+                let _ = s.write_all(body.as_bytes());
+            }
+        });
+        (port, log)
+    }
+
+    fn page_title(dom: &Dom) -> String {
+        let t = vigia_css::query(dom, "title").unwrap();
+        vigia_actions::text_content(dom, t[0])
+    }
+
+    #[test]
+    fn inline_handler_this_and_event() {
+        // the acceptance case: el.click() runs the onclick attr with
+        // this = the element and the event object as `event`
+        let mut it = interp(
+            r#"<body><a id=l onclick="var b=document.createElement('b');b.id='x';document.body.appendChild(b);b.textContent=this.id+':'+event.type">go</a></body>"#,
+        );
+        it.run("document.getElementById('l').click()").unwrap();
+        let dom = it.take_dom();
+        let b = vigia_css::query(&dom, "#x").unwrap();
+        assert_eq!(vigia_actions::text_content(&dom, b[0]), "l:click");
+    }
+
+    #[test]
+    fn listeners_bubble_and_stop() {
+        let mut it = interp(
+            r#"<body><div id=a onclick="log.push('inline')"><p id=p>one</p></div></body>"#,
+        );
+        it.run(
+            "var log=[];\
+             var a=document.getElementById('a');\
+             a.addEventListener('click',function(e){log.push('a:'+(e.currentTarget===this)+':'+e.target.tagName)});\
+             document.body.addEventListener('click',function(e){log.push('body')});\
+             document.getElementById('p').click()",
+        )
+        .unwrap();
+        // inline first, then the node's listeners, then ancestors bubble
+        assert_eq!(ev(&mut it, "log.join(',')"), "inline,a:true:P,body");
+
+        // stopPropagation on #a keeps body's listener from running, but a
+        // second same-node listener still fires
+        let mut it = interp(r#"<body><div id=a><p id=p>one</p></div></body>"#);
+        it.run(
+            "var log=[];\
+             var a=document.getElementById('a');\
+             a.addEventListener('click',function(e){log.push('a1');e.stopPropagation()});\
+             a.addEventListener('click',function(e){log.push('a2')});\
+             document.body.addEventListener('click',function(e){log.push('body')});\
+             document.getElementById('p').click()",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "log.join(',')"), "a1,a2");
+    }
+
+    #[test]
+    fn listener_dedupe_and_remove() {
+        let mut it = interp(r#"<body><div id=a></div></body>"#);
+        assert_eq!(
+            ev(
+                &mut it,
+                "var n=0;var e=document.getElementById('a');\
+                 function h(){n+=1}\
+                 e.addEventListener('click',h);e.addEventListener('click',h);\
+                 e.click();n"
+            ),
+            "1"
+        );
+        assert_eq!(ev(&mut it, "e.removeEventListener('click',h);e.click();n"), "1");
+        assert!(errmsg(&mut it, "e.addEventListener('click',1)").contains("function"));
+    }
+
+    #[test]
+    fn dispatch_event_and_prevent_default() {
+        let mut it = interp(r#"<body><a id=l href="/nope">x</a></body>"#);
+        // no listeners -> dispatchEvent returns true
+        assert_eq!(ev(&mut it, "document.getElementById('l').dispatchEvent({type:'click'})"), "true");
+        // preventDefault flips defaultPrevented and the return value
+        it.run(
+            "var l=document.getElementById('l');\
+             l.addEventListener('click',function(e){e.preventDefault()})",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "l.dispatchEvent({type:'click'})"), "false");
+        // prevented default: click() does not navigate
+        it.run("l.click()").unwrap();
+        assert!(it.pending_nav.is_none());
+        assert!(errmsg(&mut it, "l.dispatchEvent({})").contains("type"));
+        assert!(errmsg(&mut it, "l.dispatchEvent(5)").contains("event object"));
+    }
+
+    #[test]
+    fn click_nav_pending() {
+        // no net ctx: href recorded raw; with preventDefault it isn't
+        let mut it = interp(r#"<body><a id=l href="/next">x</a></body>"#);
+        it.run("document.getElementById('l').click()").unwrap();
+        assert_eq!(it.pending_nav.as_deref(), Some("/next"));
+        assert_eq!(ev(&mut it, "location.href"), "/next");
+    }
+
+    #[test]
+    fn focus_blur_fire() {
+        let mut it = interp(r#"<body><input id=i></body>"#);
+        assert_eq!(
+            ev(
+                &mut it,
+                "var s='';var e=document.getElementById('i');\
+                 e.addEventListener('focus',function(){s+='f'});\
+                 e.addEventListener('blur',function(){s+='b'});\
+                 e.focus();e.blur();s"
+            ),
+            "fb"
+        );
+    }
+
+    #[test]
+    fn dom_content_loaded() {
+        let mut d = Dom::new();
+        vigia_html::parse(
+            r#"<html><head><title>old</title>
+               <script>document.addEventListener('DOMContentLoaded',function(e){document.title='ready:'+e.target.nodeType})</script>
+               </head><body></body></html>"#,
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(d, None);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(page_title(&out.dom), "ready:9");
+    }
+
+    #[test]
+    fn pending_nav_resolved_against_base() {
+        let mut d = Dom::new();
+        vigia_html::parse(
+            "<html><body><a id=l href='/next'>x</a><script>document.getElementById('l').click()</script></body></html>",
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(
+            d,
+            Some(NetCtx {
+                base: vigia_url::Url::parse("http://a.com/dir/p").unwrap(),
+                jar: CookieJar::new(),
+            }),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(out.pending_nav.as_deref(), Some("http://a.com/next"));
+        assert!(out.jar.is_some());
+    }
+
+    #[test]
+    fn fetch_needs_page_context() {
+        let mut it = Interp::new();
+        assert!(it.run("fetch('/x')").unwrap_err().0.contains("page context"));
+        // installed even with a dom but no net ctx
+        let mut it = interp("<body></body>");
+        assert!(it.run("fetch('/x')").unwrap_err().0.contains("page context"));
+    }
+
+    #[test]
+    fn fetch_sync_json_and_cookies() {
+        let body = "{\"name\":\"x\"}";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: sid=7; Path=/\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (port, log) = serve(vec![resp]);
+        let mut d = Dom::new();
+        vigia_html::parse(
+            "<html><head><title>o</title></head><body><script>var r=fetch('/api?x=1');document.title=r.status+':'+r.ok+':'+r.json().name+':'+r.text()</script></body></html>",
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(
+            d,
+            Some(NetCtx {
+                base: vigia_url::Url::parse(&format!("http://127.0.0.1:{port}/dir/page"))
+                    .unwrap(),
+                jar: CookieJar::new(),
+            }),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            page_title(&out.dom),
+            format!("200:true:x:{{\"name\":\"x\"}}")
+        );
+        // relative url resolved against the page url
+        assert_eq!(log.lock().unwrap()[0], "GET /api?x=1 HTTP/1.1");
+        // Set-Cookie landed in the jar that came back out
+        let jar = out.jar.unwrap();
+        assert_eq!(jar.len(), 1);
+        let u = vigia_url::Url::parse(&format!("http://127.0.0.1:{port}/other")).unwrap();
+        assert_eq!(jar.header_for(&u).as_deref(), Some("sid=7"));
+    }
+
+    #[test]
+    fn fetch_redirect_and_404() {
+        let bodies = vec![
+            "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\n\r\n".to_string(),
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".to_string(),
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string(),
+        ];
+        let (port, _log) = serve(bodies);
+        let mut d = Dom::new();
+        vigia_html::parse(
+            "<html><head><title>o</title></head><body><script>\
+             var a=fetch('/go');var b=fetch('/missing');\
+             document.title=a.redirected+':'+a.url+'|'+b.ok+':'+b.status</script></body></html>",
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(
+            d,
+            Some(NetCtx {
+                base: vigia_url::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
+                jar: CookieJar::new(),
+            }),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(
+            page_title(&out.dom),
+            format!("true:http://127.0.0.1:{port}/final|false:404")
+        );
+    }
+
+    #[test]
+    fn fetch_network_error_is_js_error() {
+        // port 1 is closed: the io failure surfaces as a script error
+        let mut d = Dom::new();
+        vigia_html::parse(
+            "<html><body><script>fetch('http://127.0.0.1:1/x')</script></body></html>",
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(
+            d,
+            Some(NetCtx {
+                base: vigia_url::Url::parse("http://127.0.0.1:1/").unwrap(),
+                jar: CookieJar::new(),
+            }),
+        );
+        assert_eq!(out.errors.len(), 1);
+        assert!(out.errors[0].0.contains("fetch"), "{}", out.errors[0].0);
     }
 }

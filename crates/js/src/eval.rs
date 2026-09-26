@@ -159,7 +159,7 @@ fn rel(h: &Heap, l: Value, r: Value, nf: fn(f64, f64) -> bool, sf: fn(&str, &str
 
 // ---- property access ---------------------------------------------------
 
-fn get_prop(h: &Heap, v: Value, key: &str) -> Result<Value, JsError> {
+pub(crate) fn get_prop(h: &Heap, v: Value, key: &str) -> Result<Value, JsError> {
     match v {
         Value::Obj(id) => Ok(match h.obj(id) {
             Obj::Ordinary(pairs) => pairs
@@ -181,7 +181,7 @@ fn get_prop(h: &Heap, v: Value, key: &str) -> Result<Value, JsError> {
     }
 }
 
-fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<(), JsError> {
+pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<(), JsError> {
     match v {
         Value::Obj(id) => match h.obj_mut(id) {
             Obj::Ordinary(pairs) => {
@@ -281,6 +281,9 @@ impl Interp {
                 }
             }
         }
+        if let Ok(f) = self.heap.alloc_obj(Obj::Native("fetch", n_fetch)) {
+            self.env_declare(0, "fetch", Value::Obj(f));
+        }
         self.env_declare(0, "this", Value::Undef);
     }
 
@@ -304,7 +307,7 @@ impl Interp {
         self.envs[env as usize].vars.insert(name.to_string(), v);
     }
 
-    fn env_get(&self, env: u32, name: &str) -> Option<Value> {
+    pub(crate) fn env_get(&self, env: u32, name: &str) -> Option<Value> {
         let mut cur = env;
         loop {
             let e = &self.envs[cur as usize];
@@ -742,7 +745,7 @@ impl Interp {
         self.call_value(f, this, &args, hint)
     }
 
-    fn call_value(
+    pub(crate) fn call_value(
         &mut self,
         f: Value,
         this: Value,
@@ -790,7 +793,7 @@ impl Interp {
                     Err(e) => Err(e),
                 }
             }
-            C::Nat(nf) => nf(self, args),
+            C::Nat(nf) => nf(self, this, args),
         };
         self.call_depth -= 1;
         r
@@ -948,7 +951,7 @@ impl Interp {
 
 // ---- builtins ------------------------------------------------------------
 
-fn n_console_log(it: &mut Interp, args: &[Value]) -> Result<Value, JsError> {
+fn n_console_log(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     let mut line = String::new();
     for (i, a) in args.iter().enumerate() {
         if i > 0 {
@@ -961,15 +964,57 @@ fn n_console_log(it: &mut Interp, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Undef)
 }
 
-fn n_json_parse(it: &mut Interp, args: &[Value]) -> Result<Value, JsError> {
+fn n_json_parse(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     let src = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
     let j = Json::parse(&src).map_err(|e| err(e.to_string()))?;
     json_to_val(&mut it.heap, &j)
 }
 
-fn n_json_stringify(it: &mut Interp, args: &[Value]) -> Result<Value, JsError> {
+fn n_json_stringify(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     let j = val_to_json(&it.heap, args.first().copied().unwrap_or(Value::Undef), 0)?;
     Ok(Value::Str(it.heap.alloc_str(j.to_string())?))
+}
+
+/// fetch(url) - synchronous on purpose (the engine has no promises).
+/// Resolves `url` against the page URL and shares its cookie jar (both
+/// directions). Returns a plain object: status/ok/redirected/url + the
+/// body text under `__body`, which text()/json() read off `this`.
+fn n_fetch(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let raw = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    let Some(ctx) = it.net.as_mut() else {
+        return Err(err("fetch needs a page context"));
+    };
+    let url = ctx.base.join(&raw).map_err(|e| err(format!("fetch: {e}")))?;
+    let res = vigia_net::fetch(&url.to_string(), &mut ctx.jar)
+        .map_err(|e| err(format!("fetch: {e}")))?;
+    let pairs = vec![
+        ("status".into(), Value::Num(res.status as f64)),
+        ("ok".into(), Value::Bool((200..=299).contains(&res.status))),
+        ("redirected".into(), Value::Bool(res.redirects > 0)),
+        ("url".into(), Value::Str(it.heap.alloc_str(res.final_url.to_string())?)),
+        ("__body".into(), Value::Str(it.heap.alloc_str(res.text())?)),
+        ("text".into(), Value::Obj(it.heap.alloc_obj(Obj::Native("text", n_res_text))?)),
+        ("json".into(), Value::Obj(it.heap.alloc_obj(Obj::Native("json", n_res_json))?)),
+    ];
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Ordinary(pairs))?))
+}
+
+fn res_body(h: &Heap, this: Value) -> Result<String, JsError> {
+    match get_prop(h, this, "__body")? {
+        Value::Str(s) => Ok(h.get_str(s).to_string()),
+        _ => Err(err("response method called on a non-response object")),
+    }
+}
+
+fn n_res_text(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let b = res_body(&it.heap, this)?;
+    Ok(Value::Str(it.heap.alloc_str(b)?))
+}
+
+fn n_res_json(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let b = res_body(&it.heap, this)?;
+    let j = Json::parse(&b).map_err(|e| err(e.to_string()))?;
+    json_to_val(&mut it.heap, &j)
 }
 
 fn json_to_val(h: &mut Heap, j: &Json) -> Result<Value, JsError> {

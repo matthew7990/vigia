@@ -96,19 +96,37 @@ fn report_fetch(res: &vigia_net::Response) {
     );
 }
 
-fn parse_dom(res: &vigia_net::Response, js: bool) -> (Dom, std::time::Duration) {
+/// Parse + optional script run. The jar passes through the interp so page
+/// fetch() calls share cookies. Third return is a navigation a script's
+/// click() asked for (v1 bridge) - the caller decides whether to follow.
+fn parse_dom(
+    res: &vigia_net::Response,
+    js: bool,
+    jar: &mut CookieJar,
+) -> (Dom, std::time::Duration, Option<String>) {
     let t0 = Instant::now();
     let mut dom = Dom::new();
     vigia_html::parse(&res.text(), &mut dom);
+    let mut nav = None;
     if js {
         let mut it = vigia_js::Interp::new();
-        let (d, errs) = it.run_scripts(dom);
-        dom = d;
-        for e in errs {
+        let out = it.run_scripts(
+            dom,
+            Some(vigia_js::NetCtx {
+                base: res.final_url.clone(),
+                jar: std::mem::take(jar),
+            }),
+        );
+        dom = out.dom;
+        nav = out.pending_nav;
+        if let Some(j) = out.jar {
+            *jar = j;
+        }
+        for e in out.errors {
             eprintln!("warn: js: {e}");
         }
     }
-    (dom, t0.elapsed())
+    (dom, t0.elapsed(), nav)
 }
 
 fn profile_path(name: &str) -> Option<std::path::PathBuf> {
@@ -163,9 +181,18 @@ fn main() {
             report(&format!("~{} tokens", fmt_num(est_tokens(res.body.len()))));
         }
         "snap" | "dom" => {
-            let res = fetch_page(&url, &mut jar);
+            let mut res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, parse_ms) = parse_dom(&res, js);
+            let (mut dom, mut parse_ms, nav) = parse_dom(&res, js, &mut jar);
+            if let Some(u) = nav {
+                // v1 navigation bridge: a script's click() asked for a
+                // page - follow it once, no chains.
+                res = fetch_page(&u, &mut jar);
+                report_fetch(&res);
+                let (d, ms, _) = parse_dom(&res, js, &mut jar);
+                dom = d;
+                parse_ms += ms;
+            }
             if cmd == "dom" {
                 println!(
                     "{} nodes, {} interned strings, {} cookies",
@@ -196,7 +223,7 @@ fn main() {
             });
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, parse_ms) = parse_dom(&res, js);
+            let (dom, parse_ms, _) = parse_dom(&res, js, &mut jar);
             let hits = match vigia_css::query(&dom, &sel) {
                 Ok(h) => h,
                 Err(e) => fail(format!("{e}")),
@@ -220,13 +247,13 @@ fn main() {
                 .unwrap_or_else(|| fail("click needs a ref: vigia click <url> <#n>"));
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, _) = parse_dom(&res, js);
+            let (dom, _, _) = parse_dom(&res, js, &mut jar);
             let res2 = match vigia_actions::click(&dom, &res.final_url, ref_n, &[], &mut jar) {
                 Ok(r) => r,
                 Err(e) => fail(format!("click failed: {e}")),
             };
             report_fetch(&res2);
-            let (dom2, _) = parse_dom(&res2, js);
+            let (dom2, _, _) = parse_dom(&res2, js, &mut jar);
             print!("{}", snapshot(&dom2));
             report("");
         }
@@ -253,7 +280,7 @@ fn main() {
             }
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, _) = parse_dom(&res, js);
+            let (dom, _, _) = parse_dom(&res, js, &mut jar);
             let res2 = match vigia_actions::submit_form(
                 &dom,
                 &res.final_url,
@@ -265,7 +292,7 @@ fn main() {
                 Err(e) => fail(format!("submit failed: {e}")),
             };
             report_fetch(&res2);
-            let (dom2, _) = parse_dom(&res2, js);
+            let (dom2, _, _) = parse_dom(&res2, js, &mut jar);
             print!("{}", snapshot(&dom2));
             report("");
         }
@@ -273,7 +300,7 @@ fn main() {
             let path = args.first().map(|s| s.as_str());
             let res = fetch_page(&url, &mut jar);
             report_fetch(&res);
-            let (dom, _) = parse_dom(&res, js);
+            let (dom, _, _) = parse_dom(&res, js, &mut jar);
             let mut found = 0;
             let mut seen = Vec::new();
             for sel in [

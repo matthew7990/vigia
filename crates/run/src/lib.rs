@@ -213,15 +213,42 @@ struct Page {
     status: u16,
 }
 
-fn load(res: vigia_net::Response, js: bool) -> Page {
+fn load(res: vigia_net::Response, js: bool, jar: &mut CookieJar) -> Page {
+    load_follow(res, js, jar, true)
+}
+
+fn load_follow(res: vigia_net::Response, js: bool, jar: &mut CookieJar, follow: bool) -> Page {
     let mut dom = Dom::new();
     vigia_html::parse(&res.text(), &mut dom);
     if js {
         let mut it = vigia_js::Interp::new();
-        let (d, errs) = it.run_scripts(dom);
-        dom = d;
-        for e in errs {
+        // The jar moves in for the script run and comes back with any
+        // cookies the page's fetch() calls picked up.
+        let out = it.run_scripts(
+            dom,
+            Some(vigia_js::NetCtx {
+                base: res.final_url.clone(),
+                jar: std::mem::take(jar),
+            }),
+        );
+        dom = out.dom;
+        if let Some(j) = out.jar {
+            *jar = j;
+        }
+        for e in out.errors {
             eprintln!("warn: js: {e}");
+        }
+        // v1 navigation bridge: a click() on <a href> inside page scripts
+        // asks for a navigation - the host follows it once, no chains.
+        if let Some(nav) = out.pending_nav {
+            if follow {
+                match vigia_net::fetch(&nav, jar) {
+                    Ok(res2) => return load_follow(res2, js, jar, false),
+                    Err(e) => eprintln!("warn: js nav {nav}: {e}"),
+                }
+            } else {
+                eprintln!("warn: js: navigation to {nav} not followed");
+            }
         }
     }
     Page {
@@ -249,7 +276,7 @@ fn exec(
     match &stmt.op {
         Op::Snap(url) => {
             let res = vigia_net::fetch(url, jar).map_err(|e| format!("fetch failed: {e}"))?;
-            let p = load(res, js);
+            let p = load(res, js, jar);
             out(&vigia_snapshot::snapshot(&p.dom));
             *page = Some(p);
         }
@@ -257,13 +284,13 @@ fn exec(
             let p = page.as_ref().ok_or(NO_PAGE)?;
             let res = vigia_actions::click(&p.dom, &p.url, *n, &[], jar)
                 .map_err(|e| format!("click failed: {e}"))?;
-            *page = Some(load(res, js));
+            *page = Some(load(res, js, jar));
         }
         Op::Submit { form, data } => {
             let p = page.as_ref().ok_or(NO_PAGE)?;
             let res = vigia_actions::submit_form(&p.dom, &p.url, form.as_deref(), data, jar)
                 .map_err(|e| format!("submit failed: {e}"))?;
-            *page = Some(load(res, js));
+            *page = Some(load(res, js, jar));
         }
         Op::Fill(n, value) => {
             let p = page.as_mut().ok_or(NO_PAGE)?;
@@ -512,5 +539,48 @@ expect bare
                 ("c".into(), "1".into()),
             ]
         );
+    }
+
+    /// Serve each response body (full HTTP) on its own connection.
+    fn serve(bodies: Vec<String>) -> u16 {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for body in bodies {
+                let Ok((mut s, _)) = l.accept() else { return };
+                let mut req = [0u8; 4096];
+                let _ = s.read(&mut req);
+                let _ = s.write_all(body.as_bytes());
+            }
+        });
+        port
+    }
+
+    fn http(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    #[test]
+    fn js_pending_nav_followed_once() {
+        // page 1's script clicks the link -> pending_nav -> host follows
+        // the fetch once and lands on page 2.
+        let p1 = "<html><body><a id=l href='/two'>x</a>\
+                  <script>document.getElementById('l').click()</script></body></html>";
+        let p2 = "<html><body><h1>NAV TARGET PAGE</h1></body></html>";
+        let port = serve(vec![http(p1), http(p2)]);
+        let stmts = parse_script(&format!("snap http://127.0.0.1:{port}/")).unwrap();
+        let mut jar = CookieJar::new();
+        let mut audit = Vec::new();
+        let mut text = String::new();
+        let mut emit = |s: &str| text.push_str(s);
+        run_with(&stmts, &mut jar, &mut audit, &mut emit, true).unwrap();
+        assert!(text.contains("NAV TARGET PAGE"), "{text}");
+        // and the click navigated: page 2's url is the audit's context now
+        assert_eq!(audit.len(), 1);
     }
 }

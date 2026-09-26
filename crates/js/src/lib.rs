@@ -15,6 +15,12 @@
 //! - `new F()` gives a fresh Ordinary as `this`; no prototype wiring.
 //! - No regex literals, for-in/of, switch, try, do-while, getters,
 //!   instanceof, delete, void, ?., ??, =>, spread, classes, labels.
+//! - Events: addEventListener + inline `on*` attrs, bubble phase only
+//!   (no capture). Dispatch is synchronous.
+//! - fetch() is synchronous: returns a plain response object whose
+//!   text()/json() methods read its `__body` prop (no hidden state).
+//! - el.click() on <a href> sets pending_nav + location.href instead of
+//!   navigating; following it is the host's call.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -28,6 +34,7 @@ mod lex;
 mod parse;
 
 pub use ast::{Expr, FnDef, Stmt};
+pub use bindings::ScriptsOutcome;
 pub use parse::parse_program as parse;
 
 /// Interpreter error. Message carries a byte offset where one is known.
@@ -56,8 +63,18 @@ pub enum Value {
     Obj(u32),
 }
 
-/// Builtin function signature: interpreter access + already-evaled args.
-pub type NativeFn = fn(&mut Interp, &[Value]) -> Result<Value, JsError>;
+/// Builtin function signature: interpreter access, the receiver (`this`),
+/// and already-evaled args.
+pub type NativeFn = fn(&mut Interp, this: Value, &[Value]) -> Result<Value, JsError>;
+
+/// Page network context for a script run: the URL the DOM came from
+/// (resolves relative fetch()/click() targets) plus the cookie jar. The
+/// jar is moved in for the run and handed back through ScriptsOutcome -
+/// no pointers, no lifetimes.
+pub struct NetCtx {
+    pub base: vigia_url::Url,
+    pub jar: vigia_session::CookieJar,
+}
 
 #[derive(Debug)]
 pub enum Obj {
@@ -158,6 +175,14 @@ pub struct Interp {
     pub dom: Option<vigia_dom::Dom>,
     /// node -> wrapper obj cache so `a === b` identity holds per node
     pub(crate) dom_objs: HashMap<NodeId, u32>,
+    /// node -> (event type, handler) listeners. JS values, so they live
+    /// here rather than on DOM nodes. Cleared by set_dom.
+    pub(crate) listeners: HashMap<NodeId, Vec<(String, Value)>>,
+    /// Net context for fetch()/click resolution; moved in per script run.
+    pub net: Option<NetCtx>,
+    /// Set by click() on <a href> when default isn't prevented. The host
+    /// decides whether to follow it (v1 navigation bridge).
+    pub pending_nav: Option<String>,
     pub(crate) out: String,
     pub(crate) last: Value,
     pub(crate) steps: u64,
@@ -180,6 +205,9 @@ impl Interp {
             envs: vec![Env { vars: HashMap::new(), parent: None }],
             dom: None,
             dom_objs: HashMap::new(),
+            listeners: HashMap::new(),
+            net: None,
+            pending_nav: None,
             out: String::new(),
             last: Value::Undef,
             steps: 0,

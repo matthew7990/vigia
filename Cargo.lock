@@ -178,6 +178,9 @@ dependencies = [
  "vigia-dom",
  "vigia-html",
  "vigia-json",
+ "vigia-net",
+ "vigia-session",
+ "vigia-url",
 ]
 
 [[package]]

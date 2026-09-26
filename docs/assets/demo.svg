@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 340" width="760" height="340" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14">
+  <rect width="760" height="340" rx="10" fill="#0d1117"/>
+  <rect x="0.5" y="0.5" width="759" height="339" rx="10" fill="none" stroke="#30363d"/>
+  <circle cx="26" cy="24" r="6" fill="#ff5f57"/>
+  <circle cx="46" cy="24" r="6" fill="#febc2e"/>
+  <circle cx="66" cy="24" r="6" fill="#28c840"/>
+  <text x="30" y="62" fill="#7ee787">$</text>
+  <text x="50" y="62" fill="#e6edf3">vigia snap https://example.com/shop</text>
+  <text x="30" y="92"  fill="#8b949e">status 200 | 3.1 KB wire -&gt; 2.0 KB body | 0 redirects | total 9ms</text>
+  <text x="30" y="118" fill="#e6edf3">page 'Shop'</text>
+  <text x="30" y="140" fill="#e6edf3">  - navigation</text>
+  <text x="30" y="162" fill="#e6edf3">    - link #1 'Cart' -&gt; /cart</text>
+  <text x="30" y="184" fill="#e6edf3">  - form</text>
+  <text x="30" y="206" fill="#e6edf3">    - textbox #2 [name=q]</text>
+  <text x="30" y="228" fill="#e6edf3">    - button #3 'Search'</text>
+  <text x="30" y="250" fill="#e6edf3">  - listitem #4 'Widget - $12' </text>
+  <text x="30" y="272" fill="#e6edf3">  - listitem #5 'Gadget - $30'</text>
+  <text x="30" y="302" fill="#8b949e">[metrics] parse 1ms snap 0ms | nodes 41 | ~180 -&gt; ~96 tokens | heap 22 KB | rss 5.9 MB</text>
+  <text x="30" y="328" fill="#58a6f6"># every line an agent can act on by ref: click #3, fill #2 "query"</text>
+</svg>

@@ -383,6 +383,177 @@ pub fn run_with(
     Ok(())
 }
 
+/// One parallel tab: a name, per-tab `$var` bindings, and the jar file it
+/// loads/saves (None = fresh empty jar, nothing persisted).
+pub struct TabSpec {
+    pub name: String,
+    pub vars: Vec<(String, String)>,
+    pub jar_path: Option<std::path::PathBuf>,
+}
+
+/// Everything one tab produced: run result, its audit trail, and the text
+/// its ops emitted.
+pub struct TabOutcome {
+    pub name: String,
+    pub result: Result<(), RunError>,
+    pub audit: Vec<AuditEntry>,
+    pub out: String,
+}
+
+/// Var lookup: exact match in `vars` first, then env `VIGIA_<name>`.
+fn lookup(name: &str, vars: &[(String, String)]) -> Option<String> {
+    vars.iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var(format!("VIGIA_{name}")).ok())
+}
+
+/// Resolve `$NAME` / `${NAME}` in `arg`; `$$` is a literal `$`, unknown
+/// names stay literal.
+fn resolve(arg: &str, vars: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(arg.len());
+    let b = arg.as_bytes();
+    let mut i = 0;
+    while i < arg.len() {
+        if b[i] != b'$' {
+            let next = arg[i + 1..]
+                .find('$')
+                .map(|j| i + 1 + j)
+                .unwrap_or(arg.len());
+            out.push_str(&arg[i..next]);
+            i = next;
+            continue;
+        }
+        let after = &arg[i + 1..];
+        if after.starts_with('$') {
+            out.push('$');
+            i += 2;
+            continue;
+        }
+        // (name, index just past the whole token)
+        let (name, end) = if let Some(braced) = after.strip_prefix('{') {
+            match braced.find('}') {
+                Some(j) if j > 0 => (&braced[..j], i + 3 + j),
+                _ => {
+                    out.push('$');
+                    i += 1;
+                    continue;
+                }
+            }
+        } else {
+            let n: usize = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .map(char::len_utf8)
+                .sum();
+            if n == 0 {
+                out.push('$');
+                i += 1;
+                continue;
+            }
+            (&after[..n], i + 1 + n)
+        };
+        match lookup(name, vars) {
+            Some(v) => out.push_str(&v),
+            None => out.push_str(&arg[i..end]),
+        }
+        i = end;
+    }
+    out
+}
+
+/// Clone `stmts` with this tab's vars resolved into every string arg.
+/// run_with stays untouched: it just sees rewritten ops.
+fn subst_stmts(stmts: &[Stmt], vars: &[(String, String)]) -> Vec<Stmt> {
+    stmts
+        .iter()
+        .map(|s| Stmt {
+            line: s.line,
+            op: match &s.op {
+                Op::Snap(u) => Op::Snap(resolve(u, vars)),
+                Op::Click(n) => Op::Click(*n),
+                Op::Fill(n, v) => Op::Fill(*n, resolve(v, vars)),
+                Op::Submit { form, data } => Op::Submit {
+                    form: form.as_ref().map(|f| resolve(f, vars)),
+                    data: data
+                        .iter()
+                        .map(|(k, v)| (k.clone(), resolve(v, vars)))
+                        .collect(),
+                },
+                Op::Extract(sel) => Op::Extract(resolve(sel, vars)),
+                Op::Json(p) => Op::Json(p.as_ref().map(|p| resolve(p, vars))),
+                Op::Expect(t) => Op::Expect(resolve(t, vars)),
+            },
+        })
+        .collect()
+}
+
+fn panic_msg(p: Box<dyn std::any::Any + Send>) -> String {
+    p.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_else(|| "panic".into())
+}
+
+/// Run the same `stmts` in N parallel tabs: one std::thread per tab, each
+/// with its own jar (loaded from `jar_path`, saved back after the run -
+/// even on failure, so partial cookie updates are not lost; save errors
+/// append a warning to the tab's output), its own page state, and its own
+/// captured output. Outcomes come back in `tabs` order.
+pub fn run_tabs(stmts: &[Stmt], tabs: &[TabSpec], js: bool) -> Vec<TabOutcome> {
+    let mut handles = Vec::with_capacity(tabs.len());
+    for tab in tabs {
+        let name = tab.name.clone();
+        let jar_path = tab.jar_path.clone();
+        let stmts = subst_stmts(stmts, &tab.vars);
+        let name2 = name.clone();
+        handles.push((
+            name,
+            std::thread::spawn(move || {
+                let mut jar = match &jar_path {
+                    Some(p) => CookieJar::load(p),
+                    None => CookieJar::new(),
+                };
+                let mut audit = Vec::new();
+                let mut out = String::new();
+                let result = run_with(
+                    &stmts,
+                    &mut jar,
+                    &mut audit,
+                    &mut |s: &str| out.push_str(s),
+                    js,
+                );
+                if let Some(p) = &jar_path {
+                    if let Err(e) = jar.save(p) {
+                        if !out.is_empty() && !out.ends_with('\n') {
+                            out.push('\n');
+                        }
+                        out.push_str(&format!("warn: jar save failed: {e}\n"));
+                    }
+                }
+                (name2, result, audit, out)
+            }),
+        ));
+    }
+    handles
+        .into_iter()
+        .map(|(name, h)| match h.join() {
+            Ok((_, result, audit, out)) => TabOutcome {
+                name,
+                result,
+                audit,
+                out,
+            },
+            Err(p) => TabOutcome {
+                name,
+                result: Err(RunError(0, format!("tab panicked: {}", panic_msg(p)))),
+                audit: Vec::new(),
+                out: String::new(),
+            },
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,5 +753,161 @@ expect bare
         assert!(text.contains("NAV TARGET PAGE"), "{text}");
         // and the click navigated: page 2's url is the audit's context now
         assert_eq!(audit.len(), 1);
+    }
+
+    #[test]
+    fn subst_vars() {
+        let src = "snap http://x/$USER\nfill #1 \"${PASS}\"\nexpect $$USER\n\
+                   submit -d k=$VIGIA_RUN_SUBST_NOPE -d f=$USER";
+        let stmts = parse_script(src).unwrap();
+        let vars = vec![
+            ("USER".to_string(), "alice".to_string()),
+            ("PASS".to_string(), "s3cret".to_string()),
+        ];
+        let out = subst_stmts(&stmts, &vars);
+        assert_eq!(out[0].op, Op::Snap("http://x/alice".into()));
+        assert_eq!(out[1].op, Op::Fill(1, "s3cret".into()));
+        assert_eq!(out[2].op, Op::Expect("$USER".into()));
+        assert_eq!(
+            out[3].op,
+            Op::Submit {
+                form: None,
+                // unknown name stays literal, known resolves
+                data: vec![
+                    ("k".into(), "$VIGIA_RUN_SUBST_NOPE".into()),
+                    ("f".into(), "alice".into()),
+                ],
+            }
+        );
+        // original stmts untouched
+        assert_eq!(stmts[0].op, Op::Snap("http://x/$USER".into()));
+    }
+
+    #[test]
+    fn subst_env_fallback_and_override() {
+        std::env::set_var("VIGIA_SUBST_T1", "from-env");
+        let stmts =
+            parse_script("fill #1 $SUBST_T1\nfill #2 $SUBST_T2\nfill #3 $SUBST_T1").unwrap();
+        // no tab vars: env VIGIA_<NAME> fills in, missing stays literal
+        let out = subst_stmts(&stmts, &[]);
+        assert_eq!(out[0].op, Op::Fill(1, "from-env".into()));
+        assert_eq!(out[1].op, Op::Fill(2, "$SUBST_T2".into()));
+        // a tab var beats the env var
+        let vars = vec![("SUBST_T1".to_string(), "from-tab".to_string())];
+        let out = subst_stmts(&stmts, &vars);
+        assert_eq!(out[2].op, Op::Fill(3, "from-tab".into()));
+        std::env::remove_var("VIGIA_SUBST_T1");
+    }
+
+    /// Serve `n` connections; `respond` sees the raw request and returns
+    /// the full HTTP response. Parallel tabs arrive in any order, so the
+    /// handler keys off the request path.
+    fn serve_n(n: usize, respond: impl Fn(&str) -> String + Send + 'static) -> u16 {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for _ in 0..n {
+                let Ok((mut s, _)) = l.accept() else { return };
+                let mut req = [0u8; 4096];
+                let _ = s.read(&mut req);
+                let req = String::from_utf8_lossy(&req);
+                let _ = s.write_all(respond(&req).as_bytes());
+            }
+        });
+        port
+    }
+
+    fn req_path(req: &str) -> &str {
+        req.split_whitespace().nth(1).unwrap_or("/")
+    }
+
+    #[test]
+    fn run_tabs_independent_jars() {
+        // Each tab snaps /<name>; the server echoes the name in the body
+        // and in a Set-Cookie, which each tab persists to its own jar.
+        let port = serve_n(2, |req| {
+            let tab = req_path(req).trim_start_matches('/');
+            let body = format!("<html><body><h1>hello {tab}</h1></body></html>");
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: sid={tab}; Path=/\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            )
+        });
+        let dir = std::env::temp_dir().join(format!("vigia-tabs-a-{}", std::process::id()));
+        let tabs = vec![
+            TabSpec {
+                name: "alice".into(),
+                vars: vec![("TAB".into(), "alice".into())],
+                jar_path: Some(dir.join("alice.jar")),
+            },
+            TabSpec {
+                name: "bob".into(),
+                vars: vec![("TAB".into(), "bob".into())],
+                jar_path: Some(dir.join("bob.jar")),
+            },
+        ];
+        let stmts = parse_script(&format!("snap http://127.0.0.1:{port}/$TAB")).unwrap();
+        let outcomes = run_tabs(&stmts, &tabs, false);
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].name, "alice");
+        assert_eq!(outcomes[1].name, "bob");
+        for o in &outcomes {
+            assert!(o.result.is_ok(), "{}: {:?}", o.name, o.result);
+            assert!(o.out.contains(&format!("hello {}", o.name)), "{}", o.out);
+            assert_eq!(o.audit.len(), 1);
+            assert_eq!(o.audit[0].op, "snap");
+            assert!(o.audit[0].ok);
+        }
+        // each jar kept only its own cookie
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let alice = CookieJar::load(&dir.join("alice.jar"));
+        let bob = CookieJar::load(&dir.join("bob.jar"));
+        assert_eq!(alice.header_for(&url).as_deref(), Some("sid=alice"));
+        assert_eq!(bob.header_for(&url).as_deref(), Some("sid=bob"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_tabs_failure_isolated() {
+        // Same script, but bob's $WANT does not match his page -> his run
+        // fails at line 2 while alice completes.
+        let port = serve_n(2, |req| {
+            let tab = req_path(req).trim_start_matches('/');
+            http(&format!("<html><body><p>page-{tab}</p></body></html>"))
+        });
+        let tabs = vec![
+            TabSpec {
+                name: "alice".into(),
+                vars: vec![
+                    ("TAB".into(), "alice".into()),
+                    ("WANT".into(), "alice".into()),
+                ],
+                jar_path: None,
+            },
+            TabSpec {
+                name: "bob".into(),
+                vars: vec![
+                    ("TAB".into(), "bob".into()),
+                    ("WANT".into(), "alice".into()),
+                ],
+                jar_path: None,
+            },
+        ];
+        let stmts = parse_script(&format!(
+            "snap http://127.0.0.1:{port}/$TAB\nexpect page-$WANT"
+        ))
+        .unwrap();
+        let outcomes = run_tabs(&stmts, &tabs, false);
+        assert!(outcomes[0].result.is_ok(), "{:?}", outcomes[0].result);
+        let e = outcomes[1].result.as_ref().unwrap_err();
+        assert_eq!(e.0, 2);
+        // both audits carry both ops; bob's expect is the failed one
+        assert_eq!(outcomes[0].audit.len(), 2);
+        assert!(outcomes[0].audit.iter().all(|a| a.ok));
+        assert_eq!(outcomes[1].audit.len(), 2);
+        assert!(outcomes[1].audit[0].ok);
+        assert!(!outcomes[1].audit[1].ok);
     }
 }

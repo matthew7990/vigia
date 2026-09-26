@@ -19,6 +19,7 @@ const USAGE: &str = "vigia - AI-native browser runtime
   vigia json <url> [a.b.0]               embedded JSON (__NEXT_DATA__, ld+json)
   vigia js <file.js> | -e \"<code>\"     run JavaScript (own interpreter)
   vigia run <file.vig> [--audit log.jsonl]  multi-step script + audit trail
+                        [--tab name ...] [-D KEY=VAL | --var KEY=VAL]
 
   --profile <name>                       persistent cookie jar (~/.vigia/profiles)
   --js                                   run page <script>s before reading the DOM
@@ -137,6 +138,31 @@ fn profile_path(name: &str) -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(home).join(".vigia/profiles").join(format!("{name}.jar")))
 }
 
+/// One audit entry as a JSONL line; `tab` adds the parallel-tab field.
+fn audit_line(e: &vigia_run::AuditEntry, tab: Option<&str>) -> String {
+    let mut f = vec![
+        ("line".into(), vigia_json::Json::Num(e.line as f64)),
+        ("op".into(), vigia_json::Json::Str(e.op.into())),
+        ("arg".into(), vigia_json::Json::Str(e.arg.clone())),
+    ];
+    if let Some(t) = tab {
+        f.push(("tab".into(), vigia_json::Json::Str(t.into())));
+    }
+    f.push(("status".into(), vigia_json::Json::Num(e.status as f64)));
+    f.push((
+        "ms".into(),
+        vigia_json::Json::Num((e.ms * 1000.0).round() / 1000.0),
+    ));
+    f.push(("ok".into(), vigia_json::Json::Bool(e.ok)));
+    vigia_json::Json::Obj(f).to_string()
+}
+
+fn write_audit(path: &str, text: &str) {
+    if let Err(e) = std::fs::write(path, text) {
+        eprintln!("warn: audit write failed: {e}");
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -165,8 +191,12 @@ fn main() {
         eprint!("{USAGE}");
         std::process::exit(1);
     }
+    let has_tab = args.iter().any(|a| a == "--tab");
     let cmd = args.remove(0);
     let url = args.remove(0);
+    if has_tab && cmd != "run" {
+        fail("--tab only works with run");
+    }
 
     let mut jar = jar_path
         .as_ref()
@@ -364,6 +394,8 @@ fn main() {
         "run" => {
             // The url-position arg is the .vig script path here.
             let mut audit_path = None;
+            let mut tab_names: Vec<String> = Vec::new();
+            let mut raw_vars: Vec<String> = Vec::new();
             let mut i = 0;
             while i < args.len() {
                 match args[i].as_str() {
@@ -371,8 +403,31 @@ fn main() {
                         audit_path = Some(args[i + 1].clone());
                         i += 2;
                     }
+                    "--tab" if i + 1 < args.len() => {
+                        let name = args[i + 1].clone();
+                        if profile_path(&name).is_none() {
+                            fail("bad tab name");
+                        }
+                        if tab_names.contains(&name) {
+                            fail(format!("duplicate tab: {name}"));
+                        }
+                        tab_names.push(name);
+                        i += 2;
+                    }
+                    "-D" | "--var" if i + 1 < args.len() => {
+                        raw_vars.push(args[i + 1].clone());
+                        i += 2;
+                    }
                     _ => fail(format!("bad arg: {}", args[i])),
                 }
+            }
+            if tab_names.is_empty() {
+                if !raw_vars.is_empty() {
+                    fail("-D/--var need at least one --tab");
+                }
+            } else if jar_path.is_some() {
+                // The tab name IS the profile; both jars would fight.
+                fail("--profile does not combine with --tab");
             }
             let src = std::fs::read_to_string(&url)
                 .unwrap_or_else(|e| fail(format!("cannot read {url}: {e}")));
@@ -380,6 +435,82 @@ fn main() {
                 Ok(s) => s,
                 Err(e) => fail(format!("run failed at line {}: {}", e.0, e.1)),
             };
+            if !tab_names.is_empty() {
+                // Parallel tabs: same script, one thread each with its own
+                // profile jar.
+                // `alice.USER=x` scopes USER to tab alice (split on the
+                // first '.' that names a declared tab); bare `USER=x`
+                // reaches every tab. Scoped vars beat global ones.
+                let vars: Vec<(Option<String>, String, String)> = raw_vars
+                    .iter()
+                    .map(|kv| {
+                        let (k, v) = kv
+                            .split_once('=')
+                            .unwrap_or_else(|| fail("bad -D, want KEY=VAL"));
+                        match k.split_once('.') {
+                            Some((t, kk)) if tab_names.iter().any(|n| n == t) => {
+                                (Some(t.to_string()), kk.to_string(), v.to_string())
+                            }
+                            _ => (None, k.to_string(), v.to_string()),
+                        }
+                    })
+                    .collect();
+                let specs: Vec<vigia_run::TabSpec> = tab_names
+                    .iter()
+                    .map(|n| {
+                        let mut v: Vec<(String, String)> = vars
+                            .iter()
+                            .filter(|(t, _, _)| t.as_deref() == Some(n.as_str()))
+                            .map(|(_, k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        v.extend(
+                            vars.iter()
+                                .filter(|(t, _, _)| t.is_none())
+                                .map(|(_, k, v)| (k.clone(), v.clone())),
+                        );
+                        vigia_run::TabSpec {
+                            name: n.clone(),
+                            vars: v,
+                            jar_path: profile_path(n),
+                        }
+                    })
+                    .collect();
+                let outcomes = vigia_run::run_tabs(&stmts, &specs, js);
+                let multi = outcomes.len() > 1;
+                for o in &outcomes {
+                    if multi {
+                        println!("== tab {}", o.name);
+                    }
+                    print!("{}", o.out);
+                    if !o.out.is_empty() && !o.out.ends_with('\n') {
+                        println!();
+                    }
+                }
+                if let Some(p) = &audit_path {
+                    let mut text = String::new();
+                    for o in &outcomes {
+                        for e in &o.audit {
+                            let _ = writeln!(text, "{}", audit_line(e, Some(&o.name)));
+                        }
+                    }
+                    write_audit(p, &text);
+                }
+                for o in &outcomes {
+                    if let Err(e) = &o.result {
+                        eprintln!("tab {} failed at line {}: {}", o.name, e.0, e.1);
+                    }
+                }
+                let n_ok = outcomes.iter().filter(|o| o.result.is_ok()).count();
+                eprintln!("tabs: {} ok, {} failed", n_ok, outcomes.len() - n_ok);
+                if n_ok != outcomes.len() {
+                    std::process::exit(2);
+                }
+                report(&format!(
+                    "{} steps",
+                    outcomes.iter().map(|o| o.audit.len()).sum::<usize>()
+                ));
+                return;
+            }
             let mut audit = Vec::new();
             let mut emit = |s: &str| {
                 print!("{s}");
@@ -391,22 +522,9 @@ fn main() {
             if let Some(p) = &audit_path {
                 let mut text = String::new();
                 for e in &audit {
-                    let line = vigia_json::Json::Obj(vec![
-                        ("line".into(), vigia_json::Json::Num(e.line as f64)),
-                        ("op".into(), vigia_json::Json::Str(e.op.into())),
-                        ("arg".into(), vigia_json::Json::Str(e.arg.clone())),
-                        ("status".into(), vigia_json::Json::Num(e.status as f64)),
-                        (
-                            "ms".into(),
-                            vigia_json::Json::Num((e.ms * 1000.0).round() / 1000.0),
-                        ),
-                        ("ok".into(), vigia_json::Json::Bool(e.ok)),
-                    ]);
-                    let _ = writeln!(text, "{}", line.to_string());
+                    let _ = writeln!(text, "{}", audit_line(e, None));
                 }
-                if let Err(e) = std::fs::write(p, text) {
-                    eprintln!("warn: audit write failed: {e}");
-                }
+                write_audit(p, &text);
             }
             match result {
                 Ok(()) => report(&format!("{} steps", audit.len())),

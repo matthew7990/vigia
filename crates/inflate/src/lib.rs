@@ -1,5 +1,5 @@
 //! Own DEFLATE decoder (RFC 1951) with gzip (RFC 1952) and zlib (RFC 1950)
-//! wrappers. Bit-at-a-time decode — simple and auditable. A table-driven
+//! wrappers. Bit-at-a-time decode - simple and auditable. A table-driven
 //! fast path is a measured optimization for later, not a v1 need.
 
 const MAXBITS: usize = 15;
@@ -100,7 +100,7 @@ impl Huffman {
             h.count[len as usize] += 1;
         }
         if h.count[0] as usize == lengths.len() {
-            return Ok(h); // no codes at all — decode() will always fail
+            return Ok(h); // no codes at all - decode() will always fail
         }
 
         // Over-subscription check (incomplete sets are legal).
@@ -341,7 +341,7 @@ fn codes(
     }
 }
 
-/// zlib (RFC 1950) wrapper. Also accepts a bare DEFLATE stream as a fallback —
+/// zlib (RFC 1950) wrapper. Also accepts a bare DEFLATE stream as a fallback -
 /// HTTP "deflate" is famously ambiguous in the wild.
 pub fn zlib_decode(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
     if data.len() >= 6 {
@@ -386,7 +386,7 @@ pub fn gzip_decode(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
         i += 2 + xlen;
     }
     for mask in [0x08u8, 0x10] {
-        // FNAME, FCOMMENT — zero-terminated
+        // FNAME, FCOMMENT - zero-terminated
         if flg & mask != 0 {
             match data[i..].iter().position(|&b| b == 0) {
                 Some(n) => i += n + 1,
@@ -395,7 +395,7 @@ pub fn gzip_decode(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
         }
     }
     if flg & 0x02 != 0 {
-        i += 2; // FHCRC — skipped, trailer CRC covers output
+        i += 2; // FHCRC - skipped, trailer CRC covers output
     }
     if i >= data.len() {
         return Err(Error::Truncated);

@@ -1,4 +1,4 @@
-//! Session state: cookie jar over `vigia-url`. Correct RFC 6265 matching —
+//! Session state: cookie jar over `vigia-url`. Correct RFC 6265 matching -
 //! domain-match requires a label boundary ("a.com" must not match
 //! "evila.com"), path-match requires a segment boundary, Secure only over
 //! https. Profile persistence is the next iteration; the jar is the seam.
@@ -14,7 +14,7 @@ pub struct Cookie {
     pub secure: bool,
     /// No Domain attribute: cookie goes to the exact host only (RFC 6265 5.3).
     pub host_only: bool,
-    /// HttpOnly: not readable by JS — matters once vigia-js exists.
+    /// HttpOnly: not readable by JS - matters once vigia-js exists.
     pub http_only: bool,
 }
 

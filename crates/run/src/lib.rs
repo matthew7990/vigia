@@ -308,7 +308,7 @@ fn exec(
 
 /// Execute `stmts` in order against a shared jar and live DOM. Emitted
 /// text (snapshots, extract hits, json blocks) goes to `out`. Each executed
-/// stmt appends one `AuditEntry` to `audit` — including the failed one —
+/// stmt appends one `AuditEntry` to `audit` - including the failed one -
 /// then the first failure returns `Err`.
 pub fn run(
     stmts: &[Stmt],

@@ -1,6 +1,6 @@
 [package]
 name = "vigia-dom"
-description = "Arena-based DOM with interned strings — flat memory, no Rc graphs"
+description = "Arena-based DOM with interned strings - flat memory, no Rc graphs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

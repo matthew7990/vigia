@@ -1,7 +1,7 @@
 //! vigia-json: own JSON parser/serializer. No serde.
 //!
 //! Value model preserves object key order (Vec of pairs) and keeps numbers
-//! as f64 — sufficient for agent-side data extraction from embedded JSON
+//! as f64 - sufficient for agent-side data extraction from embedded JSON
 //! (`__NEXT_DATA__`, `ld+json`, API responses).
 
 #[derive(Debug, Clone, PartialEq)]

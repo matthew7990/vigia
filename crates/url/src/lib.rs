@@ -1,4 +1,4 @@
-//! Own URL parser and resolver — the piece redirects, cookies and links stand
+//! Own URL parser and resolver - the piece redirects, cookies and links stand
 //! on. Pragmatic WHATWG-style subset for http/https plus opaque schemes.
 //! No IDN/punycode, no percent-decoding of components (only encoding of
 //! characters that must not appear raw).
@@ -196,7 +196,7 @@ impl Url {
         self.scheme == "https"
     }
 
-    /// "host" or "host:port" — for the Host header and SNI display.
+    /// "host" or "host:port" - for the Host header and SNI display.
     pub fn host_header(&self) -> String {
         match self.port {
             Some(p) if Some(p) != default_port(&self.scheme) => format!("{}:{}", self.host, p),
@@ -212,7 +212,7 @@ impl Url {
         self.port.or_else(|| default_port(&self.scheme)).unwrap_or(80)
     }
 
-    /// path + query, never empty — what goes on the request line.
+    /// path + query, never empty - what goes on the request line.
     pub fn request_target(&self) -> String {
         match &self.query {
             Some(q) => format!("{}?{}", self.path, q),
@@ -291,7 +291,7 @@ fn normalize_path(path: &mut String) {
     *path = joined;
 }
 
-// Percent-encode sets (minimal — only what must never appear raw).
+// Percent-encode sets (minimal - only what must never appear raw).
 const C_PATH: &str = " \"<>\\^`{|}";
 const C_QUERY: &str = " \"#<>";
 

@@ -1,6 +1,6 @@
 //! HTML entity decoding. Named subset covering what real pages use
 //! (esp. Spanish/Latin accented chars), plus numeric and hex references.
-//! Full WHATWG table is ~2231 entries of generated data — roadmap item;
+//! Full WHATWG table is ~2231 entries of generated data - roadmap item;
 //! this covers the entities that actually appear in the wild.
 
 use std::borrow::Cow;

@@ -1,5 +1,5 @@
 //! Allocation metering. Register `CountingAlloc` as `#[global_allocator]` and
-//! the whole process's heap becomes measurable — the "total load" number is
+//! the whole process's heap becomes measurable - the "total load" number is
 //! reported, not estimated. Contains the project's single `unsafe` site:
 //! the allocator shim itself.
 

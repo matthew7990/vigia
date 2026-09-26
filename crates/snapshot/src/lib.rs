@@ -1,4 +1,4 @@
-//! Serialize the arena DOM into a compact semantic tree — the artifact an
+//! Serialize the arena DOM into a compact semantic tree - the artifact an
 //! agent consumes. Roles instead of tags (link, textbox, heading), accessible
 //! names inlined, structural containers collapsed, `#n` refs on interactive
 //! elements (the future action contract). Optimized for one metric: tokens
@@ -26,7 +26,7 @@ const KEPT_ATTRS: &[&str] = &[
     "id", "class", "type", "name", "placeholder", "value", "role", "aria-label", "alt", "title",
 ];
 
-/// Elements an agent can act on — they get `#n` refs.
+/// Elements an agent can act on - they get `#n` refs.
 const INTERACTIVE: &[&str] = &["a", "input", "button", "select", "textarea", "summary"];
 
 /// Elements that keep their line even without attrs (containers with meaning).
@@ -98,7 +98,7 @@ fn collect_inline(dom: &Dom, id: NodeId, out: &mut String) {
 
 /// Interactive elements in the same order as `#n` refs appear in the
 /// snapshot: document order, skipping SKIP_TAGS subtrees entirely. The
-/// action layer resolves `#n` through this — both sides must stay aligned.
+/// action layer resolves `#n` through this - both sides must stay aligned.
 pub fn interactive_refs(dom: &Dom) -> Vec<NodeId> {
     let mut out = Vec::new();
     collect_refs(dom, dom.root(), &mut out);
@@ -183,7 +183,7 @@ impl Snapshotter {
                 let interactive = INTERACTIVE.contains(&tag);
 
                 // Pure-structure containers with no kept attrs never earn a
-                // line — children surface at this depth, text as 'quoted' lines.
+                // line - children surface at this depth, text as 'quoted' lines.
                 if COLLAPSE_TAGS.contains(&tag) && !has_kept_attrs {
                     for &child in dom.children(id) {
                         self.write_node(dom, child, depth, out);

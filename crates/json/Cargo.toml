@@ -1,4 +1,6 @@
 [package]
 name = "vigia-json"
-version = "0.1.0"
-edition = "2021"
+description = "Own JSON parser/serializer: order-preserving values, dotted-path lookup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

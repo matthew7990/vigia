@@ -1,4 +1,4 @@
-//! TLS boundary — the project's single declared third-party dependency,
+//! TLS boundary - the project's single declared third-party dependency,
 //! isolated behind `connect()` so the rest of vigia never names it.
 //! Contract: own TLS 1.3 (X25519, AES-GCM, SHA-256) replaces this crate in
 //! phase 2, validated against it as reference.
@@ -19,7 +19,7 @@ fn config() -> &'static ClientConfig {
     })
 }
 
-/// Opaque TLS stream — callers outside this crate never name rustls types.
+/// Opaque TLS stream - callers outside this crate never name rustls types.
 pub struct TlsStream(StreamOwned<ClientConnection, TcpStream>);
 
 impl std::io::Read for TlsStream {

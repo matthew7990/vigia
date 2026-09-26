@@ -1,4 +1,4 @@
-//! Own CSS selector engine — pragmatic subset tuned for scraping:
+//! Own CSS selector engine - pragmatic subset tuned for scraping:
 //! `tag`, `*`, `.class`, `#id`, `[attr]` `=` `~=` `|=` `^=` `$=` `*=`,
 //! `:first-child` `:last-child` `:nth-child()` `:empty` `:not(compound)`,
 //! combinators ` ` `>` `+` `~`, and `,` groups. Tag/attr names are
@@ -261,7 +261,7 @@ fn read_attr(chars: &[char], mut i: usize) -> Result<((String, AttrOp, String), 
             i += 1; // closing quote
         } else {
             // Bare value: read until whitespace or ']'. Wider than the spec
-            // (allows / and . unquoted) — pragmatic for scraping selectors.
+            // (allows / and . unquoted) - pragmatic for scraping selectors.
             let start = i;
             while i < chars.len() && !chars[i].is_whitespace() && chars[i] != ']' {
                 i += 1;

@@ -1,7 +1,9 @@
 [package]
 name = "vigia-js"
-version = "0.1.0"
-edition = "2021"
+description = "Own JavaScript interpreter: lexer, parser, tree-walk eval on arena values"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
 
 [dependencies]
 vigia-json = { path = "../json" }

@@ -2,7 +2,7 @@
 //!
 //! Every node lives in a single `Vec`, addressed by `NodeId` (a `u32`).
 //! Tag and attribute names are interned once per document. No `Rc`/`RefCell`
-//! graphs and no per-node heap allocation beyond the node vector itself —
+//! graphs and no per-node heap allocation beyond the node vector itself -
 //! this is what keeps the footprint flat on big pages.
 
 use std::collections::HashMap;
@@ -56,7 +56,7 @@ pub enum NodeData {
 pub struct ElementData {
     /// Interned tag name.
     pub tag: u32,
-    /// (interned name, value). Attribute values stay owned — interning them
+    /// (interned name, value). Attribute values stay owned - interning them
     /// is a measurable tradeoff left for later.
     pub attrs: Vec<(u32, String)>,
 }

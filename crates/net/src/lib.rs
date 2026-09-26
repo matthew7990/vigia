@@ -1,4 +1,4 @@
-//! Own HTTP/1.1 client on `std::net` — request line, headers, chunked
+//! Own HTTP/1.1 client on `std::net` - request line, headers, chunked
 //! decoding, redirects, gzip via `vigia-inflate`. TLS is isolated behind
 //! `vigia-tls` (the project's one declared dependency exception).
 //! Sync and connection-close on purpose; keep-alive pooling is a measured
@@ -89,7 +89,7 @@ pub struct Response {
 }
 
 impl Response {
-    /// Body decoded to UTF-8 — BOM, Content-Type charset, then <meta> sniff.
+    /// Body decoded to UTF-8 - BOM, Content-Type charset, then <meta> sniff.
     pub fn text(&self) -> String {
         let ct = self
             .headers

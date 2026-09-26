@@ -1,5 +1,3 @@
 target/
-.vigia/
-recordings/
-*.har
 .env
+.vigia/

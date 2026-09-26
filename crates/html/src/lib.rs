@@ -1,6 +1,6 @@
 //! Own HTML parser: tokenizer + tree construction in one streaming pass.
 //!
-//! Deliberately a pragmatic subset — handles tags, attributes (quoted and
+//! Deliberately a pragmatic subset - handles tags, attributes (quoted and
 //! unquoted), text, comments, doctype, void elements, raw-text elements and a
 //! minimal set of implied end tags. Malformed input is recovered, not rejected.
 //! Full HTML5 tree-construction fidelity (adoption agency, foster parenting)

@@ -704,6 +704,20 @@ fn subst_stmts(stmts: &[vigia_run::Stmt], vars: &[(String, String)]) -> Vec<vigi
                 vigia_run::Op::Extract(sel) => vigia_run::Op::Extract(resolve(sel, vars)),
                 vigia_run::Op::Json(p) => vigia_run::Op::Json(p.as_ref().map(|p| resolve(p, vars))),
                 vigia_run::Op::Expect(t) => vigia_run::Op::Expect(resolve(t, vars)),
+                vigia_run::Op::Req {
+                    url,
+                    method,
+                    headers,
+                    body,
+                } => vigia_run::Op::Req {
+                    url: resolve(url, vars),
+                    method: method.clone(),
+                    headers: headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), resolve(v, vars)))
+                        .collect(),
+                    body: body.as_ref().map(|b| resolve(b, vars)),
+                },
             },
         })
         .collect()

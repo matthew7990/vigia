@@ -165,20 +165,33 @@ impl<C: Read> Metered<C> {
 
 /// GET `url`, following redirects, applying cookies from `jar` both ways.
 pub fn fetch(url: &str, jar: &mut CookieJar) -> Result<Response, Error> {
-    run(url, "GET", None, jar)
+    run(url, "GET", None, &[], jar)
 }
 
 /// POST `url` with an application/x-www-form-urlencoded body.
 pub fn post_form(url: &Url, encoded: &str, jar: &mut CookieJar) -> Result<Response, Error> {
-    run(&url.to_string(), "POST", Some(encoded.as_bytes()), jar)
+    run(&url.to_string(), "POST", Some(encoded.as_bytes()), &[], jar)
+}
+
+/// Full request: any method, caller headers on top of the defaults
+/// (later duplicates win), any body. The API-replay primitive.
+pub fn req(
+    url: &str,
+    method: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    jar: &mut CookieJar,
+) -> Result<Response, Error> {
+    run(url, method, body, headers, jar)
 }
 
 /// Request loop with redirect handling. POST on 301/302/303 downgrades to
 /// GET (browser behavior); 307/308 re-send the body.
 fn run(
     url: &str,
-    method: &'static str,
+    method: &str,
     body: Option<&[u8]>,
+    headers: &[(String, String)],
     jar: &mut CookieJar,
 ) -> Result<Response, Error> {
     let mut current = Url::parse(url)?;
@@ -187,7 +200,7 @@ fn run(
     let mut redirects = 0;
     let mut timings = Timings::default();
     loop {
-        let res = request(&current, jar, method, body)?;
+        let res = request(&current, jar, method, body, headers)?;
         timings.connect += res.timings.connect;
         timings.tls += res.timings.tls;
         timings.ttfb += res.timings.ttfb;
@@ -237,6 +250,7 @@ fn request(
     jar: &mut CookieJar,
     method: &str,
     body: Option<&[u8]>,
+    extra_headers: &[(String, String)],
 ) -> Result<StepResponse, Error> {
     let t_total = Instant::now();
 
@@ -273,14 +287,17 @@ fn request(
     if let Some(cookie) = jar.header_for(url) {
         let _ = fmt::Write::write_fmt(&mut req, format_args!("Cookie: {cookie}\r\n"));
     }
+    let custom_ct = extra_headers
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case("content-type"));
     if let Some(b) = body {
-        let _ = fmt::Write::write_fmt(
-            &mut req,
-            format_args!(
-                "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n",
-                b.len()
-            ),
-        );
+        if !custom_ct {
+            req.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
+        }
+        let _ = fmt::Write::write_fmt(&mut req, format_args!("Content-Length: {}\r\n", b.len()));
+    }
+    for (k, v) in extra_headers {
+        let _ = fmt::Write::write_fmt(&mut req, format_args!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
     conn.write_all(req.as_bytes())?;

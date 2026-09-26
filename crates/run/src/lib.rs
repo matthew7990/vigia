@@ -26,6 +26,13 @@ pub enum Op {
     Extract(String),
     Json(Option<String>),
     Expect(String),
+    /// Raw request against the session jar: the API-replay op.
+    Req {
+        url: String,
+        method: String,
+        headers: Vec<(String, String)>,
+        body: Option<String>,
+    },
 }
 
 impl Op {
@@ -38,6 +45,7 @@ impl Op {
             Self::Extract(_) => "extract",
             Self::Json(_) => "json",
             Self::Expect(_) => "expect",
+            Self::Req { .. } => "req",
         }
     }
 
@@ -60,6 +68,7 @@ impl Op {
             Self::Extract(sel) => sel.clone(),
             Self::Json(path) => path.clone().unwrap_or_default(),
             Self::Expect(sub) => sub.clone(),
+            Self::Req { method, url, .. } => format!("{method} {url}"),
         }
     }
 }
@@ -199,6 +208,46 @@ pub fn parse_script(src: &str) -> Result<Vec<Stmt>, RunError> {
                 _ => return Err(RunError(line, "json takes at most one argument".into())),
             },
             "expect" => Op::Expect(one_arg(&toks, line, "expect")?),
+            "req" => {
+                if toks.len() < 2 {
+                    return Err(RunError(line, "req takes a url".into()));
+                }
+                let mut method = "GET".to_string();
+                let mut headers = Vec::new();
+                let mut body = None;
+                let mut j = 2;
+                while j < toks.len() {
+                    match toks[j].as_str() {
+                        "-X" | "--method" if j + 1 < toks.len() => {
+                            method = toks[j + 1].to_uppercase();
+                            j += 2;
+                        }
+                        "-H" | "--header" if j + 1 < toks.len() => {
+                            let Some((k, v)) = toks[j + 1].split_once(':') else {
+                                return Err(RunError(line, "bad -H, want 'K: V'".into()));
+                            };
+                            headers.push((k.trim().to_string(), v.trim().to_string()));
+                            j += 2;
+                        }
+                        "-d" | "--data" if j + 1 < toks.len() => {
+                            body = Some(toks[j + 1].clone());
+                            if method == "GET" {
+                                method = "POST".into();
+                            }
+                            j += 2;
+                        }
+                        other => {
+                            return Err(RunError(line, format!("bad req arg: {other}")));
+                        }
+                    }
+                }
+                Op::Req {
+                    url: toks[1].clone(),
+                    method,
+                    headers,
+                    body,
+                }
+            }
             other => return Err(RunError(line, format!("unknown op: {other}"))),
         };
         stmts.push(Stmt { op, line });
@@ -337,6 +386,25 @@ fn exec(
             if !vigia_snapshot::snapshot(&p.dom).contains(sub.as_str()) {
                 return Err(format!("expect failed: '{sub}' not in snapshot"));
             }
+        }
+        Op::Req {
+            url,
+            method,
+            headers,
+            body,
+        } => {
+            // Out-of-band API call: doesn't touch the page DOM, does share
+            // the cookie jar both ways - the session IS the auth.
+            let res = vigia_net::req(
+                url,
+                method,
+                headers,
+                body.as_deref().map(str::as_bytes),
+                jar,
+            )
+            .map_err(|e| format!("req failed: {e}"))?;
+            out(&format!("== {} {}", res.status, res.final_url));
+            out(&res.text());
         }
     }
     Ok(())
@@ -483,6 +551,20 @@ fn subst_stmts(stmts: &[Stmt], vars: &[(String, String)]) -> Vec<Stmt> {
                 Op::Extract(sel) => Op::Extract(resolve(sel, vars)),
                 Op::Json(p) => Op::Json(p.as_ref().map(|p| resolve(p, vars))),
                 Op::Expect(t) => Op::Expect(resolve(t, vars)),
+                Op::Req {
+                    url,
+                    method,
+                    headers,
+                    body,
+                } => Op::Req {
+                    url: resolve(url, vars),
+                    method: method.clone(),
+                    headers: headers
+                        .iter()
+                        .map(|(k, v)| (k.clone(), resolve(v, vars)))
+                        .collect(),
+                    body: body.as_ref().map(|b| resolve(b, vars)),
+                },
             },
         })
         .collect()
@@ -600,6 +682,28 @@ expect bare
                 Op::Expect("bare".into()),
             ]
         );
+    }
+
+    #[test]
+    fn req_op_parses() {
+        assert_eq!(
+            ops(
+                r#"req http://a.com/api -X POST -H "Content-Type: application/json" -d "{\"x\":1}""#
+            ),
+            vec![Op::Req {
+                url: "http://a.com/api".into(),
+                method: "POST".into(),
+                headers: vec![("Content-Type".into(), "application/json".into())],
+                body: Some("{\"x\":1}".into()),
+            }]
+        );
+        // -d alone implies POST.
+        match &ops("req http://a.com/api -d x=1")[0] {
+            Op::Req { method, .. } => assert_eq!(method, "POST"),
+            _ => panic!("expected req"),
+        }
+        assert!(parse_script("req").is_err());
+        assert!(parse_script("req http://a.com -H bad").is_err());
     }
 
     #[test]

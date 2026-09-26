@@ -16,6 +16,7 @@ const USAGE: &str = "vigia - AI-native browser runtime
   vigia extract <url> <css>              elements matching a CSS selector
   vigia click <url> <#n>                 follow snapshot ref (link/submit)
   vigia submit <url> [-f css] -d k=v..   fill + submit a form (login flows)
+  vigia req <url> [-X M] [-H 'K: V'].. [-d body]   raw API call on the session jar
   vigia json <url> [a.b.0]               embedded JSON (__NEXT_DATA__, ld+json)
   vigia js <file.js> | -e \"<code>\"     run JavaScript (own interpreter)
   vigia run <file.vig> [--audit log.jsonl]  multi-step script + audit trail
@@ -376,6 +377,49 @@ fn main() {
             let (dom2, _, _) = parse_dom(&res2, js, &mut jar);
             print!("{}", snapshot(&dom2));
             report("");
+        }
+        "req" => {
+            // Raw request on the session jar: the API-replay primitive.
+            let mut method = "GET".to_string();
+            let mut headers = Vec::new();
+            let mut body: Option<String> = None;
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-X" | "--method" if i + 1 < args.len() => {
+                        method = args[i + 1].to_uppercase();
+                        i += 2;
+                    }
+                    "-H" | "--header" if i + 1 < args.len() => {
+                        match args[i + 1].split_once(':') {
+                            Some((k, v)) => {
+                                headers.push((k.trim().to_string(), v.trim().to_string()))
+                            }
+                            None => fail("bad -H, want 'K: V'"),
+                        }
+                        i += 2;
+                    }
+                    "-d" | "--data" if i + 1 < args.len() => {
+                        body = Some(args[i + 1].clone());
+                        if method == "GET" {
+                            method = "POST".into();
+                        }
+                        i += 2;
+                    }
+                    _ => fail(format!("bad arg: {}", args[i])),
+                }
+            }
+            let res = vigia_net::req(
+                &url,
+                &method,
+                &headers,
+                body.as_deref().map(str::as_bytes),
+                &mut jar,
+            )
+            .unwrap_or_else(|e| fail(format!("req failed: {e}")));
+            report_fetch(&res);
+            print!("{}", res.text());
+            report(&format!("~{} tokens", fmt_num(est_tokens(res.body.len()))));
         }
         "json" => {
             let path = args.first().map(|s| s.as_str());

@@ -71,6 +71,7 @@ vigia fetch <url>                 # raw response body
 vigia extract <url> "td.price"    # CSS selector extraction
 vigia click <url> 3               # follow snapshot ref #3 (gets a new page)
 vigia submit <url> -d user=x -d pass=y   # form login
+vigia req <url> -H 'K: V' -d '{..}'   # raw API call on the session jar
 vigia json <url> [a.b.0]          # embedded JSON (__NEXT_DATA__, ld+json)
 vigia js <file.js> | -e "<code>"  # run JavaScript (own interpreter)
 vigia run <file.vig> [--audit log.jsonl] # multi-step script + audit trail
@@ -96,6 +97,7 @@ fill #2 "my password"
 click #3
 expect "Dashboard"
 extract li.item
+req https://api.example.com/data -H "Content-Type: application/json" -d "{\"a\":1}"
 ```
 
 Every command reports cost and latency on stderr:

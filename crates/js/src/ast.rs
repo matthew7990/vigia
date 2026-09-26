@@ -50,4 +50,13 @@ pub enum Stmt {
     Block(Vec<Stmt>),
     Break,
     Continue,
+    /// `throw <expr>`
+    Throw(Expr),
+    /// try { body } [catch [(param)] { block }] [finally { block }] -
+    /// the parser requires at least one of catch/finally.
+    Try {
+        body: Vec<Stmt>,
+        catch: Option<(Option<String>, Vec<Stmt>)>,
+        finally: Option<Vec<Stmt>>,
+    },
 }

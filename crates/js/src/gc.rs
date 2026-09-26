@@ -182,6 +182,7 @@ impl Interp {
             self.protos.number,
             self.protos.date,
             self.protos.promise,
+            self.protos.error,
         ] {
             if p != u32::MAX {
                 m.ow.push(p);

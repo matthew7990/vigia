@@ -45,6 +45,10 @@ const KWS: &[&str] = &[
     "instanceof",
     "async",
     "await",
+    "throw",
+    "try",
+    "catch",
+    "finally",
 ];
 
 /// Longest first: prefix order decides `>>>=` vs `>>>` vs `>>` vs `>`.

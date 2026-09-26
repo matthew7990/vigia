@@ -216,6 +216,20 @@ impl P {
                 Ok(Stmt::While(c, Box::new(b?)))
             }
             Tok::Kw("for") => self.for_stmt(),
+            Tok::Kw("throw") => {
+                self.i += 1;
+                // real ASI: a newline between throw and its expr is an error
+                if self.nl() {
+                    return Err(err("newline after 'throw'"));
+                }
+                if self.at_p(";") || self.at_p("}") || self.at_eof() {
+                    return Err(err("throw needs an expression"));
+                }
+                let e = self.expr()?;
+                self.semi()?;
+                Ok(Stmt::Throw(e))
+            }
+            Tok::Kw("try") => self.try_stmt(),
             Tok::Kw("break") | Tok::Kw("continue") => {
                 if self.in_loop == 0 {
                     return Err(err("break/continue outside loop"));
@@ -235,6 +249,41 @@ impl P {
                 Ok(Stmt::Expr(e))
             }
         }
+    }
+
+    /// try {} [catch[(ident)] {}] [finally {}] - at least one clause is
+    /// required; the catch binding (when present) is a single identifier.
+    fn try_stmt(&mut self) -> R<Stmt> {
+        self.i += 1; // 'try'
+        self.exp_p("{")?;
+        let body = self.block_body()?;
+        let catch = if self.eat_kw("catch") {
+            let param = if self.eat_p("(") {
+                let p = self.ident()?;
+                self.exp_p(")")?;
+                Some(p)
+            } else {
+                None
+            };
+            self.exp_p("{")?;
+            Some((param, self.block_body()?))
+        } else {
+            None
+        };
+        let finally = if self.eat_kw("finally") {
+            self.exp_p("{")?;
+            Some(self.block_body()?)
+        } else {
+            None
+        };
+        if catch.is_none() && finally.is_none() {
+            return Err(err("'try' needs 'catch' or 'finally'"));
+        }
+        Ok(Stmt::Try {
+            body,
+            catch,
+            finally,
+        })
     }
 
     /// Body of a `{ ... }` block; `{` already consumed.
@@ -720,5 +769,50 @@ mod tests {
         assert!(parse_program("a.b.").is_err());
         assert!(parse_program("(((((1").is_err());
         assert!(parse_program("1++").is_err());
+    }
+
+    #[test]
+    fn try_throw() {
+        assert!(matches!(
+            parse_program("try{a()}catch(e){b()}finally{c()}")
+                .unwrap()
+                .remove(0),
+            Stmt::Try { .. }
+        ));
+        // each clause optional, but at least one is required
+        match parse_program("try{}catch(e){}").unwrap().remove(0) {
+            Stmt::Try {
+                catch: Some((Some(p), _)),
+                finally: None,
+                ..
+            } => assert_eq!(p, "e"),
+            s => panic!("{s:?}"),
+        }
+        match parse_program("try{}finally{}").unwrap().remove(0) {
+            Stmt::Try {
+                catch: None,
+                finally: Some(_),
+                ..
+            } => {}
+            s => panic!("{s:?}"),
+        }
+        // catch without a binding param
+        match parse_program("try{}catch{}").unwrap().remove(0) {
+            Stmt::Try {
+                catch: Some((None, _)),
+                ..
+            } => {}
+            s => panic!("{s:?}"),
+        }
+        assert!(parse_program("try{}").is_err());
+        assert!(parse_program("try{}catch({a}){}").is_err()); // no destructuring
+        assert!(matches!(
+            parse_program("throw x").unwrap().remove(0),
+            Stmt::Throw(Expr::Ident(_))
+        ));
+        assert!(parse_program("throw").is_err());
+        assert!(parse_program("throw\n1").is_err()); // real ASI rule
+                                                     // p.catch(...) member syntax unaffected by the new keyword
+        assert_eq!(parse_program("p.catch(f)").unwrap().len(), 1);
     }
 }

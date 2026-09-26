@@ -254,6 +254,9 @@ impl Interp {
             }
         }
         if let Err(e) = self.fire(0, "DOMContentLoaded") {
+            // an uncaught listener `throw` arrives as a raw value - render
+            // it now, there's no script frame left to catch it
+            let e = self.bound_err(e);
             errs.push(e);
         }
         ScriptsOutcome {
@@ -954,7 +957,7 @@ mod tests {
     }
 
     fn errmsg(it: &mut Interp, src: &str) -> String {
-        it.run(src).unwrap_err().0
+        it.run(src).unwrap_err().to_string()
     }
 
     const PAGE: &str = r#"<html><head><title>old</title></head><body>
@@ -1214,7 +1217,7 @@ mod tests {
         let out = it.run_scripts(d, None);
         let (dom, errs) = (out.dom, out.errors);
         assert_eq!(errs.len(), 1);
-        assert!(errs[0].0.contains("throwaway"));
+        assert!(errs[0].to_string().contains("throwaway"));
         // mutations from the scripts that ran are in the returned dom
         let h1 = vigia_css::query(&dom, "h1").unwrap();
         assert_eq!(vigia_actions::text_content(&dom, h1[0]), "INJ");
@@ -1378,6 +1381,66 @@ mod tests {
     }
 
     #[test]
+    fn listener_throw_containment() {
+        // a listener that catches its own throw doesn't disturb dispatch
+        let mut it = interp(r#"<body><div id=a><p id=p>x</p></div></body>"#);
+        it.run(
+            "var log=[];\
+             var a=document.getElementById('a');\
+             a.addEventListener('click',function(e){try{throw 9}catch(q){log.push('c'+q)}});\
+             document.body.addEventListener('click',function(){log.push('body')});\
+             document.getElementById('p').click()",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "log.join(',')"), "c9,body");
+        // an uncaught throw still aborts dispatch and reaches click()'s
+        // caller, where a page-level try can see the value verbatim
+        let mut it = interp(r#"<body><div id=a></div></body>"#);
+        assert_eq!(
+            ev(
+                &mut it,
+                "var r;\
+                 document.getElementById('a').addEventListener('click',function(){throw 8});\
+                 try{document.getElementById('a').click()}catch(q){r=q}r"
+            ),
+            "8"
+        );
+        // unhandled: the dispatch error is the run() error
+        assert!(errmsg(&mut it, "document.getElementById('a').click()").contains("8"));
+    }
+
+    #[test]
+    fn script_throw_collects() {
+        // an uncaught `throw` in one <script> lands in errors; later
+        // scripts still run
+        let mut d = Dom::new();
+        vigia_html::parse(
+            "<html><body><script>throw new Error('bad')</script>\
+             <script>document.title='ok'</script></body></html>",
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(d, None);
+        assert_eq!(out.errors.len(), 1);
+        assert!(
+            out.errors[0].to_string().contains("Error: bad"),
+            "{}",
+            out.errors[0]
+        );
+        assert_eq!(page_title(&out.dom), "ok");
+        // a plain thrown value stringifies too
+        let mut d = Dom::new();
+        vigia_html::parse(
+            "<html><body><script>throw 'zip'</script></body></html>",
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(d, None);
+        assert_eq!(out.errors.len(), 1);
+        assert_eq!(out.errors[0].to_string(), "zip");
+    }
+
+    #[test]
     fn dom_content_loaded() {
         let mut d = Dom::new();
         vigia_html::parse(
@@ -1418,14 +1481,14 @@ mod tests {
         assert!(it
             .run("fetch('/x')")
             .unwrap_err()
-            .0
+            .to_string()
             .contains("page context"));
         // installed even with a dom but no net ctx
         let mut it = interp("<body></body>");
         assert!(it
             .run("fetch('/x')")
             .unwrap_err()
-            .0
+            .to_string()
             .contains("page context"));
     }
 
@@ -1459,10 +1522,7 @@ mod tests {
             }),
         );
         assert!(out.errors.is_empty(), "{:?}", out.errors);
-        assert_eq!(
-            page_title(&out.dom),
-            format!("200:true:x:{{\"name\":\"x\"}}")
-        );
+        assert_eq!(page_title(&out.dom), "200:true:x:{\"name\":\"x\"}");
         // relative url resolved against the page url
         assert_eq!(log.lock().unwrap()[0], "GET /api?x=1 HTTP/1.1");
         // Set-Cookie landed in the jar that came back out
@@ -1545,11 +1605,15 @@ mod tests {
         );
         assert_eq!(out.errors.len(), 1);
         assert!(
-            out.errors[0].0.contains("unhandled rejection"),
+            out.errors[0].to_string().contains("unhandled rejection"),
             "{}",
-            out.errors[0].0
+            out.errors[0]
         );
-        assert!(out.errors[0].0.contains("fetch"), "{}", out.errors[0].0);
+        assert!(
+            out.errors[0].to_string().contains("fetch"),
+            "{}",
+            out.errors[0]
+        );
     }
 
     // ---- async runtime on the page ------------------------------------------
@@ -1677,7 +1741,11 @@ mod tests {
             "http://127.0.0.1:1/",
         );
         assert_eq!(out.errors.len(), 1);
-        assert!(out.errors[0].0.contains("dead.js"), "{}", out.errors[0].0);
+        assert!(
+            out.errors[0].to_string().contains("dead.js"),
+            "{}",
+            out.errors[0]
+        );
         assert_eq!(page_title(&out.dom), "alive");
     }
 
@@ -1713,14 +1781,14 @@ mod tests {
         // skipped, but each leaves an error entry as the signal
         assert_eq!(out.errors.len(), 2);
         assert!(
-            out.errors[0].0.contains("data scheme"),
+            out.errors[0].to_string().contains("data scheme"),
             "{}",
-            out.errors[0].0
+            out.errors[0]
         );
         assert!(
-            out.errors[1].0.contains("javascript scheme"),
+            out.errors[1].to_string().contains("javascript scheme"),
             "{}",
-            out.errors[1].0
+            out.errors[1]
         );
         assert_eq!(page_title(&out.dom), "ok");
     }

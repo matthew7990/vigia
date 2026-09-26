@@ -22,7 +22,7 @@
 //!   `new` on a Native just calls it (ctors allocate their own result).
 //!   `new` callee is primary + member chain: `new a.b()` is New(Member a.b).
 //! - No regex literals: String.replace takes a string/number needle only.
-//! - No for-in/of, switch, try, do-while, getters, delete, void, ?., ??,
+//! - No for-in/of, switch, do-while, getters, delete, void, ?., ??,
 //!   =>, spread, classes, labels, __proto__ accessor.
 //! - Events: addEventListener + inline `on*` attrs, bubble phase only
 //!   (no capture). Dispatch is synchronous.
@@ -37,14 +37,22 @@
 //!   so every queued timer completes before run() returns. Caps: 4096
 //!   timer fires per drain, microtask throughput bounded by max_steps.
 //!   resolve(promise) adopts its state; non-Promise thenables are not
-//!   adopted. Promise rejection reasons are plain values; a handler that
-//!   throws rejects with the error text as a string.
+//!   adopted. Promise rejection reasons are plain values; a handler's
+//!   `throw` rejects with the thrown value verbatim, an internal error
+//!   with its message text.
 //! - async/await: `async function` bodies run synchronously and wrap the
 //!   result into a promise (returned promise values are adopted). `await`
-//!   on a Fulfilled promise unwraps; Rejected throws the reason (as text);
+//!   on a Fulfilled promise unwraps; Rejected throws the reason value;
 //!   Pending is an error - no suspension exists because everything
 //!   resolvable is settled eagerly. `await` outside an async fn is an
 //!   eval error (the parser accepts it for grammar simplicity).
+//! - Errors: throw/try/catch/finally, plus an `Error` builtin (name,
+//!   message, toString - no `stack`). A catch param binds thrown values
+//!   verbatim; internal errors materialize as Error objects so
+//!   `e instanceof Error` and `e.message` work. `finally` runs on every
+//!   exit (normal, throw, return, break) and its own abrupt completion
+//!   wins. Runaway guards (steps, call depth, heap/env caps) are Fatal:
+//!   catch never sees them, finally still runs before they propagate.
 //! - fetch() performs the HTTP request eagerly at call time and returns a
 //!   resolved Promise holding the response object; network failures give
 //!   a rejected Promise (real fetch semantics). Response text()/json()
@@ -71,19 +79,42 @@ pub use bindings::ScriptsOutcome;
 pub use gc::GcStats;
 pub use parse::parse_program as parse;
 
-/// Interpreter error. Message carries a byte offset where one is known.
+/// Interpreter error. `Msg` is an internal (catchable) error; `Throw`
+/// carries a script `throw`'s value verbatim; `Fatal` is a runaway-guard
+/// stop (steps/call-depth/heap/env caps) that catch clauses never see -
+/// it still passes through finally blocks.
 #[derive(Debug)]
-pub struct JsError(pub String);
+pub enum JsError {
+    Msg(String),
+    Throw(Value),
+    Fatal(String),
+}
+
+impl JsError {
+    /// try/catch intercepts only Msg and Throw.
+    pub(crate) fn catchable(&self) -> bool {
+        !matches!(self, JsError::Fatal(_))
+    }
+}
 
 impl std::fmt::Display for JsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        match self {
+            JsError::Msg(m) | JsError::Fatal(m) => write!(f, "{m}"),
+            // a Throw reaching Display skipped boundary normalization
+            JsError::Throw(v) => write!(f, "uncaught throw: {v:?}"),
+        }
     }
 }
 impl std::error::Error for JsError {}
 
 pub(crate) fn err(msg: impl Into<String>) -> JsError {
-    JsError(msg.into())
+    JsError::Msg(msg.into())
+}
+
+/// Runaway-guard stop: never intercepted by catch clauses.
+pub(crate) fn fatal(msg: impl Into<String>) -> JsError {
+    JsError::Fatal(msg.into())
 }
 
 /// JS value. Str/Obj are arena indices into Heap, not pointers.
@@ -205,6 +236,7 @@ pub struct Protos {
     pub number: u32,
     pub date: u32,
     pub promise: u32,
+    pub error: u32,
 }
 
 impl Protos {
@@ -217,6 +249,7 @@ impl Protos {
             number: u32::MAX,
             date: u32::MAX,
             promise: u32::MAX,
+            error: u32::MAX,
         }
     }
 }
@@ -268,7 +301,7 @@ impl Heap {
 
     fn room(&self) -> Result<(), JsError> {
         if self.live() >= self.cap {
-            Err(err("heap cap"))
+            Err(fatal("heap cap"))
         } else {
             Ok(())
         }
@@ -471,13 +504,13 @@ impl Interp {
         let mut errs = Vec::new();
         self.drain(&mut errs);
         match r {
-            Err(e) => Err(e),
+            Err(e) => Err(self.bound_err(e)),
             // unreachable: parser rejects top-level return/break/continue
             Ok(eval::Flow::Normal) => match errs.into_iter().next() {
-                Some(e) => Err(e),
+                Some(e) => Err(self.bound_err(e)),
                 None => Ok(self.last),
             },
-            Ok(_) => Err(err("control flow escaped program")),
+            Ok(_) => Err(fatal("control flow escaped program")),
         }
     }
 }

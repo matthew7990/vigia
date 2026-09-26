@@ -9,7 +9,7 @@ use vigia_json::Json;
 
 use crate::ast::{Expr, FnDef, Stmt};
 use crate::{
-    err, po, Env, Heap, Interp, JsError, Microtask, NativeFn, Obj, PromiseState, Protos,
+    err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, Obj, PromiseState, Protos,
     ThenHandler, Timer, Value,
 };
 
@@ -513,6 +513,16 @@ impl Interp {
             ("toISOString", n_date_iso),
             ("valueOf", n_date_get_time),
         ]);
+        // Error.prototype: `name` as a data prop + a real toString method
+        let mut eps: Vec<(String, Value)> = Vec::new();
+        if let Ok(nm) = self.heap.intern_str("Error") {
+            eps.push(("name".into(), Value::Str(nm)));
+        }
+        let proto = po(self.protos.object);
+        if let Ok(ep) = self.heap.alloc_obj(Obj::Ordinary { pairs: eps, proto }) {
+            self.protos.error = ep;
+            self.put(ep, "toString", n_err_to_string);
+        }
     }
 
     pub(crate) fn install_builtins(&mut self) {
@@ -544,6 +554,7 @@ impl Interp {
         self.ctor("Number", n_number_cast, pr.number, &[]);
         self.ctor("Boolean", n_boolean_cast, u32::MAX, &[]);
         self.ctor("Date", n_date, pr.date, &[("now", n_date_now)]);
+        self.ctor("Error", n_error, pr.error, &[]);
         self.ctor(
             "Promise",
             n_promise_ctor,
@@ -618,7 +629,7 @@ impl Interp {
     fn tick(&mut self) -> Result<(), JsError> {
         self.steps += 1;
         if self.steps > self.max_steps {
-            return Err(err("step limit exceeded"));
+            return Err(fatal("step limit exceeded"));
         }
         Ok(())
     }
@@ -632,7 +643,7 @@ impl Interp {
             return Ok(id);
         }
         if self.envs.len() >= self.max_envs {
-            return Err(err("env cap"));
+            return Err(fatal("env cap"));
         }
         self.envs.push(Env {
             vars: HashMap::new(),
@@ -754,21 +765,78 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::For(init, test, upd, body) => self.stmt_for(env, init, test, upd, body),
-            Stmt::Block(ss) => {
-                // new env only when the block declares something
-                if ss
-                    .iter()
-                    .any(|s| matches!(s, Stmt::VarDecl(_) | Stmt::FnDecl(_)))
-                {
-                    let e2 = self.new_env(env)?;
-                    self.exec_block(ss, e2)
-                } else {
-                    self.exec_block(ss, env)
-                }
-            }
+            Stmt::Block(ss) => self.exec_scoped(env, ss),
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
+            Stmt::Throw(e) => {
+                let v = self.expr(env, e)?;
+                Err(JsError::Throw(v))
+            }
+            Stmt::Try {
+                body,
+                catch,
+                finally,
+            } => self.stmt_try(env, body, catch, finally),
         }
+    }
+
+    /// Braced body in a fresh env only when it declares names - the
+    /// scoping rule Stmt::Block and the try clauses share.
+    fn exec_scoped(&mut self, env: u32, ss: &[Stmt]) -> Result<Flow, JsError> {
+        if ss
+            .iter()
+            .any(|s| matches!(s, Stmt::VarDecl(_) | Stmt::FnDecl(_)))
+        {
+            let e2 = self.new_env(env)?;
+            self.exec_block(ss, e2)
+        } else {
+            self.exec_block(ss, env)
+        }
+    }
+
+    /// try/catch/finally. catch sees only catchable errors (thrown values
+    /// and internal Msgs - Fatal blows straight through). finally runs on
+    /// every exit incl. return/break/continue, and its own abrupt
+    /// completion (a throw or a control-flow Flow) overrides whatever was
+    /// in flight.
+    fn stmt_try(
+        &mut self,
+        env: u32,
+        body: &[Stmt],
+        catch: &Option<(Option<String>, Vec<Stmt>)>,
+        finally: &Option<Vec<Stmt>>,
+    ) -> Result<Flow, JsError> {
+        let r = self.exec_scoped(env, body);
+        let r = match (r, catch) {
+            (Err(e), Some((param, cbody))) if e.catchable() => {
+                match self.catch_env(env, param.as_deref(), e) {
+                    Ok(cenv) => self.exec_block(cbody, cenv),
+                    Err(e2) => Err(e2),
+                }
+            }
+            (r, _) => r,
+        };
+        let Some(fbody) = finally else { return r };
+        match self.exec_scoped(env, fbody) {
+            Ok(Flow::Normal) => r,
+            abrupt => abrupt,
+        }
+    }
+
+    /// Fresh env for a catch block, holding the param binding when one
+    /// exists: thrown values bind verbatim; an internal Msg materializes
+    /// as an Error object so `e.message`/`e instanceof Error` work.
+    fn catch_env(&mut self, env: u32, param: Option<&str>, e: JsError) -> Result<u32, JsError> {
+        let v = match e {
+            JsError::Throw(v) => v,
+            JsError::Msg(m) => self.error_obj(&m)?,
+            JsError::Fatal(_) => unreachable!("fatal errors aren't catchable"),
+        };
+        let cenv = self.new_env(env)?;
+        if let Some(p) = param {
+            self.env_declare(cenv, p, v);
+        }
+        Ok(cenv)
     }
 
     /// for(init; test; upd) body: the decl env rides env_stack so GC
@@ -928,9 +996,9 @@ impl Interp {
                         self.handled_promises.insert(pid);
                         match self.heap.obj(pid) {
                             Obj::Promise(PromiseState::Fulfilled(u)) => Ok(*u),
-                            Obj::Promise(PromiseState::Rejected(r)) => {
-                                Err(err(format!("await: {}", to_str(&self.heap, *r))))
-                            }
+                            // the reason value itself is thrown, so a
+                            // try/catch around the await sees it verbatim
+                            Obj::Promise(PromiseState::Rejected(r)) => Err(JsError::Throw(*r)),
                             Obj::Promise(PromiseState::Pending { .. }) => {
                                 Err(err("await on pending promise (vigia settles fetch/timer \
                                  eagerly; pending awaits unsupported)"))
@@ -1210,7 +1278,7 @@ impl Interp {
         self.call_depth += 1;
         if self.call_depth > self.max_call_depth {
             self.call_depth -= 1;
-            return Err(err("max call depth"));
+            return Err(fatal("max call depth"));
         }
         // Root callee/this/args for the call's duration: GC can't see Rust
         // locals, so a callback a native holds (arr.map's f) or an IIFE
@@ -1262,21 +1330,24 @@ impl Interp {
         self.call_vals.truncate(vbase);
         self.call_depth -= 1;
         if is_async {
-            // async fn: returned value fulfills (promises adopt), a thrown
-            // error rejects with the message text.
-            let p = promise_new(self)?;
+            // async fn: a return fulfills (promises adopt); a `throw`
+            // rejects with the thrown value verbatim, an internal error
+            // with its message text. Fatal propagates instead - the
+            // promise just stays pending (and unreported).
             match r {
-                Ok(v) => self.promise_resolve(p, v),
+                Ok(v) => {
+                    let p = promise_new(self)?;
+                    self.promise_resolve(p, v);
+                    Ok(Value::Obj(p))
+                }
+                Err(e @ JsError::Fatal(_)) => Err(e),
                 Err(e) => {
-                    let s = self
-                        .heap
-                        .alloc_str(e.0)
-                        .map(Value::Str)
-                        .unwrap_or(Value::Undef);
-                    self.promise_settle(p, true, s);
+                    let p = promise_new(self)?;
+                    let v = err_value(self, e);
+                    self.promise_settle(p, true, v);
+                    Ok(Value::Obj(p))
                 }
             }
-            Ok(Value::Obj(p))
         } else {
             r
         }
@@ -1289,6 +1360,50 @@ impl Interp {
                 .map(|j| j.to_string())
                 .unwrap_or_else(|_| "[object Object]".into()),
             _ => to_str(&self.heap, v),
+        }
+    }
+
+    /// Fresh Error object under Error.prototype carrying `msg`.
+    pub(crate) fn error_obj(&mut self, msg: &str) -> Result<Value, JsError> {
+        let proto = po(self.protos.error);
+        let m = Value::Str(self.heap.alloc_str(msg.to_string())?);
+        Ok(Value::Obj(self.heap.alloc_obj(Obj::Ordinary {
+            pairs: vec![("message".into(), m)],
+            proto,
+        })?))
+    }
+
+    /// Text of a thrown value for an error report: objects with a
+    /// `message` prop (Error-shaped) render "Name: message".
+    fn thrown_text(&self, v: Value) -> String {
+        if let Value::Obj(_) = v {
+            if let Ok(m) = get_prop(&self.heap, &self.protos, v, "message") {
+                if !matches!(m, Value::Undef) {
+                    let mut name = get_prop(&self.heap, &self.protos, v, "name")
+                        .map(|n| to_str(&self.heap, n))
+                        .unwrap_or_default();
+                    if name.is_empty() {
+                        name = "Error".into();
+                    }
+                    let ms = to_str(&self.heap, m);
+                    return if ms.is_empty() {
+                        name
+                    } else {
+                        format!("{name}: {ms}")
+                    };
+                }
+            }
+        }
+        to_str(&self.heap, v)
+    }
+
+    /// Boundary render: a thrown value becomes its text (the heap id
+    /// inside Throw isn't rooted once the error leaves eval); Msg and
+    /// Fatal pass through unchanged.
+    pub(crate) fn bound_err(&self, e: JsError) -> JsError {
+        match e {
+            JsError::Throw(v) => err(self.thrown_text(v)),
+            _ => e,
         }
     }
 }
@@ -1405,12 +1520,8 @@ fn n_res_json(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Js
         Ok(v) => it.promise_settle(p, false, v),
         // real .json() rejects on a parse error, it doesn't throw
         Err(e) => {
-            let s = it
-                .heap
-                .alloc_str(e.0)
-                .map(Value::Str)
-                .unwrap_or(Value::Undef);
-            it.promise_settle(p, true, s);
+            let v = err_value(it, e);
+            it.promise_settle(p, true, v);
         }
     }
     Ok(Value::Obj(p))
@@ -2449,6 +2560,45 @@ fn n_date_iso(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Js
     Ok(Value::Str(it.heap.alloc_str(t)?))
 }
 
+// -- Error ---------------------------------------------------------------------------
+
+/// Error(msg): called or `new`ed alike - an Ordinary under Error.proto-
+/// type with an own `message` prop. No `stack` (v1 documents the gap).
+fn n_error(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let msg = match args.first() {
+        Some(v) if !matches!(v, Value::Undef) => to_str(&it.heap, *v),
+        _ => String::new(),
+    };
+    if let Value::Obj(id) = this {
+        // `new Error(m)` hands us the fresh object with the right proto
+        if matches!(it.heap.obj(id), Obj::Ordinary { .. }) {
+            let m = Value::Str(it.heap.alloc_str(msg)?);
+            set_prop(&mut it.heap, this, "message", m)?;
+            return Ok(this);
+        }
+    }
+    it.error_obj(&msg)
+}
+
+/// Error.prototype.toString: "Name: message" (missing name -> "Error",
+/// missing or empty message -> the name alone).
+fn n_err_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let name = match get_prop(&it.heap, &it.protos, this, "name")? {
+        Value::Undef => "Error".to_string(),
+        v => to_str(&it.heap, v),
+    };
+    let msg = match get_prop(&it.heap, &it.protos, this, "message")? {
+        Value::Undef => String::new(),
+        v => to_str(&it.heap, v),
+    };
+    let s = if msg.is_empty() {
+        name
+    } else {
+        format!("{name}: {msg}")
+    };
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
 // -- Math ----------------------------------------------------------------------------
 
 fn n_math_floor(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
@@ -2511,6 +2661,17 @@ fn as_promise(it: &Interp, v: Value) -> Option<u32> {
     match v {
         Value::Obj(id) if matches!(it.heap.obj(id), Obj::Promise(_)) => Some(id),
         _ => None,
+    }
+}
+
+/// Rejection reason for a failed callback/executor: a `throw`'s value
+/// verbatim, an internal or fatal error's message text.
+fn err_value(it: &mut Interp, e: JsError) -> Value {
+    match e {
+        JsError::Throw(v) => v,
+        JsError::Msg(m) | JsError::Fatal(m) => {
+            it.heap.alloc_str(m).map(Value::Str).unwrap_or(Value::Undef)
+        }
     }
 }
 
@@ -2675,16 +2836,18 @@ impl Interp {
                     // fire-and-forget cb returning a rejected promise is
                     // still reported by the unhandled sweep below
                 }
+                // Fatal isn't a rejection reason - the engine is stopped,
+                // report it and leave `next` unsettled
+                Err(e @ JsError::Fatal(_)) => errs.push(e),
                 Err(e) => {
                     if m.next == u32::MAX {
+                        // render now: a heap id inside Throw isn't rooted
+                        // across the next drain safepoint
+                        let e = self.bound_err(e);
                         errs.push(e);
                     } else {
-                        let s = self
-                            .heap
-                            .alloc_str(e.0)
-                            .map(Value::Str)
-                            .unwrap_or(Value::Undef);
-                        self.promise_settle(m.next, true, s);
+                        let v = err_value(self, e);
+                        self.promise_settle(m.next, true, v);
                     }
                 }
             },
@@ -2704,7 +2867,7 @@ impl Interp {
         'outer: loop {
             while let Some(m) = self.microtasks.pop_front() {
                 if self.tick().is_err() {
-                    errs.push(err("step limit exceeded"));
+                    errs.push(fatal("step limit exceeded"));
                     return;
                 }
                 self.run_microtask(m, errs);
@@ -2720,7 +2883,7 @@ impl Interp {
             let Some(i) = pick else { break };
             fires += 1;
             if fires > MAX_TIMER_FIRES {
-                errs.push(err("timer cap exceeded (4096 fires in one drain)"));
+                errs.push(fatal("timer cap exceeded (4096 fires in one drain)"));
                 break 'outer;
             }
             self.now_ms = self.now_ms.max(self.timers[i].deadline_ms);
@@ -2730,6 +2893,7 @@ impl Interp {
                 (t.cb, t.args.clone())
             };
             if let Err(e) = self.call_value(cb, Value::Undef, &args, None) {
+                let e = self.bound_err(e);
                 errs.push(e);
             }
             let t = &mut self.timers[i];
@@ -2757,10 +2921,7 @@ impl Interp {
         }
         for (id, r) in unhandled {
             self.handled_promises.insert(id);
-            errs.push(err(format!(
-                "unhandled rejection: {}",
-                to_str(&self.heap, r)
-            )));
+            errs.push(err(format!("unhandled rejection: {}", self.thrown_text(r))));
         }
     }
 }
@@ -2796,7 +2957,8 @@ fn resolver_fn(it: &mut Interp, pid: u32, reject: bool) -> Result<Value, JsError
 }
 
 /// new Promise(executor): executor runs synchronously with fresh
-/// resolve/reject natives; a throw rejects the promise.
+/// resolve/reject natives; a throw rejects the promise with the thrown
+/// value (Fatal propagates instead of rejecting).
 fn n_promise_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     let exec = arg(args, 0);
     if callable(it, exec).is_none() {
@@ -2806,12 +2968,13 @@ fn n_promise_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value
     let res = resolver_fn(it, pid, false)?;
     let rej = resolver_fn(it, pid, true)?;
     if let Err(e) = it.call_value(exec, Value::Undef, &[res, rej], None) {
-        let s = it
-            .heap
-            .alloc_str(e.0)
-            .map(Value::Str)
-            .unwrap_or(Value::Undef);
-        it.promise_settle(pid, true, s);
+        match e {
+            JsError::Fatal(_) => return Err(e),
+            _ => {
+                let v = err_value(it, e);
+                it.promise_settle(pid, true, v);
+            }
+        }
     }
     Ok(Value::Obj(pid))
 }
@@ -3250,7 +3413,7 @@ mod tests {
     }
 
     fn errmsg(src: &str) -> String {
-        ev(src).unwrap_err().0
+        ev(src).unwrap_err().to_string()
     }
 
     #[test]
@@ -3454,11 +3617,11 @@ mod tests {
         assert!(errmsg("1+").contains("byte"));
         // test threads have ~2MB stacks: cap depth low, check the guard
         let mut it = Interp::new();
-        it.max_call_depth = 200;
+        it.max_call_depth = 100;
         assert!(it
             .run("function f(){f()}f()")
             .unwrap_err()
-            .0
+            .to_string()
             .contains("call depth"));
     }
 
@@ -3467,11 +3630,15 @@ mod tests {
         // heap cap: concat allocates a fresh slot per iteration
         let mut it = Interp::with_cap(20);
         let e = it.run("var s='a';while(1){s=s+s}").unwrap_err();
-        assert!(e.0.contains("heap cap"), "{}", e.0);
+        assert!(e.to_string().contains("heap cap"), "{e}");
         // step limit
         let mut it = Interp::new();
         it.max_steps = 100;
-        assert!(it.run("while(1){}").unwrap_err().0.contains("step"));
+        assert!(it
+            .run("while(1){}")
+            .unwrap_err()
+            .to_string()
+            .contains("step"));
     }
 
     // ---- prototypes -----------------------------------------------------
@@ -4036,11 +4203,12 @@ mod tests {
             ),
             "5\n"
         );
-        // await on rejected throws -> the async fn's promise rejects
+        // await on rejected throws the reason value -> the async fn's
+        // promise rejects with it verbatim
         assert_eq!(
             out("async function f(){await Promise.reject('bad')}\
                 f().catch(function(e){console.log('aw:'+e)})"),
-            "aw:await: bad\n"
+            "aw:bad\n"
         );
         // await on pending is a clear error (no suspension exists)
         assert!(out("async function f(){await new Promise(function(){})}\
@@ -4068,11 +4236,145 @@ mod tests {
         assert!(it
             .run("function q(){queueMicrotask(q)}q()")
             .unwrap_err()
-            .0
+            .to_string()
             .contains("step"));
         // an uncleared interval hits the timer cap, not a hang
         let mut it = Interp::new();
         let e = it.run("setInterval(function(){},1)").unwrap_err();
-        assert!(e.0.contains("timer cap"), "{}", e.0);
+        assert!(e.to_string().contains("timer cap"), "{e}");
+    }
+
+    // ---- throw / try / catch / finally --------------------------------
+
+    #[test]
+    fn try_catch_basics() {
+        // catch binds the thrown value verbatim - numbers, objects alike
+        assert_eq!(num("var r=0;try{throw 7}catch(e){r=e}r"), 7.0);
+        assert_eq!(num("var r;try{throw {a:5}}catch(e){r=e.a}r"), 5.0);
+        // a throw inside a fn reaches the caller's try
+        assert_eq!(
+            num("function f(){throw 3}var r;try{f()}catch(e){r=e}r"),
+            3.0
+        );
+        // no throw: the catch clause is skipped
+        assert_eq!(num("var r=1;try{r=2}catch(e){r=3}r"), 2.0);
+        // nested try + rethrow reaches the outer catch
+        assert_eq!(
+            num("var r;try{try{throw 5}catch(e){throw e+1}}catch(f){r=f}r"),
+            6.0
+        );
+        // catch param is block-scoped: no leak, no clobber of outer `e`
+        assert_eq!(disp("var e=9;try{throw 1}catch(e){e=5}e"), "9");
+        assert_eq!(disp("try{throw 1}catch(q){}typeof q"), "undefined");
+        // bare `catch {}` (no binding) is legal
+        assert_eq!(num("var r;try{throw 1}catch{r=4}r"), 4.0);
+        // uncaught throw surfaces as the run() error
+        assert!(errmsg("throw 'zip'").contains("zip"));
+        assert!(errmsg("throw new Error('x')").contains("Error: x"));
+        // try/finally without catch still propagates
+        assert!(errmsg("try{throw 'up'}finally{1}").contains("up"));
+    }
+
+    #[test]
+    fn error_builtin() {
+        assert_eq!(disp("var e=new Error('x');e.message"), "x");
+        assert_eq!(disp("var e=Error('y');e.message"), "y");
+        assert!(boolean("var e=new Error('x');e instanceof Error"));
+        assert!(boolean("var e=new Error('x');e instanceof Object"));
+        assert_eq!(disp("new Error('x').toString()"), "Error: x");
+        assert_eq!(disp("Error().toString()"), "Error");
+        assert_eq!(disp("new Error('x').name"), "Error");
+        // internal errors materialize as Error objects at the binding
+        assert_eq!(
+            disp("var r;try{nope()}catch(e){r=e.message+'|'+(e instanceof Error)}r"),
+            "nope is not defined|true"
+        );
+        // no `stack` in v1
+        assert_eq!(disp("typeof new Error('x').stack"), "undefined");
+    }
+
+    #[test]
+    fn try_finally() {
+        // finally on normal completion and after a handled throw
+        assert_eq!(disp("var s='';try{s+='t'}finally{s+='f'}s"), "tf");
+        assert_eq!(
+            disp("var s='';try{throw 1}catch(e){s+='c'}finally{s+='f'}s"),
+            "cf"
+        );
+        // finally runs while a throw is in flight, then the throw continues
+        assert_eq!(
+            disp("var s='';try{try{throw 1}finally{s+='f'}}catch(e){s+='c'}s"),
+            "fc"
+        );
+        // ... and on return/break exits too
+        assert_eq!(
+            num("var s=0;function f(){try{return 9}finally{s=1}}var r=f();r*10+s"),
+            91.0
+        );
+        assert_eq!(
+            disp("var s='';for(var i=0;i<3;i++){try{if(i==1){break}s+=i}finally{s+='f'}}s"),
+            "0ff"
+        );
+        // an abrupt finally completion overrides the in-flight outcome
+        assert_eq!(num("function f(){try{return 1}finally{return 2}}f()"), 2.0);
+        assert_eq!(num("function f(){try{throw 1}finally{return 7}}f()"), 7.0);
+        assert!(errmsg("try{throw 1}finally{throw 'fin'}").contains("fin"));
+    }
+
+    #[test]
+    fn fatal_errors_bypass_catch() {
+        // call depth is Fatal: catch never sees it, finally still runs
+        let mut it = Interp::new();
+        it.max_call_depth = 100;
+        let e = it
+            .run("var s='';function f(){f()}try{f()}catch(q){s='caught'}finally{s='fin'}")
+            .unwrap_err();
+        assert!(e.to_string().contains("call depth"), "{e}");
+        let v = it.run("s").unwrap();
+        assert_eq!(it.inspect(v), "fin");
+        // same for the step limit: the catch clause is skipped entirely
+        let mut it = Interp::new();
+        it.max_steps = 500;
+        let e = it
+            .run("var s='';try{while(1){}}catch(q){s='caught'}")
+            .unwrap_err();
+        assert!(e.to_string().contains("step limit"), "{e}");
+        it.steps = 0; // the step budget is cumulative across run() calls
+        let v = it.run("s").unwrap();
+        assert_eq!(it.inspect(v), "");
+    }
+
+    #[test]
+    fn try_catch_async() {
+        // await on a rejection throws the reason into try/catch verbatim
+        assert_eq!(
+            out("async function f(){try{await Promise.reject('r')}catch(e){console.log('aw:'+e)}}f()"),
+            "aw:r\n"
+        );
+        // an async fn's `throw` rejects with the value verbatim
+        assert_eq!(
+            out("async function f(){throw {m:'q'}}f().catch(function(e){console.log(e.m)})"),
+            "q\n"
+        );
+        // ... and an Error keeps its shape through .catch
+        assert_eq!(
+            out("async function f(){throw new Error('z')}f().catch(function(e){console.log(e.message,e instanceof Error)})"),
+            "z true\n"
+        );
+        // a promise executor's throw rejects with the value too
+        assert_eq!(
+            out("new Promise(function(){throw 42}).catch(function(e){console.log('ex:'+e)})"),
+            "ex:42\n"
+        );
+        // try/finally inside an async body
+        assert_eq!(
+            out("async function f(){try{return 1}finally{console.log('fin')}}f().then(function(v){console.log(v)})"),
+            "fin\n1\n"
+        );
+        // a then-callback's thrown value rejects the chain verbatim
+        assert_eq!(
+            out("Promise.resolve(1).then(function(){throw {m:'w'}}).catch(function(e){console.log(e.m)})"),
+            "w\n"
+        );
     }
 }

@@ -20,6 +20,8 @@ const USAGE: &str = "vigia - AI-native browser runtime
   vigia js <file.js> | -e \"<code>\"     run JavaScript (own interpreter)
   vigia run <file.vig> [--audit log.jsonl]  multi-step script + audit trail
                         [--tab name ...] [-D KEY=VAL | --var KEY=VAL]
+  vigia serve [--bind host:port]           HTTP + MCP session API (default
+                        127.0.0.1:8080; no auth - exposing it is remote code exec)
 
   --profile <name>                       persistent cookie jar (~/.vigia/profiles)
   --js                                   run page <script>s before reading the DOM
@@ -130,6 +132,37 @@ fn parse_dom(
     (dom, t0.elapsed(), nav)
 }
 
+/// `vigia serve [--bind host:port]` - block forever on the HTTP+MCP API.
+fn serve(args: Vec<String>) -> ! {
+    let mut bind = "127.0.0.1:8080".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--bind" if i + 1 < args.len() => {
+                bind = args[i + 1].clone();
+                i += 2;
+            }
+            s if s.starts_with("--bind=") => {
+                bind = s["--bind=".len()..].to_string();
+                i += 1;
+            }
+            other => fail(format!("bad arg: {other}")),
+        }
+    }
+    let srv =
+        vigia_serve::Server::listen(&bind).unwrap_or_else(|e| fail(format!("bind {bind}: {e}")));
+    eprintln!("vigia serve listening on http://{}", srv.addr());
+    eprintln!(
+        "endpoints: POST /session | GET /sessions | DELETE /session/:id | \
+         POST /session/:id/{{snap,click,fill,submit,extract,eval,run}} | POST /mcp | GET /health"
+    );
+    if !srv.addr().ip().is_loopback() {
+        eprintln!("warn: no auth - a non-loopback bind is remote code execution");
+    }
+    srv.serve();
+    std::process::exit(0)
+}
+
 fn profile_path(name: &str) -> Option<std::path::PathBuf> {
     if name.is_empty()
         || !name
@@ -195,12 +228,22 @@ fn main() {
         false
     };
 
-    if args.len() < 2 {
+    if args.is_empty() {
+        eprint!("{USAGE}");
+        std::process::exit(1);
+    }
+    let cmd = args.remove(0);
+
+    // serve has no url-position arg - handle it before the url slot.
+    if cmd == "serve" {
+        serve(args);
+    }
+
+    if args.is_empty() {
         eprint!("{USAGE}");
         std::process::exit(1);
     }
     let has_tab = args.iter().any(|a| a == "--tab");
-    let cmd = args.remove(0);
     let url = args.remove(0);
     if has_tab && cmd != "run" {
         fail("--tab only works with run");

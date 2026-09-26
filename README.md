@@ -81,6 +81,8 @@ vigia snap <url> --profile work   # persistent cookies on disk
 # the same script in parallel tabs - one profile jar per tab:
 vigia run login.vig --tab alice --tab bob \
   -D alice.USER=alice -D alice.PASS=x -D bob.USER=bob -D bob.PASS=y
+
+vigia serve [--bind 127.0.0.1:8080]  # HTTP + MCP session API for agents
 ```
 
 A `.vig` script is one op per line, executed in a single process with a
@@ -181,13 +183,14 @@ Done:
   `src=` scripts, Promise + microtasks + virtual-clock timers +
   `async`/`await`, Promise-returning `fetch`, mark-sweep GC
 - Replay: `.vig` scripts plus JSONL audit trail
+- `vigia serve`: HTTP session API + MCP `tools/call` surface (one
+  worker thread per session, JSON in/out)
 
 Next:
 
 - JS: regex literals, `try`/`catch`, classes, `for-of`
 - Own TLS 1.3 (replace the rustls exception)
 - HTML5 tree-construction hardening (adoption agency, foster parenting)
-- `vigia serve`: HTTP/MCP control surface for agent frameworks
 - Keep-alive pooling; parallel fetch engine (thread pool, RSS budget)
 
 Honest limits: pending `await` is unsupported (vigia settles eagerly);

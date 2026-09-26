@@ -12,6 +12,7 @@ members = [
     "crates/mem",
     "crates/net",
     "crates/run",
+    "crates/serve",
     "crates/session",
     "crates/snapshot",
     "crates/tls",

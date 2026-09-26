@@ -64,7 +64,10 @@ const KEEP_LINE: &[&str] = &[
     "nav", "form", "table", "ul", "ol", "select", "iframe", "video", "audio", "details",
 ];
 
-fn role_of(tag: &str, attrs: &[(u32, String)], dom: &Dom) -> String {
+/// Semantic role for an element: the same names snapshot lines use
+/// ("link", "textbox", "heading", ...). Public so `vigia serve` extract
+/// results speak the same vocabulary as the snapshot.
+pub fn role_of(tag: &str, attrs: &[(u32, String)], dom: &Dom) -> String {
     match tag {
         "a" => "link".into(),
         t if t.len() == 2 && t.starts_with('h') && t.as_bytes()[1].is_ascii_digit() => {

@@ -1,24 +1,19 @@
 [package]
-name = "vigia"
-description = "AI-native browser runtime CLI"
+name = "vigia-serve"
+description = "vigia serve: HTTP/1.1 + MCP session API over std::net, no deps, no async"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[[bin]]
-name = "vigia"
-path = "src/main.rs"
 
 [dependencies]
 vigia-actions = { path = "../actions" }
 vigia-css = { path = "../css" }
 vigia-dom = { path = "../dom" }
 vigia-html = { path = "../html" }
-vigia-json = { path = "../json" }
 vigia-js = { path = "../js" }
-vigia-mem = { path = "../mem" }
+vigia-json = { path = "../json" }
 vigia-net = { path = "../net" }
 vigia-run = { path = "../run" }
-vigia-serve = { path = "../serve" }
 vigia-session = { path = "../session" }
 vigia-snapshot = { path = "../snapshot" }
+vigia-url = { path = "../url" }

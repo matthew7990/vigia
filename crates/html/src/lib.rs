@@ -6,7 +6,10 @@
 //! Full HTML5 tree-construction fidelity (adoption agency, foster parenting)
 //! is a roadmap item; correctness bugs get fixed case by case.
 
+use entities::decode;
 use vigia_dom::Dom;
+
+pub mod entities;
 
 /// Elements that never have children or an end tag.
 const VOID: &[&str] = &[
@@ -69,7 +72,13 @@ pub fn parse(input: &str, dom: &mut Dom) -> u32 {
                                 .find(&close)
                                 .map(|i| next + i)
                                 .unwrap_or(bytes.len());
-                            dom.text(id, &input[next..end.min(bytes.len())]);
+                            let raw = &input[next..end.min(bytes.len())];
+                            // RCDATA (title/textarea) decodes entities; script/style stay raw.
+                            if matches!(name.as_str(), "title" | "textarea") {
+                                dom.text(id, &decode(raw));
+                            } else {
+                                dom.text(id, raw);
+                            }
                             pos = skip_past_gt(bytes, end);
                         } else {
                             open.push(id);
@@ -89,7 +98,7 @@ pub fn parse(input: &str, dom: &mut Dom) -> u32 {
             let end = input[pos..].find('<').map(|i| pos + i).unwrap_or(bytes.len());
             let text = &input[pos..end];
             if !text.trim().is_empty() {
-                dom.text(*open.last().unwrap(), text);
+                dom.text(*open.last().unwrap(), &decode(text));
             }
             pos = end;
         }
@@ -155,13 +164,13 @@ fn read_attrs(input: &str, from: usize) -> (Vec<(String, String)>, bool, usize) 
                                 .find(q as char)
                                 .map(|i| start + i)
                                 .unwrap_or(bytes.len());
-                            let v = input[start..end].to_string();
+                            let v = decode(&input[start..end]).into_owned();
                             pos = (end + 1).min(bytes.len());
                             v
                         }
                         _ => {
                             let (v, p) = read_name(bytes, pos);
-                            let v = v.to_string();
+                            let v = decode(v).into_owned();
                             pos = p;
                             v
                         }

@@ -10,9 +10,11 @@ static ALLOC: vigia_mem::CountingAlloc = vigia_mem::CountingAlloc;
 
 const USAGE: &str = "vigia - AI-native browser runtime
 
-  vigia snap <url>    fetch + parse + agent snapshot to stdout
-  vigia fetch <url>   raw response body to stdout
-  vigia dom <url>     parsed DOM stats (nodes, interned strings)
+  vigia snap <url>                       fetch + parse + semantic snapshot
+  vigia fetch <url>                      raw response body
+  vigia dom <url>                        parsed DOM stats
+  vigia extract <url> <css>              elements matching a CSS selector
+  vigia submit <url> [-f css] -d k=v..   fill + submit a form (login flows)
 
 Own HTTP/1.1 + URL parser + inflate + HTML parser + arena DOM.
 Metrics on stderr: bytes in/out, ~tokens, ms per phase, heap peak, RSS peak.
@@ -53,33 +55,26 @@ fn report(extra: &str) {
     if !extra.is_empty() {
         let _ = write!(line, " {extra}");
     }
-    let heap = vigia_mem::peak_bytes();
-    let _ = write!(line, " | heap peak {}", fmt_bytes(heap));
+    let _ = write!(line, " | heap peak {}", fmt_bytes(vigia_mem::peak_bytes()));
     if let Some(rss) = vigia_mem::rss_peak_bytes() {
         let _ = write!(line, " | rss peak {}", fmt_bytes(rss));
     }
     eprintln!("{line}");
 }
 
-fn main() {
-    let mut args = std::env::args().skip(1);
-    let cmd = args.next().unwrap_or_else(|| {
-        eprint!("{USAGE}");
-        std::process::exit(1);
-    });
-    let url = args.next().unwrap_or_else(|| {
-        eprint!("{USAGE}");
-        std::process::exit(1);
-    });
+fn fail(msg: impl std::fmt::Display) -> ! {
+    eprintln!("{msg}");
+    std::process::exit(2)
+}
 
-    let mut jar = CookieJar::new();
-    let res = match vigia_net::fetch(&url, &mut jar) {
+fn fetch_page(url: &str, jar: &mut CookieJar) -> vigia_net::Response {
+    match vigia_net::fetch(url, jar) {
         Ok(r) => r,
-        Err(e) => {
-            eprintln!("fetch failed: {e}");
-            std::process::exit(2);
-        }
-    };
+        Err(e) => fail(format!("fetch failed: {e}")),
+    }
+}
+
+fn report_fetch(res: &vigia_net::Response) {
     let t = &res.timings;
     eprintln!(
         "status {} | {} wire -> {} body | {} redirects | connect {} tls {} ttfb {} total {}",
@@ -92,17 +87,37 @@ fn main() {
         fmt_ms(t.ttfb),
         fmt_ms(t.total),
     );
+}
+
+fn parse_dom(res: &vigia_net::Response) -> (Dom, std::time::Duration) {
+    let t0 = Instant::now();
+    let mut dom = Dom::new();
+    vigia_html::parse(&res.text(), &mut dom);
+    (dom, t0.elapsed())
+}
+
+fn main() {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.len() < 2 {
+        eprint!("{USAGE}");
+        std::process::exit(1);
+    }
+    let cmd = args.remove(0);
+    let url = args.remove(0);
+
+    let mut jar = CookieJar::new();
 
     match cmd.as_str() {
         "fetch" => {
-            print!("{}", String::from_utf8_lossy(&res.body));
+            let res = fetch_page(&url, &mut jar);
+            report_fetch(&res);
+            print!("{}", res.text());
             report(&format!("~{} tokens", fmt_num(est_tokens(res.body.len()))));
         }
         "snap" | "dom" => {
-            let t0 = Instant::now();
-            let mut dom = Dom::new();
-            vigia_html::parse(&String::from_utf8_lossy(&res.body), &mut dom);
-            let parse_ms = t0.elapsed();
+            let res = fetch_page(&url, &mut jar);
+            report_fetch(&res);
+            let (dom, parse_ms) = parse_dom(&res);
             if cmd == "dom" {
                 println!(
                     "{} nodes, {} interned strings, {} cookies",
@@ -125,6 +140,69 @@ fn main() {
                     fmt_num(est_tokens(snap.len())),
                 ));
             }
+        }
+        "extract" => {
+            let sel = args.first().cloned().unwrap_or_else(|| {
+                eprint!("{USAGE}");
+                std::process::exit(1)
+            });
+            let res = fetch_page(&url, &mut jar);
+            report_fetch(&res);
+            let (dom, parse_ms) = parse_dom(&res);
+            let hits = match vigia_css::query(&dom, &sel) {
+                Ok(h) => h,
+                Err(e) => fail(format!("{e}")),
+            };
+            for id in &hits {
+                let tag = dom.tag_name(*id).unwrap_or("?");
+                let text = vigia_actions::text_content(&dom, *id);
+                let text = text.chars().take(120).collect::<String>();
+                println!("- {tag} '{text}'");
+            }
+            report(&format!(
+                "parse {} | {} matches",
+                fmt_ms(parse_ms),
+                hits.len()
+            ));
+        }
+        "submit" => {
+            let mut overrides = Vec::new();
+            let mut form_sel = None;
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "-d" | "--data" if i + 1 < args.len() => {
+                        let kv = &args[i + 1];
+                        match kv.split_once('=') {
+                            Some((k, v)) => overrides.push((k.to_string(), v.to_string())),
+                            None => fail("bad -d, want k=v"),
+                        }
+                        i += 2;
+                    }
+                    "-f" | "--form" if i + 1 < args.len() => {
+                        form_sel = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    _ => fail(format!("bad arg: {}", args[i])),
+                }
+            }
+            let res = fetch_page(&url, &mut jar);
+            report_fetch(&res);
+            let (dom, _) = parse_dom(&res);
+            let res2 = match vigia_actions::submit_form(
+                &dom,
+                &res.final_url,
+                form_sel.as_deref(),
+                &overrides,
+                &mut jar,
+            ) {
+                Ok(r) => r,
+                Err(e) => fail(format!("submit failed: {e}")),
+            };
+            report_fetch(&res2);
+            let (dom2, _) = parse_dom(&res2);
+            print!("{}", snapshot(&dom2));
+            report("");
         }
         _ => {
             eprint!("{USAGE}");

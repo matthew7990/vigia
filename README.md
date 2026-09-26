@@ -33,7 +33,10 @@ Current sole exception, isolated behind `crates/tls` (`vigia_tls::connect` — n
 | `vigia-html` | Own tokenizer + tree builder, single streaming pass | no intermediate event buffer |
 | `vigia-dom` | Arena DOM, interned strings | flat `Vec` + `u32` ids |
 | `vigia-session` | Cookie jar (RFC 6265), profiles | host-only/domain-boundary correct |
-| `vigia-snapshot` | DOM -> compact text tree for agents | skips script/style/svg subtrees |
+| `vigia-snapshot` | DOM -> semantic tree (roles, `#n` refs) | collapses pure-structure wrappers |
+| `vigia-css` | Own selector engine (query the DOM) | no stylesheet needed |
+| `vigia-charset` | Bytes -> UTF-8 (win1252, utf-16, meta sniff) | ~200 lines, no ICU |
+| `vigia-actions` | Form collection + submit, text extraction | urlencoded, GET/POST semantics |
 | `vigia-mem` | Counting allocator + RSS peak | the total-load meter |
 | `vigia` (cli) | `snap` / `fetch` / `dom` | metrics on stderr, always |
 
@@ -45,6 +48,8 @@ cargo build --release
 ./target/release/vigia snap https://example.com    # agent snapshot
 ./target/release/vigia fetch https://example.com   # raw body
 ./target/release/vigia dom https://example.com     # parse stats
+./target/release/vigia extract <url> "td.price"    # CSS selector extraction
+./target/release/vigia submit <url> -d user=x -d pass=y   # form login
 ```
 
 Every command reports cost and latency on stderr:
@@ -82,11 +87,11 @@ Run it: `python3 bench/gen_corpus.py`, serve `bench/corpus/` on :8899, `python3 
 - [x] Own HTTP/1.1 + URL parser + inflate + TLS boundary
 - [x] Semantic snapshot v2: roles, inlined names, `#n` interactive refs, collapsed wrappers
 - [x] Benchmark harness vs lightpanda (`bench/`)
+- [x] HTML entities (named + numeric, C1->win1252) + charset decoding (win1252/utf-16/meta sniff)
+- [x] Own CSS selector engine (tag/.class/#id/[attr ops]/pseudos/combinators/groups)
+- [x] Form submission (urlencoded GET/POST, hidden fields, redirects)
 - [ ] Own TLS 1.3 (replace the rustls exception)
-- [ ] HTML entities + charset decoding (latin-1/win-1252 -> UTF-8)
 - [ ] HTML5 tree-construction hardening (implied end tags, adoption agency)
-- [ ] Own CSS selector engine (`div.item > a[href]`) for extraction and actions
-- [ ] Form submission (urlencoded/multipart POST) — login flows without JS
 - [ ] Persistent profiles on disk (own format, no serde)
 - [ ] Embedded-JSON extraction (`__NEXT_DATA__`, `ld+json`) — JS-free SPA reads
 - [ ] `vigia-js`: own interpreter behind a feature flag, GC with hard cap

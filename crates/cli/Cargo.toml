@@ -10,6 +10,8 @@ name = "vigia"
 path = "src/main.rs"
 
 [dependencies]
+vigia-actions = { path = "../actions" }
+vigia-css = { path = "../css" }
 vigia-dom = { path = "../dom" }
 vigia-html = { path = "../html" }
 vigia-mem = { path = "../mem" }

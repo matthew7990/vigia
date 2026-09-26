@@ -1,0 +1,13 @@
+[package]
+name = "vigia-actions"
+description = "Semantic actions on the DOM: form collection, submit, extraction"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vigia-css = { path = "../css" }
+vigia-dom = { path = "../dom" }
+vigia-net = { path = "../net" }
+vigia-session = { path = "../session" }
+vigia-url = { path = "../url" }

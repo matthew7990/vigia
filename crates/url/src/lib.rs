@@ -316,13 +316,15 @@ impl fmt::Display for Url {
         if self.host.is_empty() {
             write!(f, ":{}", self.path)?;
         } else {
-            let host = if self.host.contains(':') && !self.host.starts_with('[') {
-                format!("[{}]", self.host)
+            if self.host.contains(':') && !self.host.starts_with('[') {
+                write!(f, "://[{}]", self.host)?;
             } else {
-                self.host.clone()
-            };
-            write!(f, "://{host}{}", self.path,)?;
-            let _ = host;
+                write!(f, "://{}", self.host)?;
+            }
+            if let Some(p) = self.port {
+                write!(f, ":{p}")?;
+            }
+            write!(f, "{}", self.path)?;
         }
         if let Some(q) = &self.query {
             write!(f, "?{q}")?;
@@ -374,6 +376,13 @@ mod tests {
             b.join("http://c.com/").unwrap().to_string(),
             "http://c.com/"
         );
+    }
+
+    #[test]
+    fn display_keeps_port() {
+        let u = Url::parse("http://127.0.0.1:8890/login").unwrap();
+        assert_eq!(u.to_string(), "http://127.0.0.1:8890/login");
+        assert_eq!(u.join("/x").unwrap().to_string(), "http://127.0.0.1:8890/x");
     }
 
     #[test]

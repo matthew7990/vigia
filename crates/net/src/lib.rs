@@ -88,6 +88,18 @@ pub struct Response {
     pub timings: Timings,
 }
 
+impl Response {
+    /// Body decoded to UTF-8 — BOM, Content-Type charset, then <meta> sniff.
+    pub fn text(&self) -> String {
+        let ct = self
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .map(|(_, v)| v.as_str());
+        vigia_charset::decode_auto(&self.body, vigia_charset::charset_of(ct).as_deref())
+    }
+}
+
 enum Conn {
     Plain(TcpStream),
     Tls(vigia_tls::TlsStream),
@@ -147,11 +159,29 @@ impl<C: Read> Metered<C> {
 
 /// GET `url`, following redirects, applying cookies from `jar` both ways.
 pub fn fetch(url: &str, jar: &mut CookieJar) -> Result<Response, Error> {
+    run(url, "GET", None, jar)
+}
+
+/// POST `url` with an application/x-www-form-urlencoded body.
+pub fn post_form(url: &Url, encoded: &str, jar: &mut CookieJar) -> Result<Response, Error> {
+    run(&url.to_string(), "POST", Some(encoded.as_bytes()), jar)
+}
+
+/// Request loop with redirect handling. POST on 301/302/303 downgrades to
+/// GET (browser behavior); 307/308 re-send the body.
+fn run(
+    url: &str,
+    method: &'static str,
+    body: Option<&[u8]>,
+    jar: &mut CookieJar,
+) -> Result<Response, Error> {
     let mut current = Url::parse(url)?;
+    let mut method = method;
+    let mut body = body;
     let mut redirects = 0;
     let mut timings = Timings::default();
     loop {
-        let res = request(&current, jar)?;
+        let res = request(&current, jar, method, body)?;
         timings.connect += res.timings.connect;
         timings.tls += res.timings.tls;
         timings.ttfb += res.timings.ttfb;
@@ -168,6 +198,10 @@ pub fn fetch(url: &str, jar: &mut CookieJar) -> Result<Response, Error> {
                 .map(|(_, v)| v.trim().to_string())
                 .ok_or(Error::Protocol("redirect without location"))?;
             current = res.final_url.join(&loc)?;
+            if matches!(status, 301 | 302 | 303) && method != "GET" {
+                method = "GET";
+                body = None;
+            }
             redirects += 1;
             continue;
         }
@@ -192,7 +226,12 @@ struct StepResponse {
     timings: Timings,
 }
 
-fn request(url: &Url, jar: &mut CookieJar) -> Result<StepResponse, Error> {
+fn request(
+    url: &Url,
+    jar: &mut CookieJar,
+    method: &str,
+    body: Option<&[u8]>,
+) -> Result<StepResponse, Error> {
     let t_total = Instant::now();
 
     let host = url.host.clone();
@@ -221,15 +260,27 @@ fn request(url: &Url, jar: &mut CookieJar) -> Result<StepResponse, Error> {
     let t_tls = Instant::now();
 
     let mut req = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {UA}\r\nAccept: text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.5\r\nAccept-Encoding: gzip, deflate\r\nAccept-Language: en-US,en;q=0.9\r\nConnection: close\r\n",
+        "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {UA}\r\nAccept: text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.5\r\nAccept-Encoding: gzip, deflate\r\nAccept-Language: en-US,en;q=0.9\r\nConnection: close\r\n",
         url.request_target(),
         url.host_header(),
     );
     if let Some(cookie) = jar.header_for(url) {
         let _ = fmt::Write::write_fmt(&mut req, format_args!("Cookie: {cookie}\r\n"));
     }
+    if let Some(b) = body {
+        let _ = fmt::Write::write_fmt(
+            &mut req,
+            format_args!(
+                "Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n",
+                b.len()
+            ),
+        );
+    }
     req.push_str("\r\n");
     conn.write_all(req.as_bytes())?;
+    if let Some(b) = body {
+        conn.write_all(b)?;
+    }
     conn.flush()?;
 
     let mut m = Metered { inner: conn, n: 0 };

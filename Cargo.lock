@@ -117,12 +117,37 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 name = "vigia"
 version = "0.1.0"
 dependencies = [
+ "vigia-actions",
+ "vigia-css",
  "vigia-dom",
  "vigia-html",
  "vigia-mem",
  "vigia-net",
  "vigia-session",
  "vigia-snapshot",
+]
+
+[[package]]
+name = "vigia-actions"
+version = "0.1.0"
+dependencies = [
+ "vigia-css",
+ "vigia-dom",
+ "vigia-net",
+ "vigia-session",
+ "vigia-url",
+]
+
+[[package]]
+name = "vigia-charset"
+version = "0.1.0"
+
+[[package]]
+name = "vigia-css"
+version = "0.1.0"
+dependencies = [
+ "vigia-dom",
+ "vigia-html",
 ]
 
 [[package]]
@@ -148,6 +173,7 @@ version = "0.1.0"
 name = "vigia-net"
 version = "0.1.0"
 dependencies = [
+ "vigia-charset",
  "vigia-inflate",
  "vigia-session",
  "vigia-tls",

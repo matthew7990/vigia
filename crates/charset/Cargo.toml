@@ -1,0 +1,6 @@
+[package]
+name = "vigia-charset"
+description = "Bytes -> UTF-8: BOM/meta sniffing, utf-8, windows-1252, utf-16"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

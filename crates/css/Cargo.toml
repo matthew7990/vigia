@@ -1,0 +1,12 @@
+[package]
+name = "vigia-css"
+description = "Own CSS selector engine: parse + match against the arena DOM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vigia-dom = { path = "../dom" }
+
+[dev-dependencies]
+vigia-html = { path = "../html" }

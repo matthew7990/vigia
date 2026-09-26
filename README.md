@@ -64,7 +64,7 @@ article.html     vigia            5.3      9.6    54815    13703  0
 article.html     lightpanda     325.4     22.2   232208    58052  0
 small.html       vigia            3.2      9.6      172       43  0
 small.html       lightpanda     295.4     21.8      152       38  0
-table.html       vigia           10.5      9.6   188537    47134  0
+table.html       vigia           10.5      9.6   142537    35634  0
 table.html       lightpanda     452.0     26.3   100008    25002  0
 ```
 
@@ -115,11 +115,10 @@ Done:
 - Persistent profiles: cookie jars on disk (`--profile`, own TSV format)
 - Embedded-JSON extraction (`__NEXT_DATA__`, `ld+json`): JS-free SPA reads
 - `vigia-js` core: own lexer, parser, tree-walk eval, arena values, step/call/heap guards
+- `vigia --js`: page scripts execute against the live DOM (querySelector, innerHTML, mutation)
 - Replay: `.vig` scripts plus JSONL audit trail (`vigia run`)
 
 Next:
-
-- JS <-> DOM bindings (execute page scripts, `document.querySelector`, mutation)
 - JS mark-sweep GC over the value arenas (hard cap already enforced)
 - Own TLS 1.3 (replace the rustls exception)
 - HTML5 tree-construction hardening (adoption agency, foster parenting)

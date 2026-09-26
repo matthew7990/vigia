@@ -1,0 +1,7 @@
+[package]
+name = "vigia-js"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vigia-json = { path = "../json" }

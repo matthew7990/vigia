@@ -8,6 +8,7 @@ members = [
     "crates/html",
     "crates/inflate",
     "crates/json",
+    "crates/js",
     "crates/mem",
     "crates/net",
     "crates/run",

@@ -17,6 +17,7 @@ const USAGE: &str = "vigia - AI-native browser runtime
   vigia click <url> <#n>                 follow snapshot ref (link/submit)
   vigia submit <url> [-f css] -d k=v..   fill + submit a form (login flows)
   vigia json <url> [a.b.0]               embedded JSON (__NEXT_DATA__, ld+json)
+  vigia js <file.js> | -e \"<code>\"     run JavaScript (own interpreter)
   vigia run <file.vig> [--audit log.jsonl]  multi-step script + audit trail
 
   --profile <name>                       persistent cookie jar (~/.vigia/profiles)
@@ -290,6 +291,31 @@ fn main() {
                 eprintln!("no embedded JSON blocks found");
             }
             report(&format!("{} blocks", found));
+        }
+        "js" => {
+            // url-position arg is the .js path, or -e for inline code.
+            let src = if url == "-e" {
+                match args.first() {
+                    Some(s) => s.clone(),
+                    None => fail("vigia js -e needs a code string"),
+                }
+            } else {
+                std::fs::read_to_string(&url)
+                    .unwrap_or_else(|e| fail(format!("cannot read {url}: {e}")))
+            };
+            let mut it = vigia_js::Interp::new();
+            let r = it.run(&src);
+            print!("{}", it.output());
+            match r {
+                Ok(v) => {
+                    if v != vigia_js::Value::Undef {
+                        println!("{}", it.inspect(v));
+                    }
+                    let (objs, strs) = it.heap.stats();
+                    report(&format!("objs {objs} strs {strs}"));
+                }
+                Err(e) => fail(format!("js: {e}")),
+            }
         }
         "run" => {
             // The url-position arg is the .vig script path here.

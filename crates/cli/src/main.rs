@@ -386,7 +386,11 @@ fn main() {
                         println!("{}", it.inspect(v));
                     }
                     let (objs, strs) = it.heap.stats();
-                    report(&format!("objs {objs} strs {strs}"));
+                    let mut m = format!("objs {objs} strs {strs}");
+                    if it.gc_runs > 0 {
+                        m.push_str(&format!(" gc {}", it.gc_runs));
+                    }
+                    report(&m);
                 }
                 Err(e) => fail(format!("js: {e}")),
             }

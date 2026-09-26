@@ -2,9 +2,9 @@
 //! Pragmatic ES5-ish subset with DOM bindings (bindings.rs), prototype-based
 //! property lookup, promises + a virtual-clock event loop.
 //!
-//! Values live in flat arenas (Heap::strs, Heap::objs, Interp::envs) so a
-//! later mark-sweep GC can find roots without walking pointer graphs. Rc
-//! appears only to share immutable AST bodies into Obj::Func.
+//! Values live in flat arenas (Heap::strs, Heap::objs, Interp::envs) so
+//! the mark-sweep GC (gc.rs) can find roots without walking pointer
+//! graphs. Rc appears only to share immutable AST bodies into Obj::Func.
 //!
 //! v1 semantic choices (deliberate deviations from full JS):
 //! - `;` optional before `}`, EOF, or a newline-separated token (ASI-lite).
@@ -62,11 +62,13 @@ use vigia_dom::NodeId;
 mod ast;
 mod bindings;
 mod eval;
+mod gc;
 mod lex;
 mod parse;
 
 pub use ast::{Expr, FnDef, Stmt};
 pub use bindings::ScriptsOutcome;
+pub use gc::GcStats;
 pub use parse::parse_program as parse;
 
 /// Interpreter error. Message carries a byte offset where one is known.
@@ -123,6 +125,9 @@ pub enum Obj {
     Dom(NodeId),
     /// Promise cell; Promise.prototype is a virtual proto (proto_of).
     Promise(PromiseState),
+    /// GC tombstone: a swept slot awaiting freelist reuse. Reads on a
+    /// dangling id see an empty, proto-less object instead of stale data.
+    Freed,
 }
 
 /// Promise lifecycle. Handlers registered while Pending flush into the
@@ -206,12 +211,19 @@ pub(crate) fn po(p: u32) -> Option<u32> {
     if p == u32::MAX { None } else { Some(p) }
 }
 
-/// Value arena. `cap` is a hard limit on live slots (objs + strs).
+/// Value arena. `cap` is a hard limit on live slots (objs + strs). The
+/// Vecs never shrink (ids are indices); GC-freed slots tombstone in place
+/// and wait on the freelists for reuse.
 pub struct Heap {
-    strs: Vec<String>,
-    objs: Vec<Obj>,
-    intern: HashMap<String, u32>,
-    cap: usize,
+    /// None = swept tombstone. Interned entries are marked every GC, so a
+    /// live intern id always maps to a live slot.
+    pub(crate) strs: Vec<Option<String>>,
+    pub(crate) objs: Vec<Obj>,
+    /// literal -> str arena id; ids here are GC roots.
+    pub(crate) intern: HashMap<String, u32>,
+    pub(crate) free_objs: Vec<u32>,
+    pub(crate) free_strs: Vec<u32>,
+    pub(crate) cap: usize,
 }
 
 impl Heap {
@@ -220,11 +232,23 @@ impl Heap {
     }
 
     pub fn with_cap(cap: usize) -> Self {
-        Heap { strs: Vec::new(), objs: Vec::new(), intern: HashMap::new(), cap }
+        Heap {
+            strs: Vec::new(),
+            objs: Vec::new(),
+            intern: HashMap::new(),
+            free_objs: Vec::new(),
+            free_strs: Vec::new(),
+            cap,
+        }
+    }
+
+    /// Live slots = allocated slots minus freelist entries.
+    pub(crate) fn live(&self) -> usize {
+        self.objs.len() - self.free_objs.len() + self.strs.len() - self.free_strs.len()
     }
 
     fn room(&self) -> Result<(), JsError> {
-        if self.strs.len() + self.objs.len() >= self.cap {
+        if self.live() >= self.cap {
             Err(err("heap cap"))
         } else {
             Ok(())
@@ -233,8 +257,12 @@ impl Heap {
 
     /// Runtime (non-literal) string. No dedup.
     pub fn alloc_str(&mut self, s: String) -> Result<u32, JsError> {
+        if let Some(id) = self.free_strs.pop() {
+            self.strs[id as usize] = Some(s);
+            return Ok(id);
+        }
         self.room()?;
-        self.strs.push(s);
+        self.strs.push(Some(s));
         Ok(self.strs.len() as u32 - 1)
     }
 
@@ -242,6 +270,7 @@ impl Heap {
     /// literal don't burn a slot per iteration.
     pub fn intern_str(&mut self, s: &str) -> Result<u32, JsError> {
         if let Some(&id) = self.intern.get(s) {
+            debug_assert!(self.strs[id as usize].is_some(), "interned str swept");
             return Ok(id);
         }
         let id = self.alloc_str(s.to_string())?;
@@ -250,13 +279,18 @@ impl Heap {
     }
 
     pub fn alloc_obj(&mut self, o: Obj) -> Result<u32, JsError> {
+        if let Some(id) = self.free_objs.pop() {
+            self.objs[id as usize] = o;
+            return Ok(id);
+        }
         self.room()?;
         self.objs.push(o);
         Ok(self.objs.len() as u32 - 1)
     }
 
     pub fn get_str(&self, id: u32) -> &str {
-        &self.strs[id as usize]
+        debug_assert!(self.strs[id as usize].is_some(), "freed str {id}");
+        self.strs[id as usize].as_deref().unwrap_or("")
     }
 
     pub fn obj(&self, id: u32) -> &Obj {
@@ -269,7 +303,10 @@ impl Heap {
 
     /// (objects, strings) live slots.
     pub fn stats(&self) -> (usize, usize) {
-        (self.objs.len(), self.strs.len())
+        (
+            self.objs.len() - self.free_objs.len(),
+            self.strs.len() - self.free_strs.len(),
+        )
     }
 }
 
@@ -280,9 +317,11 @@ impl Default for Heap {
 }
 
 /// Lexical environment, flat-arena style. parent = enclosing EnvId.
+/// `free` marks a GC-tombstoned slot waiting on free_envs for reuse.
 pub(crate) struct Env {
     pub vars: HashMap<String, Value>,
     pub parent: Option<u32>,
+    pub free: bool,
 }
 
 pub struct Interp {
@@ -326,6 +365,19 @@ pub struct Interp {
     pub(crate) cur_native: Value,
     /// true while an `async function` body is on the stack (gate for await).
     pub(crate) fn_async: bool,
+    /// GC freelist for the env arena (envs never shrink either).
+    pub(crate) free_envs: Vec<u32>,
+    /// Every env currently open on the eval stack (innermost last):
+    /// exec_block pushes its env, `for` pushes its decl env. GC roots -
+    /// together with parent links they cover every live frame.
+    pub(crate) env_stack: Vec<u32>,
+    /// Values held by in-flight calls (callee, `this`, args). Rust locals
+    /// are invisible to GC, so call_value roots them here for the call's
+    /// duration (and natives keep their arg slice alive through nested
+    /// calls, e.g. arr.map's callback).
+    pub(crate) call_vals: Vec<Value>,
+    /// GC collections so far (metrics).
+    pub gc_runs: u64,
     /// runaway guards, all user-tunable
     pub max_steps: u64,
     pub max_call_depth: u32,
@@ -346,7 +398,7 @@ impl Interp {
             ^ 0x9E3779B97F4A7C15;
         let mut it = Interp {
             heap: Heap::with_cap(cap),
-            envs: vec![Env { vars: HashMap::new(), parent: None }],
+            envs: vec![Env { vars: HashMap::new(), parent: None, free: false }],
             dom: None,
             dom_objs: HashMap::new(),
             listeners: HashMap::new(),
@@ -366,6 +418,10 @@ impl Interp {
             handled_promises: HashSet::new(),
             cur_native: Value::Undef,
             fn_async: false,
+            free_envs: Vec::new(),
+            env_stack: Vec::new(),
+            call_vals: Vec::new(),
+            gc_runs: 0,
             max_steps: 5_000_000,
             max_call_depth: 1_000,
             max_envs: 200_000,

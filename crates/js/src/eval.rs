@@ -90,6 +90,7 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
             Obj::Native { name, .. } => format!("function {name}() {{ [native code] }}"),
             Obj::Dom(_) => "[object Node]".into(),
             Obj::Promise(_) => "[object Promise]".into(),
+            Obj::Freed => "[object Object]".into(),
         },
     }
 }
@@ -181,7 +182,7 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
             }
             key.parse::<usize>().ok().and_then(|i| items.get(i)).copied()
         }
-        Obj::Dom(_) | Obj::Promise(_) => None,
+        Obj::Dom(_) | Obj::Promise(_) | Obj::Freed => None,
     }
 }
 
@@ -194,7 +195,7 @@ fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
         }
         Obj::Native { .. } => po(protos.function_),
         Obj::Promise(_) => po(protos.promise),
-        Obj::Dom(_) => None,
+        Obj::Dom(_) | Obj::Freed => None,
     }
 }
 
@@ -593,10 +594,17 @@ impl Interp {
     }
 
     pub(crate) fn new_env(&mut self, parent: u32) -> Result<u32, JsError> {
+        if let Some(id) = self.free_envs.pop() {
+            let e = &mut self.envs[id as usize];
+            e.vars.clear();
+            e.parent = Some(parent);
+            e.free = false;
+            return Ok(id);
+        }
         if self.envs.len() >= self.max_envs {
             return Err(err("env cap"));
         }
-        self.envs.push(Env { vars: HashMap::new(), parent: Some(parent) });
+        self.envs.push(Env { vars: HashMap::new(), parent: Some(parent), free: false });
         Ok(self.envs.len() as u32 - 1)
     }
 
@@ -631,7 +639,16 @@ impl Interp {
     }
 
     /// Execute a statement list in `env`: hoist fn decls first, then run.
+    /// `env` rides env_stack for the block's duration so GC marking sees
+    /// every open frame (a caller's env is only reachable through it).
     pub(crate) fn exec_block(&mut self, stmts: &[Stmt], env: u32) -> Result<Flow, JsError> {
+        self.env_stack.push(env);
+        let r = self.exec_block_run(stmts, env);
+        self.env_stack.pop();
+        r
+    }
+
+    fn exec_block_run(&mut self, stmts: &[Stmt], env: u32) -> Result<Flow, JsError> {
         for s in stmts {
             if let Stmt::FnDecl(def) = s {
                 let f = self.func_obj(def.clone(), env)?;
@@ -642,6 +659,8 @@ impl Interp {
         }
         for s in stmts {
             self.tick()?;
+            // safepoint: the previous statement's temporaries are consumed
+            self.maybe_gc();
             match self.stmt(env, s)? {
                 Flow::Normal => {}
                 f => return Ok(f),
@@ -686,6 +705,7 @@ impl Interp {
             }
             Stmt::While(c, body) => {
                 loop {
+                    self.maybe_gc();
                     let c = self.expr(env, c)?;
                     if !truthy(&self.heap, c) {
                         break;
@@ -699,33 +719,7 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::For(init, test, upd, body) => {
-                let fenv = self.new_env(env)?;
-                if let Some(init) = init {
-                    match self.stmt(fenv, init)? {
-                        Flow::Normal => {}
-                        f => return Ok(f),
-                    }
-                }
-                loop {
-                    self.tick()?;
-                    if let Some(t) = test {
-                        let c = self.expr(fenv, t)?;
-                        if !truthy(&self.heap, c) {
-                            break;
-                        }
-                    }
-                    match self.stmt(fenv, body)? {
-                        Flow::Normal | Flow::Continue => {}
-                        Flow::Break => break,
-                        f => return Ok(f),
-                    }
-                    if let Some(u) = upd {
-                        self.expr(fenv, u)?;
-                    }
-                }
-                Ok(Flow::Normal)
-            }
+            Stmt::For(init, test, upd, body) => self.stmt_for(env, init, test, upd, body),
             Stmt::Block(ss) => {
                 // new env only when the block declares something
                 if ss.iter().any(|s| matches!(s, Stmt::VarDecl(_) | Stmt::FnDecl(_))) {
@@ -738,6 +732,58 @@ impl Interp {
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
         }
+    }
+
+    /// for(init; test; upd) body: the decl env rides env_stack so GC
+    /// keeps the loop var's env alive even when the body opens no block.
+    fn stmt_for(
+        &mut self,
+        env: u32,
+        init: &Option<Box<Stmt>>,
+        test: &Option<Expr>,
+        upd: &Option<Expr>,
+        body: &Stmt,
+    ) -> Result<Flow, JsError> {
+        let fenv = self.new_env(env)?;
+        self.env_stack.push(fenv);
+        let r = self.stmt_for_loop(fenv, init, test, upd, body);
+        self.env_stack.pop();
+        r
+    }
+
+    fn stmt_for_loop(
+        &mut self,
+        fenv: u32,
+        init: &Option<Box<Stmt>>,
+        test: &Option<Expr>,
+        upd: &Option<Expr>,
+        body: &Stmt,
+    ) -> Result<Flow, JsError> {
+        if let Some(init) = init {
+            match self.stmt(fenv, init)? {
+                Flow::Normal => {}
+                f => return Ok(f),
+            }
+        }
+        loop {
+            self.tick()?;
+            self.maybe_gc();
+            if let Some(t) = test {
+                let c = self.expr(fenv, t)?;
+                if !truthy(&self.heap, c) {
+                    break;
+                }
+            }
+            match self.stmt(fenv, body)? {
+                Flow::Normal | Flow::Continue => {}
+                Flow::Break => break,
+                f => return Ok(f),
+            }
+            if let Some(u) = upd {
+                self.expr(fenv, u)?;
+            }
+        }
+        Ok(Flow::Normal)
     }
 
     fn expr(&mut self, env: u32, e: &Expr) -> Result<Value, JsError> {
@@ -1113,9 +1159,23 @@ impl Interp {
             self.call_depth -= 1;
             return Err(err("max call depth"));
         }
+        // Root callee/this/args for the call's duration: GC can't see Rust
+        // locals, so a callback a native holds (arr.map's f) or an IIFE
+        // temp would otherwise be swept mid-execution.
+        let vbase = self.call_vals.len();
+        self.call_vals.push(f);
+        self.call_vals.push(this);
+        self.call_vals.extend_from_slice(args);
         let (is_async, r) = match c {
             C::Fn(def, fenv) => {
-                let cenv = self.new_env(fenv)?;
+                let cenv = match self.new_env(fenv) {
+                    Ok(cenv) => cenv,
+                    Err(e) => {
+                        self.call_vals.truncate(vbase);
+                        self.call_depth -= 1;
+                        return Err(e);
+                    }
+                };
                 for (i, p) in def.params.iter().enumerate() {
                     self.env_declare(cenv, p, args.get(i).copied().unwrap_or(Value::Undef));
                 }
@@ -1146,6 +1206,7 @@ impl Interp {
                 (false, r)
             }
         };
+        self.call_vals.truncate(vbase);
         self.call_depth -= 1;
         if is_async {
             // async fn: returned value fulfills (promises adopt), a thrown
@@ -1331,7 +1392,11 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
                     .map(|v| val_to_json(h, *v, depth + 1))
                     .collect::<Result<_, JsError>>()?,
             ),
-            Obj::Func { .. } | Obj::Native { .. } | Obj::Dom(_) | Obj::Promise(_) => Json::Null,
+            Obj::Func { .. }
+            | Obj::Native { .. }
+            | Obj::Dom(_)
+            | Obj::Promise(_)
+            | Obj::Freed => Json::Null,
         },
     })
 }
@@ -1390,7 +1455,7 @@ fn n_obj_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
             Obj::Func { .. } | Obj::Native { .. } => "[object Function]",
             Obj::Dom(_) => "[object Node]",
             Obj::Promise(_) => "[object Promise]",
-            Obj::Ordinary { .. } => "[object Object]",
+            Obj::Ordinary { .. } | Obj::Freed => "[object Object]",
         },
     };
     Ok(Value::Str(it.heap.alloc_str(tag.into())?))
@@ -1417,7 +1482,7 @@ fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
             Obj::Arr { items, .. } => {
                 items.iter().enumerate().map(|(i, x)| (i.to_string(), *x)).collect()
             }
-            Obj::Dom(_) | Obj::Promise(_) => Vec::new(),
+            Obj::Dom(_) | Obj::Promise(_) | Obj::Freed => Vec::new(),
         },
         _ => Vec::new(),
     }
@@ -2454,6 +2519,11 @@ impl Interp {
     }
 
     fn run_microtask(&mut self, m: Microtask, errs: &mut Vec<JsError>) {
+        // the in-flight settle target is a bare u32 - root it so GC can't
+        // sweep `next` (or let a recycled slot alias it) while cb runs
+        if m.next != u32::MAX {
+            self.call_vals.push(Value::Obj(m.next));
+        }
         match m.cb {
             // no handler: the settlement passes straight through to `next`
             None => {
@@ -2483,6 +2553,9 @@ impl Interp {
                 }
             },
         }
+        if m.next != u32::MAX {
+            self.call_vals.pop();
+        }
     }
 
     /// Drain the work queues: microtasks FIFO until empty, then fire the
@@ -2499,6 +2572,7 @@ impl Interp {
                     return;
                 }
                 self.run_microtask(m, errs);
+                self.maybe_gc();
             }
             let pick = self
                 .timers
@@ -2535,9 +2609,10 @@ impl Interp {
             if self.timers.len() > 64 {
                 self.timers.retain(|t| !t.cancelled);
             }
+            self.maybe_gc();
         }
         let mut unhandled = Vec::new();
-        for i in 0..self.heap.stats().0 as u32 {
+        for i in 0..self.heap.objs.len() as u32 {
             if let Obj::Promise(PromiseState::Rejected(r)) = self.heap.obj(i) {
                 if !self.handled_promises.contains(&i) {
                     unhandled.push((i, *r));
@@ -2562,16 +2637,18 @@ fn bound_prop(it: &Interp, key: &str) -> Result<Value, JsError> {
 
 fn bound_promise(it: &Interp) -> Result<u32, JsError> {
     match bound_prop(it, "__p")? {
-        Value::Num(n) if n >= 0.0 => Ok(n as u32),
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Promise(_)) => Ok(id),
         _ => Err(err("promise resolver detached")),
     }
 }
 
 fn resolver_fn(it: &mut Interp, pid: u32, reject: bool) -> Result<Value, JsError> {
+    // __p is a real Obj ref, not an id-in-a-Num, so a live resolver keeps
+    // its promise alive through GC (and the marker can follow it).
     Ok(Value::Obj(it.heap.alloc_obj(Obj::Native {
         name: if reject { "reject" } else { "resolve" },
         f: if reject { n_promise_reject } else { n_promise_resolve },
-        pairs: vec![("__p".into(), Value::Num(pid as f64))],
+        pairs: vec![("__p".into(), Value::Obj(pid))],
     })?))
 }
 

@@ -454,9 +454,13 @@ impl Interp {
     /// event object; a dispatch error wins over drain errors.
     fn fire(&mut self, target: NodeId, ty: &str) -> Result<Value, JsError> {
         let ev = self.new_event(ty, target)?;
+        // ev must outlive dispatch + drain; drain's GC can't see it as a
+        // Rust local, so root it for the call's duration.
+        self.call_vals.push(ev);
         let r = self.dispatch(target, ty, ev);
         let mut errs = Vec::new();
         self.drain(&mut errs);
+        self.call_vals.pop();
         match r {
             Err(e) => Err(e),
             Ok(v) => match errs.into_iter().next() {

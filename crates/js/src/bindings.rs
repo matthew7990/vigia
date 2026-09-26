@@ -447,10 +447,23 @@ impl Interp {
         Ok(())
     }
 
-    /// Dispatch a fresh `ty` event at `target`; returns the event object.
+    /// Dispatch a fresh `ty` event at `target`, then drain the work queues:
+    /// microtasks and timers a handler queued complete before fire()
+    /// returns (this flushes early when the event was dispatched mid-script,
+    /// unlike browsers which wait for the stack to unwind). Returns the
+    /// event object; a dispatch error wins over drain errors.
     fn fire(&mut self, target: NodeId, ty: &str) -> Result<Value, JsError> {
         let ev = self.new_event(ty, target)?;
-        self.dispatch(target, ty, ev)
+        let r = self.dispatch(target, ty, ev);
+        let mut errs = Vec::new();
+        self.drain(&mut errs);
+        match r {
+            Err(e) => Err(e),
+            Ok(v) => match errs.into_iter().next() {
+                Some(e) => Err(e),
+                None => Ok(v),
+            },
+        }
     }
 
     fn event_stopped(&self, ev: Value) -> bool {
@@ -1316,7 +1329,9 @@ mod tests {
     }
 
     #[test]
-    fn fetch_sync_json_and_cookies() {
+    fn fetch_promise_json_and_cookies() {
+        // fetch() returns a resolved promise; text()/json() return resolved
+        // promises too - handlers run at the script-boundary drain.
         let body = "{\"name\":\"x\"}";
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: sid=7; Path=/\r\nContent-Length: {}\r\n\r\n{}",
@@ -1326,7 +1341,12 @@ mod tests {
         let (port, log) = serve(vec![resp]);
         let mut d = Dom::new();
         vigia_html::parse(
-            "<html><head><title>o</title></head><body><script>var r=fetch('/api?x=1');document.title=r.status+':'+r.ok+':'+r.json().name+':'+r.text()</script></body></html>",
+            "<html><head><title>o</title></head><body><script>\
+             fetch('/api?x=1').then(function(r){\
+               document.title = r.status+':'+r.ok;\
+               r.json().then(function(j){document.title += ':'+j.name});\
+               r.text().then(function(t){document.title += ':'+t})\
+             })</script></body></html>",
             &mut d,
         );
         let mut it = Interp::new();
@@ -1361,10 +1381,14 @@ mod tests {
         ];
         let (port, _log) = serve(bodies);
         let mut d = Dom::new();
+        // second fetch inside a then-handler: still sync under the hood
         vigia_html::parse(
             "<html><head><title>o</title></head><body><script>\
-             var a=fetch('/go');var b=fetch('/missing');\
-             document.title=a.redirected+':'+a.url+'|'+b.ok+':'+b.status</script></body></html>",
+             fetch('/go').then(function(a){\
+               fetch('/missing').then(function(b){\
+                 document.title=a.redirected+':'+a.url+'|'+b.ok+':'+b.status\
+               })\
+             })</script></body></html>",
             &mut d,
         );
         let mut it = Interp::new();
@@ -1383,8 +1407,29 @@ mod tests {
     }
 
     #[test]
-    fn fetch_network_error_is_js_error() {
-        // port 1 is closed: the io failure surfaces as a script error
+    fn fetch_network_error_rejects() {
+        // port 1 is closed: fetch rejects (not throws) - a then() rejection
+        // handler sees the reason
+        let mut d = Dom::new();
+        vigia_html::parse(
+            "<html><head><title>o</title></head><body><script>\
+             fetch('http://127.0.0.1:1/x').then(\
+               function(){document.title='ok'},\
+               function(e){document.title='err'})</script></body></html>",
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(
+            d,
+            Some(NetCtx {
+                base: vigia_url::Url::parse("http://127.0.0.1:1/").unwrap(),
+                jar: CookieJar::new(),
+            }),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(page_title(&out.dom), "err");
+
+        // same failure unhandled -> "unhandled rejection" drain error
         let mut d = Dom::new();
         vigia_html::parse(
             "<html><body><script>fetch('http://127.0.0.1:1/x')</script></body></html>",
@@ -1399,7 +1444,84 @@ mod tests {
             }),
         );
         assert_eq!(out.errors.len(), 1);
+        assert!(out.errors[0].0.contains("unhandled rejection"), "{}", out.errors[0].0);
         assert!(out.errors[0].0.contains("fetch"), "{}", out.errors[0].0);
+    }
+
+    // ---- async runtime on the page ------------------------------------------
+
+    #[test]
+    fn event_handler_queues_drain_before_return() {
+        // a click handler's microtasks and setTimeout(0) run inside the
+        // same dispatch: the DOM is already mutated when click() returns.
+        let mut d = Dom::new();
+        vigia_html::parse(
+            r#"<html><body><div id=a></div>
+               <script>
+               var log=[];
+               var a=document.getElementById('a');
+               a.addEventListener('click',function(){
+                 queueMicrotask(function(){log.push('mt')});
+                 setTimeout(function(){a.setAttribute('data-done','1');log.push('t0')},0)
+               });
+               a.click();
+               log.push('after');
+               document.title=log.join(',')
+               </script></body></html>"#,
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(d, None);
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        // handler ran, then mt + timer inside the dispatch, then the rest
+        assert_eq!(page_title(&out.dom), "mt,t0,after");
+        let a = vigia_css::query(&out.dom, "#a").unwrap()[0];
+        assert_eq!(out.dom.attr(a, "data-done"), Some("1"));
+    }
+
+    #[test]
+    fn await_fetch_end_to_end() {
+        let body = "{\"k\":42}";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let (port, _log) = serve(vec![resp]);
+        let mut d = Dom::new();
+        vigia_html::parse(
+            "<html><head><title>o</title></head><body><script>\
+             async function go(){\
+               var r = await fetch('/j');\
+               var j = await r.json();\
+               document.title = 'got:'+j.k\
+             }\
+             go()</script></body></html>",
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(
+            d,
+            Some(NetCtx {
+                base: vigia_url::Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
+                jar: CookieJar::new(),
+            }),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(page_title(&out.dom), "got:42");
+    }
+
+    #[test]
+    fn async_rejection_reaches_catch() {
+        // an async fn's throw becomes a rejection the caller's .catch sees
+        let mut it = Interp::new();
+        it.run(
+            "async function f(){nope()};\
+             var seen='unset';\
+             f().catch(function(e){seen=e})",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "seen"), "nope is not defined");
     }
 
     // ---- external <script src> --------------------------------------------

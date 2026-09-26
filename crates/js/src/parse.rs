@@ -157,7 +157,17 @@ impl P {
                 let n = self
                     .ident()
                     .map_err(|_| err("function declaration needs a name"))?;
-                Ok(Stmt::FnDecl(self.fn_tail(Some(n))?))
+                Ok(Stmt::FnDecl(self.fn_tail(Some(n), false)?))
+            }
+            Tok::Kw("async") => {
+                self.i += 1;
+                if !self.eat_kw("function") {
+                    return Err(err("expected 'function' after 'async'"));
+                }
+                let n = self
+                    .ident()
+                    .map_err(|_| err("async function declaration needs a name"))?;
+                Ok(Stmt::FnDecl(self.fn_tail(Some(n), true)?))
             }
             Tok::Kw("return") => {
                 if self.in_fn == 0 {
@@ -239,7 +249,9 @@ impl P {
     }
 
     /// `(params) { body }` shared by fn declarations and fn expressions.
-    fn fn_tail(&mut self, name: Option<String>) -> R<Rc<FnDef>> {
+    /// `is_async` marks `async function` bodies (enables `await`, wraps the
+    /// return value in a promise at call time).
+    fn fn_tail(&mut self, name: Option<String>, is_async: bool) -> R<Rc<FnDef>> {
         self.exp_p("(")?;
         let mut params = Vec::new();
         if !self.at_p(")") {
@@ -255,7 +267,7 @@ impl P {
         self.in_fn += 1;
         let body = self.block_body();
         self.in_fn -= 1;
-        Ok(Rc::new(FnDef { name, params, body: body? }))
+        Ok(Rc::new(FnDef { name, params, body: body?, is_async }))
     }
 
     fn for_stmt(&mut self) -> R<Stmt> {
@@ -389,6 +401,8 @@ impl P {
         let op = match self.peek() {
             Tok::P(p) if matches!(*p, "!" | "~" | "+" | "-" | "++" | "--") => *p,
             Tok::Kw("typeof") => "typeof",
+            // `await` parses everywhere; eval rejects it outside async fns.
+            Tok::Kw("await") => "await",
             Tok::Kw("new") => "new",
             _ => "",
         };
@@ -405,9 +419,9 @@ impl P {
                 }
                 Ok(Expr::Unary(op, Box::new(e)))
             }
-            "typeof" => {
+            "typeof" | "await" => {
                 self.i += 1;
-                Ok(Expr::Unary("typeof", Box::new(self.unary()?)))
+                Ok(Expr::Unary(op, Box::new(self.unary()?)))
             }
             "new" => {
                 self.i += 1;
@@ -507,7 +521,21 @@ impl P {
                 } else {
                     None
                 };
-                Ok(Expr::Func(self.fn_tail(name)?))
+                Ok(Expr::Func(self.fn_tail(name, false)?))
+            }
+            Tok::Kw("async") => {
+                // async function expression; `async` alone is not a primary
+                if !self.eat_kw("function") {
+                    return Err(err(format!(
+                        "expected 'function' after 'async' at byte {pos}"
+                    )));
+                }
+                let name = if matches!(self.peek(), Tok::Ident(_)) {
+                    Some(self.ident()?)
+                } else {
+                    None
+                };
+                Ok(Expr::Func(self.fn_tail(name, true)?))
             }
             Tok::P("(") => {
                 let e = self.expr()?;

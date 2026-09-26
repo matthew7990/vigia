@@ -32,6 +32,8 @@ pub struct FnDef {
     pub name: Option<String>,
     pub params: Vec<String>,
     pub body: Vec<Stmt>,
+    /// `async function`: call wraps the result in a Promise; enables `await`.
+    pub is_async: bool,
 }
 
 #[derive(Debug)]

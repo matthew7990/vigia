@@ -118,7 +118,8 @@ Done:
 - Persistent profiles: cookie jars on disk (`--profile`, own TSV format)
 - Embedded-JSON extraction (`__NEXT_DATA__`, `ld+json`): JS-free SPA reads
 - `vigia-js` core: own lexer, parser, tree-walk eval, arena values, step/call/heap guards
-- `vigia --js`: page scripts execute against the live DOM (querySelector, innerHTML, mutation, events, synchronous fetch, external `src=` scripts)
+- `vigia --js`: page scripts execute against the live DOM (querySelector, innerHTML, mutation, events, external `src=` scripts)
+- Async surface: `Promise` (+`all`/`race`/`allSettled`), microtasks, `setTimeout`/`setInterval` on a virtual clock, `async`/`await`, Promise-returning `fetch` - I/O still blocks; drain order is browser-like and deterministic
 - `vigia run --tab`: the same script in parallel tabs, one profile jar per tab
 - Replay: `.vig` scripts plus JSONL audit trail (`vigia run`)
 

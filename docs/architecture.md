@@ -41,7 +41,7 @@ Total-process target: **single-digit MB per session**. `vigia-mem` is a counting
 - **Layout, paint, compositing.** Agents do not consume pixels. If a visual review mode ever ships it will be a separate, optional renderer.
 - **Async runtime.** Sync I/O plus a thread pool when needed. tokio's runtime cost buys nothing at scraping scale.
 - **Keep-alive and HTTP/2.** `Connection: close` today. Pooling and HTTP/2 are measured optimizations for later.
-- **Full JS semantics.** `vigia-js` runs an ES5-ish subset today: no prototypes, classes, regex, or async. DOM bindings and a mark-sweep GC over the value arenas are the next milestones, not a different engine.
+- **Full JS semantics.** `vigia-js` runs an ES5-ish subset today: prototypes exist, classes and regex do not. Async is real but engine-synchronous: promises, microtasks, virtual-clock timers, async fns, and Promise-returning fetch all drain deterministically at script/event boundaries; pending `await` is unsupported (no suspension). A mark-sweep GC over the value arenas is the next milestone, not a different engine.
 
 ## Dependency policy
 

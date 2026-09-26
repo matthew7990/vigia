@@ -1,6 +1,6 @@
 //! vigia-js: own JavaScript interpreter core (lexer, parser, tree-walk eval).
 //! Pragmatic ES5-ish subset with DOM bindings (bindings.rs), prototype-based
-//! property lookup, no async.
+//! property lookup, promises + a virtual-clock event loop.
 //!
 //! Values live in flat arenas (Heap::strs, Heap::objs, Interp::envs) so a
 //! later mark-sweep GC can find roots without walking pointer graphs. Rc
@@ -12,11 +12,12 @@
 //! - Function declarations hoist within their block.
 //! - `this` bound for `o.m()` and `o[i]()` calls, else undefined.
 //! - Assignment to an undeclared name creates a global (sloppy mode).
-//! - Prototypes: Ordinary/Arr/Func carry `proto`; Native/Dom carry none
-//!   (Native objects reach Function.prototype through a virtual fallback).
-//!   `Func`/`Native` carry `pairs` (own props) so functions can expose
-//!   `.prototype` and constructor globals (Object, Date, ...) their statics;
-//!   every Obj::Func gets a fresh own "prototype" object at creation.
+//! - Prototypes: Ordinary/Arr/Func carry `proto`; Promise carries none
+//!   (Promise.prototype via a virtual fallback, same as Native ->
+//!   Function.prototype). `Func`/`Native` carry `pairs` (own props) so
+//!   functions can expose `.prototype` and constructor globals (Object,
+//!   Date, ...) their statics; every Obj::Func gets a fresh own "prototype"
+//!   object at creation.
 //! - `new F()`: proto = F.prototype when it's an object else Object's proto;
 //!   `new` on a Native just calls it (ctors allocate their own result).
 //!   `new` callee is primary + member chain: `new a.b()` is New(Member a.b).
@@ -25,12 +26,35 @@
 //!   =>, spread, classes, labels, __proto__ accessor.
 //! - Events: addEventListener + inline `on*` attrs, bubble phase only
 //!   (no capture). Dispatch is synchronous.
-//! - fetch() is synchronous: returns a plain response object whose
-//!   text()/json() methods read its `__body` prop (no hidden state).
+//! - Async (synchronous engine, real semantics where the model allows):
+//!   `new Promise(executor)` runs the executor inline; then/catch/finally
+//!   handlers and queueMicrotask callbacks run as microtasks at drain
+//!   points: the end of each top-level run() and after each fire() event
+//!   dispatch (the latter flushes early when the event was dispatched
+//!   mid-script - browsers would wait for the stack to unwind).
+//!   Timers (setTimeout/setInterval) run on a virtual clock: drain fires
+//!   the earliest deadline next, advancing now_ms to it without sleeping,
+//!   so every queued timer completes before run() returns. Caps: 4096
+//!   timer fires per drain, microtask throughput bounded by max_steps.
+//!   resolve(promise) adopts its state; non-Promise thenables are not
+//!   adopted. Promise rejection reasons are plain values; a handler that
+//!   throws rejects with the error text as a string.
+//! - async/await: `async function` bodies run synchronously and wrap the
+//!   result into a promise (returned promise values are adopted). `await`
+//!   on a Fulfilled promise unwraps; Rejected throws the reason (as text);
+//!   Pending is an error - no suspension exists because everything
+//!   resolvable is settled eagerly. `await` outside an async fn is an
+//!   eval error (the parser accepts it for grammar simplicity).
+//! - fetch() performs the HTTP request eagerly at call time and returns a
+//!   resolved Promise holding the response object; network failures give
+//!   a rejected Promise (real fetch semantics). Response text()/json()
+//!   also return resolved Promises, so both `await r.json()` and
+//!   `r.json().then(f)` work. A rejected promise never then'd/caught
+//!   reports "unhandled rejection" into the drain error list.
 //! - el.click() on <a href> sets pending_nav + location.href instead of
 //!   navigating; following it is the host's call.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 
 use vigia_dom::NodeId;
@@ -97,6 +121,55 @@ pub enum Obj {
     Native { name: &'static str, f: NativeFn, pairs: Vec<(String, Value)> },
     /// JS handle over a DOM node; valid only while Interp.dom is installed.
     Dom(NodeId),
+    /// Promise cell; Promise.prototype is a virtual proto (proto_of).
+    Promise(PromiseState),
+}
+
+/// Promise lifecycle. Handlers registered while Pending flush into the
+/// microtask queue on settle; a settled promise's `then` enqueues directly.
+#[derive(Debug)]
+pub enum PromiseState {
+    Pending { handlers: Vec<ThenHandler> },
+    Fulfilled(Value),
+    Rejected(Value),
+}
+
+/// One `.then` registration. A missing handler passes the settlement
+/// through untouched (so `then(None, onR)` and promise adoption both
+/// work). `next` is the promise obj id the handler's result resolves;
+/// u32::MAX = no downstream promise (internal subscriptions like all()).
+#[derive(Debug, Clone, Copy)]
+pub struct ThenHandler {
+    pub on_fulfill: Option<Value>,
+    pub on_reject: Option<Value>,
+    pub next: u32,
+}
+
+/// A queued callback: cb runs with `arg`; its result resolves `next`
+/// (u32::MAX = fire-and-forget, errors go to the drain error list).
+/// cb = None is a settlement pass-through: settle `next` with `arg`
+/// keeping the `rejecting` direction.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Microtask {
+    pub cb: Option<Value>,
+    pub arg: Value,
+    pub next: u32,
+    pub rejecting: bool,
+}
+
+/// setTimeout/setInterval entry on the virtual clock. `interval` Some =
+/// repeating; `cancelled` is set by clearTimeout/clearInterval; `parked`
+/// marks the timer currently mid-callback so a nested drain (event
+/// dispatch inside the cb) can't re-fire it.
+#[derive(Debug)]
+pub(crate) struct Timer {
+    pub id: u32,
+    pub deadline_ms: u64,
+    pub cb: Value,
+    pub args: Vec<Value>,
+    pub interval: Option<u64>,
+    pub cancelled: bool,
+    pub parked: bool,
 }
 
 /// Well-known prototype objects (heap ids), allocated once per Interp.
@@ -111,6 +184,7 @@ pub struct Protos {
     pub string: u32,
     pub number: u32,
     pub date: u32,
+    pub promise: u32,
 }
 
 impl Protos {
@@ -122,6 +196,7 @@ impl Protos {
             string: u32::MAX,
             number: u32::MAX,
             date: u32::MAX,
+            promise: u32::MAX,
         }
     }
 }
@@ -235,6 +310,22 @@ pub struct Interp {
     pub(crate) steps: u64,
     pub(crate) call_depth: u32,
     pub(crate) builtins: bool,
+    /// Queued promise handlers / queueMicrotask callbacks, FIFO.
+    pub(crate) microtasks: VecDeque<Microtask>,
+    /// Live timers ordered implicitly by deadline_ms (earliest fires first).
+    pub(crate) timers: Vec<Timer>,
+    /// Virtual clock in ms; only advances (to the fired timer's deadline).
+    pub(crate) now_ms: u64,
+    pub(crate) next_timer_id: u32,
+    /// Promise obj ids that were then'd or adopted - the unhandled-
+    /// rejection sweep at drain end skips these (and remembers reports).
+    pub(crate) handled_promises: HashSet<u32>,
+    /// Native fn object currently executing, so natives that stand in for
+    /// per-promise callbacks (resolve/reject, all() counters, finally
+    /// wrappers) can find their bound state in their own `pairs`.
+    pub(crate) cur_native: Value,
+    /// true while an `async function` body is on the stack (gate for await).
+    pub(crate) fn_async: bool,
     /// runaway guards, all user-tunable
     pub max_steps: u64,
     pub max_call_depth: u32,
@@ -268,6 +359,13 @@ impl Interp {
             steps: 0,
             call_depth: 0,
             builtins: false,
+            microtasks: VecDeque::new(),
+            timers: Vec::new(),
+            now_ms: 0,
+            next_timer_id: 1,
+            handled_promises: HashSet::new(),
+            cur_native: Value::Undef,
+            fn_async: false,
             max_steps: 5_000_000,
             max_call_depth: 1_000,
             max_envs: 200_000,
@@ -281,15 +379,26 @@ impl Interp {
         &self.out
     }
 
-    /// Parse + run a program. Returns the completion value (the last
-    /// expression statement's value), Undef if there was none.
+    /// Parse + run a program, then drain the microtask queue and pending
+    /// timers (script boundary, like browsers). Returns the completion
+    /// value (the last expression statement's value), Undef if none.
+    /// A script error wins over drain errors; on a clean script the first
+    /// drain error (failed callback, unhandled rejection, cap hit)
+    /// surfaces as the Err.
     pub fn run(&mut self, src: &str) -> Result<Value, JsError> {
         self.install_builtins();
         let stmts = parse::parse_program(src)?;
-        match self.exec_block(&stmts, 0)? {
-            eval::Flow::Normal => Ok(self.last),
+        let r = self.exec_block(&stmts, 0);
+        let mut errs = Vec::new();
+        self.drain(&mut errs);
+        match r {
+            Err(e) => Err(e),
             // unreachable: parser rejects top-level return/break/continue
-            _ => Err(err("control flow escaped program")),
+            Ok(eval::Flow::Normal) => match errs.into_iter().next() {
+                Some(e) => Err(e),
+                None => Ok(self.last),
+            },
+            Ok(_) => Err(err("control flow escaped program")),
         }
     }
 }

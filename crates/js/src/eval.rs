@@ -8,7 +8,10 @@ use std::rc::Rc;
 use vigia_json::Json;
 
 use crate::ast::{Expr, FnDef, Stmt};
-use crate::{err, po, Env, Heap, Interp, JsError, NativeFn, Obj, Protos, Value};
+use crate::{
+    err, po, Env, Heap, Interp, JsError, Microtask, NativeFn, Obj, PromiseState, Protos,
+    ThenHandler, Timer, Value,
+};
 
 pub(crate) enum Flow {
     Normal,
@@ -86,6 +89,7 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
             }
             Obj::Native { name, .. } => format!("function {name}() {{ [native code] }}"),
             Obj::Dom(_) => "[object Node]".into(),
+            Obj::Promise(_) => "[object Promise]".into(),
         },
     }
 }
@@ -177,7 +181,7 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
             }
             key.parse::<usize>().ok().and_then(|i| items.get(i)).copied()
         }
-        Obj::Dom(_) => None,
+        Obj::Dom(_) | Obj::Promise(_) => None,
     }
 }
 
@@ -189,6 +193,7 @@ fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
             *proto
         }
         Obj::Native { .. } => po(protos.function_),
+        Obj::Promise(_) => po(protos.promise),
         Obj::Dom(_) => None,
     }
 }
@@ -473,6 +478,11 @@ impl Interp {
             ("padEnd", n_str_pad_end),
         ]);
         self.protos.number = self.proto_bag(&[("toFixed", n_num_to_fixed)]);
+        self.protos.promise = self.proto_bag(&[
+            ("then", n_promise_then),
+            ("catch", n_promise_catch),
+            ("finally", n_promise_finally),
+        ]);
         self.protos.date = self.proto_bag(&[
             ("getTime", n_date_get_time),
             ("toISOString", n_date_iso),
@@ -504,11 +514,28 @@ impl Interp {
         self.ctor("Number", n_number_cast, pr.number, &[]);
         self.ctor("Boolean", n_boolean_cast, u32::MAX, &[]);
         self.ctor("Date", n_date, pr.date, &[("now", n_date_now)]);
+        self.ctor(
+            "Promise",
+            n_promise_ctor,
+            pr.promise,
+            &[
+                ("resolve", n_promise_static_resolve),
+                ("reject", n_promise_static_reject),
+                ("all", n_promise_all),
+                ("race", n_promise_race),
+                ("allSettled", n_promise_all_settled),
+            ],
+        );
         for (n, f) in [
             ("parseInt", n_parse_int as NativeFn),
             ("parseFloat", n_parse_float),
             ("isNaN", n_is_nan),
             ("isFinite", n_is_finite),
+            ("setTimeout", n_set_timeout),
+            ("setInterval", n_set_interval),
+            ("clearTimeout", n_clear_timeout),
+            ("clearInterval", n_clear_interval),
+            ("queueMicrotask", n_queue_microtask),
         ] {
             if let Ok(id) = self.heap.alloc_obj(nat(n, f)) {
                 self.env_declare(0, n, Value::Obj(id));
@@ -802,6 +829,31 @@ impl Interp {
                 };
                 Ok(Value::Str(self.heap.intern_str(type_str(&self.heap, v))?))
             }
+            "await" => {
+                if !self.fn_async {
+                    return Err(err("await outside async"));
+                }
+                let v = self.expr(env, e)?;
+                match as_promise(self, v) {
+                    None => Ok(v), // non-promise awaits pass through
+                    Some(pid) => {
+                        // await counts as handling: its rejection becomes the
+                        // async fn's own rejection, not an unhandled one
+                        self.handled_promises.insert(pid);
+                        match self.heap.obj(pid) {
+                            Obj::Promise(PromiseState::Fulfilled(u)) => Ok(*u),
+                            Obj::Promise(PromiseState::Rejected(r)) => {
+                                Err(err(format!("await: {}", to_str(&self.heap, *r))))
+                            }
+                            Obj::Promise(PromiseState::Pending { .. }) => Err(err(
+                                "await on pending promise (vigia settles fetch/timer \
+                                 eagerly; pending awaits unsupported)",
+                            )),
+                            _ => Ok(v),
+                        }
+                    }
+                }
+            }
             "++" | "--" => self.bump(env, e, if op == "++" { 1.0 } else { -1.0 }, false),
             _ => {
                 let v = self.expr(env, e)?;
@@ -1061,7 +1113,7 @@ impl Interp {
             self.call_depth -= 1;
             return Err(err("max call depth"));
         }
-        let r = match c {
+        let (is_async, r) = match c {
             C::Fn(def, fenv) => {
                 let cenv = self.new_env(fenv)?;
                 for (i, p) in def.params.iter().enumerate() {
@@ -1072,16 +1124,45 @@ impl Interp {
                     self.env_declare(cenv, n, f);
                 }
                 self.env_declare(cenv, "this", this);
-                match self.exec_block(&def.body, cenv) {
+                // `await` binds to the nearest enclosing fn, so the flag
+                // is shadowed per call rather than accumulated.
+                let prev_async = self.fn_async;
+                self.fn_async = def.is_async;
+                let r = match self.exec_block(&def.body, cenv) {
                     Ok(Flow::Return(v)) => Ok(v),
                     Ok(_) => Ok(Value::Undef),
                     Err(e) => Err(e),
-                }
+                };
+                self.fn_async = prev_async;
+                (def.is_async, r)
             }
-            C::Nat(nf) => nf(self, this, args),
+            C::Nat(nf) => {
+                // cur_native exposes the callee object to natives that
+                // carry bound state in their own props ("__p", "__f", ...).
+                let prev = self.cur_native;
+                self.cur_native = f;
+                let r = nf(self, this, args);
+                self.cur_native = prev;
+                (false, r)
+            }
         };
         self.call_depth -= 1;
-        r
+        if is_async {
+            // async fn: returned value fulfills (promises adopt), a thrown
+            // error rejects with the message text.
+            let p = promise_new(self)?;
+            match r {
+                Ok(v) => self.promise_resolve(p, v),
+                Err(e) => {
+                    let s =
+                        self.heap.alloc_str(e.0).map(Value::Str).unwrap_or(Value::Undef);
+                    self.promise_settle(p, true, s);
+                }
+            }
+            Ok(Value::Obj(p))
+        } else {
+            r
+        }
     }
 
 
@@ -1122,28 +1203,45 @@ fn n_json_stringify(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Val
     Ok(Value::Str(it.heap.alloc_str(j.to_string())?))
 }
 
-/// fetch(url) - synchronous on purpose (the engine has no promises).
-/// Resolves `url` against the page URL and shares its cookie jar (both
-/// directions). Returns a plain object: status/ok/redirected/url + the
-/// body text under `__body`, which text()/json() read off `this`.
+/// fetch(url) - the HTTP request still executes eagerly at call time
+/// (synchronous engine), but the result is a resolved Promise holding the
+/// response object; a network failure rejects the Promise instead of
+/// throwing (real fetch semantics). The response carries status/ok/
+/// redirected/url plus the body under `__body`; text()/json() read it off
+/// `this` and return resolved Promises like real Response methods.
 fn n_fetch(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     let raw = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
-    let Some(ctx) = it.net.as_mut() else {
+    if it.net.is_none() {
         return Err(err("fetch needs a page context"));
+    }
+    // ctx borrow ends before heap allocs below
+    let res = {
+        let ctx = it.net.as_mut().unwrap();
+        let url = ctx.base.join(&raw).map_err(|e| err(format!("fetch: {e}")))?;
+        vigia_net::fetch(&url.to_string(), &mut ctx.jar)
+            .map_err(|e| format!("fetch: {e}"))
     };
-    let url = ctx.base.join(&raw).map_err(|e| err(format!("fetch: {e}")))?;
-    let res = vigia_net::fetch(&url.to_string(), &mut ctx.jar)
-        .map_err(|e| err(format!("fetch: {e}")))?;
-    let pairs = vec![
-        ("status".into(), Value::Num(res.status as f64)),
-        ("ok".into(), Value::Bool((200..=299).contains(&res.status))),
-        ("redirected".into(), Value::Bool(res.redirects > 0)),
-        ("url".into(), Value::Str(it.heap.alloc_str(res.final_url.to_string())?)),
-        ("__body".into(), Value::Str(it.heap.alloc_str(res.text())?)),
-        ("text".into(), Value::Obj(it.heap.alloc_obj(nat("text", n_res_text))?)),
-        ("json".into(), Value::Obj(it.heap.alloc_obj(nat("json", n_res_json))?)),
-    ];
-    Ok(Value::Obj(it.obj_pairs(pairs)?))
+    let p = promise_new(it)?;
+    match res {
+        Ok(res) => {
+            let pairs = vec![
+                ("status".into(), Value::Num(res.status as f64)),
+                ("ok".into(), Value::Bool((200..=299).contains(&res.status))),
+                ("redirected".into(), Value::Bool(res.redirects > 0)),
+                ("url".into(), Value::Str(it.heap.alloc_str(res.final_url.to_string())?)),
+                ("__body".into(), Value::Str(it.heap.alloc_str(res.text())?)),
+                ("text".into(), Value::Obj(it.heap.alloc_obj(nat("text", n_res_text))?)),
+                ("json".into(), Value::Obj(it.heap.alloc_obj(nat("json", n_res_json))?)),
+            ];
+            let resp = Value::Obj(it.obj_pairs(pairs)?);
+            it.promise_settle(p, false, resp);
+        }
+        Err(msg) => {
+            let s = it.heap.alloc_str(msg).map(Value::Str).unwrap_or(Value::Undef);
+            it.promise_settle(p, true, s);
+        }
+    }
+    Ok(Value::Obj(p))
 }
 
 fn res_body(it: &Interp, this: Value) -> Result<String, JsError> {
@@ -1153,15 +1251,31 @@ fn res_body(it: &Interp, this: Value) -> Result<String, JsError> {
     }
 }
 
+/// Wrap `v` in a resolved promise (Response.text/json style).
+fn resolved(it: &mut Interp, v: Value) -> Result<Value, JsError> {
+    let p = promise_new(it)?;
+    it.promise_settle(p, false, v);
+    Ok(Value::Obj(p))
+}
+
 fn n_res_text(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
     let b = res_body(it, this)?;
-    Ok(Value::Str(it.heap.alloc_str(b)?))
+    let v = Value::Str(it.heap.alloc_str(b)?);
+    resolved(it, v)
 }
 
 fn n_res_json(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
     let b = res_body(it, this)?;
-    let j = Json::parse(&b).map_err(|e| err(e.to_string()))?;
-    json_to_val(it, &j)
+    let p = promise_new(it)?;
+    match Json::parse(&b).map_err(|e| err(e.to_string())).and_then(|j| json_to_val(it, &j)) {
+        Ok(v) => it.promise_settle(p, false, v),
+        // real .json() rejects on a parse error, it doesn't throw
+        Err(e) => {
+            let s = it.heap.alloc_str(e.0).map(Value::Str).unwrap_or(Value::Undef);
+            it.promise_settle(p, true, s);
+        }
+    }
+    Ok(Value::Obj(p))
 }
 
 fn json_to_val(it: &mut Interp, j: &Json) -> Result<Value, JsError> {
@@ -1217,7 +1331,7 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
                     .map(|v| val_to_json(h, *v, depth + 1))
                     .collect::<Result<_, JsError>>()?,
             ),
-            Obj::Func { .. } | Obj::Native { .. } | Obj::Dom(_) => Json::Null,
+            Obj::Func { .. } | Obj::Native { .. } | Obj::Dom(_) | Obj::Promise(_) => Json::Null,
         },
     })
 }
@@ -1275,6 +1389,7 @@ fn n_obj_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
             Obj::Arr { .. } => "[object Array]",
             Obj::Func { .. } | Obj::Native { .. } => "[object Function]",
             Obj::Dom(_) => "[object Node]",
+            Obj::Promise(_) => "[object Promise]",
             Obj::Ordinary { .. } => "[object Object]",
         },
     };
@@ -1302,7 +1417,7 @@ fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
             Obj::Arr { items, .. } => {
                 items.iter().enumerate().map(|(i, x)| (i.to_string(), *x)).collect()
             }
-            Obj::Dom(_) => Vec::new(),
+            Obj::Dom(_) | Obj::Promise(_) => Vec::new(),
         },
         _ => Vec::new(),
     }
@@ -2183,6 +2298,670 @@ fn n_math_sqrt(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsEr
     Ok(Value::Num(to_num(&it.heap, arg(args, 0)).sqrt()))
 }
 
+// ---- async runtime: promises, microtasks, timers -----------------------------
+// Synchronous engine, real ordering: handlers queue as microtasks and run at
+// drain() points (end of each run(), after each fire() event dispatch). Timers
+// share the drain on a virtual clock - deadlines order firing, now_ms jumps to
+// each deadline instead of sleeping. Caps: 4096 timer fires per drain; the
+// microtask loop ticks steps so max_steps bounds it.
+
+/// Fresh pending promise.
+fn promise_new(it: &mut Interp) -> Result<u32, JsError> {
+    it.heap.alloc_obj(Obj::Promise(PromiseState::Pending { handlers: Vec::new() }))
+}
+
+/// Heap id if `v` is a Promise.
+fn as_promise(it: &Interp, v: Value) -> Option<u32> {
+    match v {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Promise(_)) => Some(id),
+        _ => None,
+    }
+}
+
+/// `v` if callable (Func/Native), else None. JS treats a non-callable
+/// .then argument as absent (pass-through).
+fn callable(it: &Interp, v: Value) -> Option<Value> {
+    match v {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Func { .. } | Obj::Native { .. }) => {
+            Some(v)
+        }
+        _ => None,
+    }
+}
+
+/// One drain sweep: all queued microtasks first, then the earliest-due
+/// timer, repeat until both run dry. Errors collect into `errs` and never
+/// abort the loop (a failing callback doesn't cancel its siblings), except
+/// the runaway guards which stop the drain.
+const MAX_TIMER_FIRES: u32 = 4096;
+
+impl Interp {
+    /// Settle a pending promise and queue one microtask per registered
+    /// handler (a missing handler passes the outcome through). No-op on
+    /// an already-settled promise.
+    pub(crate) fn promise_settle(&mut self, id: u32, rejecting: bool, v: Value) {
+        let st = match self.heap.obj_mut(id) {
+            Obj::Promise(st) => st,
+            _ => return,
+        };
+        if !matches!(st, PromiseState::Pending { .. }) {
+            return;
+        }
+        let next_state =
+            if rejecting { PromiseState::Rejected(v) } else { PromiseState::Fulfilled(v) };
+        let PromiseState::Pending { handlers } = std::mem::replace(st, next_state) else {
+            return;
+        };
+        for h in handlers {
+            self.microtasks.push_back(Microtask {
+                cb: if rejecting { h.on_reject } else { h.on_fulfill },
+                arg: v,
+                next: h.next,
+                rejecting,
+            });
+        }
+    }
+
+    /// `resolve(v)` semantics: a Promise argument is adopted (pending
+    /// subscribes a pass-through, settled copies the state); anything else
+    /// fulfills. No-op if `id` already settled. Non-Promise thenables are
+    /// NOT adopted (v1 limitation).
+    pub(crate) fn promise_resolve(&mut self, id: u32, v: Value) {
+        if v == Value::Obj(id) {
+            let s = self
+                .heap
+                .alloc_str("promise resolved with itself".into())
+                .map(Value::Str)
+                .unwrap_or(Value::Undef);
+            self.promise_settle(id, true, s);
+            return;
+        }
+        let Some(pid) = as_promise(self, v) else {
+            self.promise_settle(id, false, v);
+            return;
+        };
+        // adopting counts as handling the source promise
+        self.handled_promises.insert(pid);
+        enum Adopt {
+            Fulfill(Value),
+            Reject(Value),
+            Subscribe,
+        }
+        let act = match self.heap.obj(pid) {
+            Obj::Promise(PromiseState::Fulfilled(u)) => Adopt::Fulfill(*u),
+            Obj::Promise(PromiseState::Rejected(r)) => Adopt::Reject(*r),
+            _ => Adopt::Subscribe,
+        };
+        match act {
+            Adopt::Fulfill(u) => self.promise_settle(id, false, u),
+            Adopt::Reject(r) => self.promise_settle(id, true, r),
+            Adopt::Subscribe => {
+                if let Obj::Promise(PromiseState::Pending { handlers }) = self.heap.obj_mut(pid)
+                {
+                    handlers.push(ThenHandler {
+                        on_fulfill: None,
+                        on_reject: None,
+                        next: id,
+                    });
+                }
+            }
+        }
+    }
+
+    /// `.then(onF, onR)` core: allocate `next`, then register or enqueue
+    /// depending on the promise's state. Marks the promise handled for the
+    /// unhandled-rejection sweep. Returns `next`'s obj id.
+    fn promise_then(
+        &mut self,
+        id: u32,
+        on_fulfill: Option<Value>,
+        on_reject: Option<Value>,
+    ) -> Result<u32, JsError> {
+        let next = promise_new(self)?;
+        enum S {
+            Pend,
+            Ful(Value),
+            Rej(Value),
+        }
+        let s = match self.heap.obj(id) {
+            Obj::Promise(PromiseState::Pending { .. }) => S::Pend,
+            Obj::Promise(PromiseState::Fulfilled(v)) => S::Ful(*v),
+            Obj::Promise(PromiseState::Rejected(r)) => S::Rej(*r),
+            _ => S::Pend,
+        };
+        match s {
+            S::Pend => {
+                if let Obj::Promise(PromiseState::Pending { handlers }) = self.heap.obj_mut(id)
+                {
+                    handlers.push(ThenHandler { on_fulfill, on_reject, next });
+                }
+            }
+            S::Ful(v) => self.microtasks.push_back(Microtask {
+                cb: on_fulfill,
+                arg: v,
+                next,
+                rejecting: false,
+            }),
+            S::Rej(r) => self.microtasks.push_back(Microtask {
+                cb: on_reject,
+                arg: r,
+                next,
+                rejecting: true,
+            }),
+        }
+        self.handled_promises.insert(id);
+        Ok(next)
+    }
+
+    fn run_microtask(&mut self, m: Microtask, errs: &mut Vec<JsError>) {
+        match m.cb {
+            // no handler: the settlement passes straight through to `next`
+            None => {
+                if m.next != u32::MAX {
+                    self.promise_settle(m.next, m.rejecting, m.arg);
+                }
+            }
+            Some(cb) => match self.call_value(cb, Value::Undef, &[m.arg], None) {
+                Ok(v) => {
+                    if m.next != u32::MAX {
+                        self.promise_resolve(m.next, v);
+                    }
+                    // fire-and-forget cb returning a rejected promise is
+                    // still reported by the unhandled sweep below
+                }
+                Err(e) => {
+                    if m.next == u32::MAX {
+                        errs.push(e);
+                    } else {
+                        let s = self
+                            .heap
+                            .alloc_str(e.0)
+                            .map(Value::Str)
+                            .unwrap_or(Value::Undef);
+                        self.promise_settle(m.next, true, s);
+                    }
+                }
+            },
+        }
+    }
+
+    /// Drain the work queues: microtasks FIFO until empty, then fire the
+    /// earliest-deadline timer (advancing the virtual clock to it - never
+    /// sleeps), drain whatever it queued, repeat. Intervals reschedule
+    /// themselves unless clearTimeout/clearInterval cancelled them mid-cb.
+    /// Ends with the unhandled-rejection sweep (reported once each).
+    pub(crate) fn drain(&mut self, errs: &mut Vec<JsError>) {
+        let mut fires = 0u32;
+        'outer: loop {
+            while let Some(m) = self.microtasks.pop_front() {
+                if self.tick().is_err() {
+                    errs.push(err("step limit exceeded"));
+                    return;
+                }
+                self.run_microtask(m, errs);
+            }
+            let pick = self
+                .timers
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| !t.cancelled && !t.parked)
+                .min_by_key(|(_, t)| t.deadline_ms)
+                .map(|(i, _)| i);
+            let Some(i) = pick else { break };
+            fires += 1;
+            if fires > MAX_TIMER_FIRES {
+                errs.push(err("timer cap exceeded (4096 fires in one drain)"));
+                break 'outer;
+            }
+            self.now_ms = self.now_ms.max(self.timers[i].deadline_ms);
+            let (cb, args) = {
+                let t = &mut self.timers[i];
+                t.parked = true; // a nested drain (event dispatch) can't re-fire it
+                (t.cb, t.args.clone())
+            };
+            if let Err(e) = self.call_value(cb, Value::Undef, &args, None) {
+                errs.push(e);
+            }
+            let t = &mut self.timers[i];
+            t.parked = false;
+            if t.cancelled {
+                // cleared inside its own callback: stays dead
+            } else if let Some(iv) = t.interval {
+                t.deadline_ms = self.now_ms + iv;
+            } else {
+                t.cancelled = true;
+            }
+            // keep the vec from growing on churny pages
+            if self.timers.len() > 64 {
+                self.timers.retain(|t| !t.cancelled);
+            }
+        }
+        let mut unhandled = Vec::new();
+        for i in 0..self.heap.stats().0 as u32 {
+            if let Obj::Promise(PromiseState::Rejected(r)) = self.heap.obj(i) {
+                if !self.handled_promises.contains(&i) {
+                    unhandled.push((i, *r));
+                }
+            }
+        }
+        for (id, r) in unhandled {
+            self.handled_promises.insert(id);
+            errs.push(err(format!("unhandled rejection: {}", to_str(&self.heap, r))));
+        }
+    }
+}
+
+// -- Promise ctor + prototype -------------------------------------------------
+
+/// resolve/reject executor args are plain Native objects whose bound
+/// promise id lives in a "__p" own prop - natives see their own callee
+/// through cur_native.
+fn bound_prop(it: &Interp, key: &str) -> Result<Value, JsError> {
+    get_prop(&it.heap, &it.protos, it.cur_native, key)
+}
+
+fn bound_promise(it: &Interp) -> Result<u32, JsError> {
+    match bound_prop(it, "__p")? {
+        Value::Num(n) if n >= 0.0 => Ok(n as u32),
+        _ => Err(err("promise resolver detached")),
+    }
+}
+
+fn resolver_fn(it: &mut Interp, pid: u32, reject: bool) -> Result<Value, JsError> {
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Native {
+        name: if reject { "reject" } else { "resolve" },
+        f: if reject { n_promise_reject } else { n_promise_resolve },
+        pairs: vec![("__p".into(), Value::Num(pid as f64))],
+    })?))
+}
+
+/// new Promise(executor): executor runs synchronously with fresh
+/// resolve/reject natives; a throw rejects the promise.
+fn n_promise_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let exec = arg(args, 0);
+    if callable(it, exec).is_none() {
+        return Err(err("Promise executor is not a function"));
+    }
+    let pid = promise_new(it)?;
+    let res = resolver_fn(it, pid, false)?;
+    let rej = resolver_fn(it, pid, true)?;
+    if let Err(e) = it.call_value(exec, Value::Undef, &[res, rej], None) {
+        let s = it.heap.alloc_str(e.0).map(Value::Str).unwrap_or(Value::Undef);
+        it.promise_settle(pid, true, s);
+    }
+    Ok(Value::Obj(pid))
+}
+
+fn n_promise_resolve(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let pid = bound_promise(it)?;
+    it.promise_resolve(pid, arg(args, 0));
+    Ok(Value::Undef)
+}
+
+fn n_promise_reject(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let pid = bound_promise(it)?;
+    it.promise_settle(pid, true, arg(args, 0));
+    Ok(Value::Undef)
+}
+
+fn this_promise(it: &Interp, this: Value) -> Result<u32, JsError> {
+    as_promise(it, this).ok_or_else(|| err("promise method needs a promise receiver"))
+}
+
+fn n_promise_then(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let pid = this_promise(it, this)?;
+    let onf = callable(it, arg(args, 0));
+    let onr = callable(it, arg(args, 1));
+    Ok(Value::Obj(it.promise_then(pid, onf, onr)?))
+}
+
+fn n_promise_catch(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let pid = this_promise(it, this)?;
+    let onr = callable(it, arg(args, 0));
+    Ok(Value::Obj(it.promise_then(pid, None, onr)?))
+}
+
+/// finally(f): f runs on either path and its result is ignored - unless f
+/// throws (rejects `next`) or returns a rejected promise (adopted). The
+/// wrapper natives carry f in "__f"; a non-callable f is a pass-through.
+fn n_promise_finally(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let pid = this_promise(it, this)?;
+    let (onf, onr) = match callable(it, arg(args, 0)) {
+        Some(fv) => {
+            let mut wrap = |nf: NativeFn| -> Result<Value, JsError> {
+                Ok(Value::Obj(it.heap.alloc_obj(Obj::Native {
+                    name: "finally",
+                    f: nf,
+                    pairs: vec![("__f".into(), fv)],
+                })?))
+            };
+            (Some(wrap(n_finally_pass)?), Some(wrap(n_finally_throw)?))
+        }
+        None => (None, None),
+    };
+    Ok(Value::Obj(it.promise_then(pid, onf, onr)?))
+}
+
+/// True when `v` is a rejected promise (finally wrappers check f's return).
+fn is_rejected_promise(it: &Interp, v: Value) -> bool {
+    matches!(v, Value::Obj(id)
+        if matches!(it.heap.obj(id), Obj::Promise(PromiseState::Rejected(_))))
+}
+
+/// finally on the fulfill path: run f, keep the original value unless f
+/// produced a rejection (a pending f() promise is not awaited - v1).
+fn n_finally_pass(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let f = match bound_prop(it, "__f")? {
+        v @ Value::Obj(_) => v,
+        _ => return Err(err("finally detached")),
+    };
+    let r = it.call_value(f, Value::Undef, &[], None)?;
+    if is_rejected_promise(it, r) {
+        return Ok(r); // adoption propagates f's reason
+    }
+    Ok(arg(args, 0))
+}
+
+/// finally on the reject path: run f, then re-throw the original reason
+/// (as a rejected promise so adoption preserves the reason value, not an
+/// error string) unless f itself failed.
+fn n_finally_throw(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let f = match bound_prop(it, "__f")? {
+        v @ Value::Obj(_) => v,
+        _ => return Err(err("finally detached")),
+    };
+    let r = it.call_value(f, Value::Undef, &[], None)?;
+    if is_rejected_promise(it, r) {
+        return Ok(r);
+    }
+    let p = promise_new(it)?;
+    it.promise_settle(p, true, arg(args, 0));
+    Ok(Value::Obj(p))
+}
+
+// -- Promise statics ------------------------------------------------------------
+
+fn n_promise_static_resolve(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let v = arg(args, 0);
+    if as_promise(it, v).is_some() {
+        return Ok(v); // Promise.resolve(promise) IS the promise
+    }
+    resolved(it, v)
+}
+
+fn n_promise_static_reject(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let p = promise_new(it)?;
+    it.promise_settle(p, true, arg(args, 0));
+    Ok(Value::Obj(p))
+}
+
+/// Arg as an Arr's items (no iterable protocol - arrays only).
+fn array_items(it: &Interp, v: Value, who: &str) -> Result<Vec<Value>, JsError> {
+    match v {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Arr { .. }) => {
+            Ok(arr_items(it, id))
+        }
+        _ => Err(err(format!("{who} needs an array"))),
+    }
+}
+
+/// A promise's immediate state: Some((rejecting, value)) when settled.
+fn settled_state(it: &Interp, pid: u32) -> Option<(bool, Value)> {
+    match it.heap.obj(pid) {
+        Obj::Promise(PromiseState::Fulfilled(v)) => Some((false, *v)),
+        Obj::Promise(PromiseState::Rejected(r)) => Some((true, *r)),
+        _ => None,
+    }
+}
+
+/// Subscribe a pure pass-through (or two bound natives) on a pending
+/// member promise; `next` = u32::MAX when no downstream promise is needed.
+fn subscribe_pending(
+    it: &mut Interp,
+    pid: u32,
+    on_fulfill: Option<Value>,
+    on_reject: Option<Value>,
+    next: u32,
+) {
+    it.handled_promises.insert(pid);
+    if let Obj::Promise(PromiseState::Pending { handlers }) = it.heap.obj_mut(pid) {
+        handlers.push(ThenHandler { on_fulfill, on_reject, next });
+    }
+}
+
+/// Native with __st (the all() state object) + optional __i (member index)
+/// bound in its own props.
+fn member_fn(it: &mut Interp, name: &'static str, f: NativeFn, st: u32, i: Option<usize>) -> Result<Value, JsError> {
+    let mut pairs = vec![("__st".into(), Value::Obj(st))];
+    if let Some(i) = i {
+        pairs.push(("__i".into(), Value::Num(i as f64)));
+    }
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Native { name, f, pairs })?))
+}
+
+fn bound_state(it: &Interp) -> Result<(u32, usize), JsError> {
+    let st = match bound_prop(it, "__st")? {
+        Value::Obj(id) => id,
+        _ => return Err(err("aggregate callback detached")),
+    };
+    let i = match bound_prop(it, "__i")? {
+        Value::Num(n) => n as usize,
+        _ => usize::MAX,
+    };
+    Ok((st, i))
+}
+
+/// all()/allSettled() bookkeeping: {count, n, results, out}. Store
+/// results[i]=v; on count==n settle `out` fulfilled with the array.
+fn all_record(it: &mut Interp, st: u32, i: usize, v: Value) -> Result<(), JsError> {
+    let h = &it.heap;
+    let (results, out, n, count) = (
+        get_prop(h, &it.protos, Value::Obj(st), "results")?,
+        get_prop(h, &it.protos, Value::Obj(st), "out")?,
+        to_num(h, get_prop(h, &it.protos, Value::Obj(st), "n")?),
+        to_num(h, get_prop(h, &it.protos, Value::Obj(st), "count")?),
+    );
+    set_index(&mut it.heap, results, Value::Num(i as f64), v)?;
+    let count = count + 1.0;
+    set_prop(&mut it.heap, Value::Obj(st), "count", Value::Num(count))?;
+    if count >= n {
+        if let Value::Obj(oid) = out {
+            it.promise_settle(oid, false, results);
+        }
+    }
+    Ok(())
+}
+
+/// Promise.all(arr): members may be promises or plain values; pending
+/// members get counting-callback subscriptions. First rejection wins;
+/// empty array resolves to [].
+fn n_promise_all(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let items = array_items(it, arg(args, 0), "Promise.all")?;
+    promise_aggregate(it, &items, false)
+}
+
+/// Promise.allSettled(arr): every member records {status,value|reason};
+/// `out` never rejects.
+fn n_promise_all_settled(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let items = array_items(it, arg(args, 0), "Promise.allSettled")?;
+    promise_aggregate(it, &items, true)
+}
+
+fn promise_aggregate(it: &mut Interp, items: &[Value], settled: bool) -> Result<Value, JsError> {
+    let out = promise_new(it)?;
+    let n = items.len();
+    let results = it.arr_obj(vec![Value::Undef; n])?;
+    let st = it.obj_pairs(vec![
+        ("count".into(), Value::Num(0.0)),
+        ("n".into(), Value::Num(n as f64)),
+        ("results".into(), Value::Obj(results)),
+        ("out".into(), Value::Obj(out)),
+    ])?;
+    for (i, m) in items.iter().enumerate() {
+        let pid = match as_promise(it, *m) {
+            Some(p) => p,
+            None => {
+                // plain value: record inline
+                if settled {
+                    settled_record(it, st, i, false, *m)?;
+                } else {
+                    all_record(it, st, i, *m)?;
+                }
+                continue;
+            }
+        };
+        it.handled_promises.insert(pid); // aggregation handles the member
+        match settled_state(it, pid) {
+            Some((false, v)) if !settled => all_record(it, st, i, v)?,
+            Some((true, r)) if !settled => it.promise_settle(out, true, r),
+            Some((rej, v)) => settled_record(it, st, i, rej, v)?,
+            None => {
+                let (okf, badf): (NativeFn, NativeFn) = if settled {
+                    (n_as_ok, n_as_bad)
+                } else {
+                    (n_all_ok, n_all_bad)
+                };
+                let ok = member_fn(it, "all.ok", okf, st, Some(i))?;
+                let bad = member_fn(it, "all.bad", badf, st, Some(i))?;
+                subscribe_pending(it, pid, Some(ok), Some(bad), u32::MAX);
+            }
+        }
+    }
+    if n == 0 {
+        // empty input resolves to [] immediately (all and allSettled alike)
+        it.promise_settle(out, false, Value::Obj(results));
+    }
+    Ok(Value::Obj(out))
+}
+
+fn n_all_ok(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (st, i) = bound_state(it)?;
+    all_record(it, st, i, arg(args, 0))?;
+    Ok(Value::Undef)
+}
+
+fn n_all_bad(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (st, _) = bound_state(it)?;
+    if let Value::Obj(out) = get_prop(&it.heap, &it.protos, Value::Obj(st), "out")? {
+        it.promise_settle(out, true, arg(args, 0));
+    }
+    Ok(Value::Undef)
+}
+
+/// allSettled row: {status:"fulfilled",value} / {status:"rejected",reason}.
+fn settled_record(
+    it: &mut Interp,
+    st: u32,
+    i: usize,
+    rejected: bool,
+    v: Value,
+) -> Result<(), JsError> {
+    let (status, key) = if rejected { ("rejected", "reason") } else { ("fulfilled", "value") };
+    let s = it.heap.alloc_str(status.into())?;
+    let o = it.obj_pairs(vec![("status".into(), Value::Str(s)), (key.into(), v)])?;
+    all_record(it, st, i, Value::Obj(o))
+}
+
+fn n_as_ok(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (st, i) = bound_state(it)?;
+    settled_record(it, st, i, false, arg(args, 0))?;
+    Ok(Value::Undef)
+}
+
+fn n_as_bad(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (st, i) = bound_state(it)?;
+    settled_record(it, st, i, true, arg(args, 0))?;
+    Ok(Value::Undef)
+}
+
+/// Promise.race(arr): every member subscribes a pass-through to `out`;
+/// the first settle wins (later settles are no-ops).
+fn n_promise_race(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let items = array_items(it, arg(args, 0), "Promise.race")?;
+    let out = promise_new(it)?;
+    for m in items {
+        match as_promise(it, m) {
+            Some(pid) => {
+                it.handled_promises.insert(pid);
+                match settled_state(it, pid) {
+                    Some((rej, v)) => it.promise_settle(out, rej, v),
+                    None => subscribe_pending(it, pid, None, None, out),
+                }
+            }
+            None => it.promise_settle(out, false, m),
+        }
+    }
+    Ok(Value::Obj(out))
+}
+
+// -- timers + queueMicrotask ---------------------------------------------------
+
+fn timer_add(it: &mut Interp, args: &[Value], interval: bool) -> Result<Value, JsError> {
+    let cb = arg(args, 0);
+    if callable(it, cb).is_none() {
+        return Err(err(if interval {
+            "setInterval needs a function"
+        } else {
+            "setTimeout needs a function"
+        }));
+    }
+    let ms = to_num(&it.heap, arg(args, 1));
+    let ms = if ms.is_finite() && ms > 0.0 { ms as u64 } else { 0 };
+    let id = it.next_timer_id;
+    it.next_timer_id = it.next_timer_id.wrapping_add(1).max(1);
+    it.timers.push(Timer {
+        id,
+        deadline_ms: it.now_ms + ms,
+        cb,
+        args: args[2.min(args.len())..].to_vec(),
+        // a 0ms interval would spin against the fire cap; floor it at 1
+        interval: interval.then_some(ms.max(1)),
+        cancelled: false,
+        parked: false,
+    });
+    Ok(Value::Num(id as f64))
+}
+
+fn n_set_timeout(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    timer_add(it, args, false)
+}
+
+fn n_set_interval(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    timer_add(it, args, true)
+}
+
+/// clearTimeout/clearInterval share the id space, like browsers.
+fn timer_clear(it: &mut Interp, args: &[Value]) -> Result<Value, JsError> {
+    let id = to_num(&it.heap, arg(args, 0));
+    if id.is_finite() && id >= 0.0 {
+        if let Some(t) = it.timers.iter_mut().find(|t| t.id == id as u32) {
+            t.cancelled = true;
+        }
+    }
+    Ok(Value::Undef)
+}
+
+fn n_clear_timeout(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    timer_clear(it, args)
+}
+
+fn n_clear_interval(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    timer_clear(it, args)
+}
+
+fn n_queue_microtask(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(cb) = callable(it, arg(args, 0)) else {
+        return Err(err("queueMicrotask needs a function"));
+    };
+    it.microtasks.push_back(Microtask {
+        cb: Some(cb),
+        arg: Value::Undef,
+        next: u32::MAX,
+        rejecting: false,
+    });
+    Ok(Value::Undef)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2629,5 +3408,352 @@ mod tests {
         // own-prop objects still work
         let mut it = Interp::with_cap(128);
         assert_eq!(it.run("var o={a:1};o.a").unwrap(), Value::Num(1.0));
+    }
+
+    // ---- promises, microtasks, timers -----------------------------------
+
+    #[test]
+    fn then_handlers_run_at_drain() {
+        // .then callbacks run after the remaining sync code, FIFO
+        assert_eq!(
+            out("Promise.resolve(1).then(function(){console.log('then')});console.log('sync')"),
+            "sync\nthen\n"
+        );
+        // values thread through chains
+        assert_eq!(
+            out("Promise.resolve(1).then(function(v){return v+1}).then(function(v){console.log(v)})"),
+            "2\n"
+        );
+        // executor resolves synchronously; still delivered post-sync
+        assert_eq!(
+            out("new Promise(function(res){res(7);console.log('exec')}).then(function(v){console.log(v)})"),
+            "exec\n7\n"
+        );
+        // resolve() called later (stored resolver) flushes the handlers
+        assert_eq!(
+            out("var r;var p=new Promise(function(res){r=res});\
+                p.then(function(v){console.log('late:'+v)});r(9)"),
+            "late:9\n"
+        );
+        // resolve(promise) adopts its state
+        assert_eq!(
+            out("var r;var p=new Promise(function(res){r=res});\
+                p.then(function(v){console.log('adopt:'+v)});r(Promise.resolve(5))"),
+            "adopt:5\n"
+        );
+        // resolve(self) rejects
+        assert_eq!(
+            out("var r;var p=new Promise(function(res){r=res});\
+                p.catch(function(){console.log('self')});r(p)"),
+            "self\n"
+        );
+        // a second then on the same settled promise queues independently
+        assert_eq!(
+            out("var p=Promise.resolve(1);p.then(function(){console.log('a')});\
+                p.then(function(){console.log('b')})"),
+            "a\nb\n"
+        );
+        // instanceof + tag
+        assert!(boolean("Promise.resolve(1) instanceof Promise"));
+        assert_eq!(disp("Promise.resolve(1)+''"), "[object Promise]");
+        // non-function args are pass-through, not errors
+        assert_eq!(
+            out("Promise.resolve(4).then(undefined).then(function(v){console.log(v)})"),
+            "4\n"
+        );
+    }
+
+    #[test]
+    fn rejection_flows_through_chains() {
+        // skips fulfill handlers, reaches the reject handler
+        assert_eq!(
+            out("Promise.reject('x').then(function(){console.log('no')})\
+                .then(function(){console.log('no2')},function(r){console.log('got:'+r)})"),
+            "got:x\n"
+        );
+        // catch = then(undefined, onR)
+        assert_eq!(
+            out("Promise.reject('x').catch(function(r){console.log('caught:'+r)})"),
+            "caught:x\n"
+        );
+        // a throwing handler rejects downstream
+        assert_eq!(
+            out("Promise.resolve(1).then(function(){nope()})\
+                .catch(function(e){console.log('err:'+e)})"),
+            "err:nope is not defined\n"
+        );
+        // catch's return value recovers the chain
+        assert_eq!(
+            out("Promise.reject('x').catch(function(){return 3})\
+                .then(function(v){console.log('rec:'+v)})"),
+            "rec:3\n"
+        );
+        // executor throwing rejects the promise
+        assert_eq!(
+            out("new Promise(function(){nope()}).catch(function(e){console.log(e)})"),
+            "nope is not defined\n"
+        );
+        // Promise.reject with no handler -> drain error surfaces from run()
+        assert!(errmsg("Promise.reject('boom')").contains("unhandled rejection"));
+        assert!(errmsg("Promise.reject('boom')").contains("boom"));
+        // a .then without onR forwards the rejection to the next promise,
+        // which itself is the unhandled one
+        assert!(
+            errmsg("Promise.reject('x').then(function(){})").contains("unhandled rejection")
+        );
+        // handled in the same script: no error
+        assert_eq!(
+            out("var p=Promise.reject('x');p.catch(function(r){console.log('ok:'+r)})"),
+            "ok:x\n"
+        );
+        // handler returning a settled promise adopts: fulfilled propagates
+        assert_eq!(
+            out("Promise.resolve(1).then(function(){return Promise.resolve(9)})\
+                .then(function(v){console.log('rv'+v)})"),
+            "rv9\n"
+        );
+        // ...and a returned rejected promise rejects the chain
+        assert_eq!(
+            out("Promise.resolve(1).then(function(){return Promise.reject('z')})\
+                .catch(function(e){console.log('rz'+e)})"),
+            "rzz\n"
+        );
+        // handler returning a PENDING promise: the chain follows it; the
+        // timer resolves q after the handler already adopted it
+        assert_eq!(
+            out("var r;var q=new Promise(function(res){r=res});\
+                Promise.resolve(0).then(function(){return q})\
+                .then(function(v){console.log('pend'+v)});\
+                setTimeout(function(){r(7)},0)"),
+            "pend7\n"
+        );
+    }
+
+    #[test]
+    fn promise_finally_both_paths() {
+        // fulfill path: f runs, value preserved
+        assert_eq!(
+            out("Promise.resolve(9).finally(function(){console.log('fin')})\
+                .then(function(v){console.log('v'+v)})"),
+            "fin\nv9\n"
+        );
+        // reject path: f runs, original reason preserved
+        assert_eq!(
+            out("Promise.reject('r').finally(function(){console.log('fin')})\
+                .catch(function(e){console.log('c'+e)})"),
+            "fin\ncr\n"
+        );
+        // throwing f overrides the outcome
+        assert_eq!(
+            out("Promise.resolve(9).finally(function(){nope()})\
+                .then(function(){console.log('no')})\
+                .catch(function(){console.log('threw')})"),
+            "threw\n"
+        );
+        // f returning a rejected promise overrides too
+        assert_eq!(
+            out("Promise.resolve(9).finally(function(){return Promise.reject('fx')})\
+                .catch(function(e){console.log('rf'+e)})"),
+            "rffx\n"
+        );
+        // non-callable f is a pass-through
+        assert_eq!(
+            out("Promise.resolve(2).finally(5).then(function(v){console.log(v)})"),
+            "2\n"
+        );
+    }
+
+    #[test]
+    fn promise_all_static() {
+        assert_eq!(
+            out("Promise.all([Promise.resolve(1),2,'x'])\
+                .then(function(a){console.log(a.join('|'))})"),
+            "1|2|x\n"
+        );
+        assert_eq!(
+            out("Promise.all([]).then(function(a){console.log('n'+a.length)})"),
+            "n0\n"
+        );
+        // order is positional even when members settle out of order
+        assert_eq!(
+            out("var r1,r2;\
+                Promise.all([new Promise(function(a){r1=a}),new Promise(function(b){r2=b})])\
+                .then(function(a){console.log(a.join(','))});r2('B');r1('A')"),
+            "A,B\n"
+        );
+        // first rejection rejects the aggregate
+        assert_eq!(
+            out("Promise.all([Promise.resolve(1),Promise.reject('no'),3])\
+                .then(function(){console.log('bad')})\
+                .catch(function(e){console.log('rej:'+e)})"),
+            "rej:no\n"
+        );
+        // mixed pending: a late rejection still wins over pending members
+        assert_eq!(
+            out("var r1,r2;\
+                Promise.all([new Promise(function(a){r1=a}),new Promise(function(_,b){r2=b})])\
+                .then(function(){console.log('bad')})\
+                .catch(function(e){console.log('late:'+e)});r2('x');r1('y')"),
+            "late:x\n"
+        );
+        assert!(errmsg("Promise.all(5)").contains("array"));
+    }
+
+    #[test]
+    fn promise_race_and_allsettled() {
+        // race: first settle wins (here the already-resolved member)
+        assert_eq!(
+            out("var r1;Promise.race([new Promise(function(a){r1=a}),Promise.resolve('fast')])\
+                .then(function(v){console.log('w'+v)});r1('slow')"),
+            "wfast\n"
+        );
+        assert_eq!(
+            out("Promise.race([1,Promise.resolve(2)]).then(function(v){console.log(v)})"),
+            "1\n"
+        );
+        // race can reject
+        assert_eq!(
+            out("Promise.race([Promise.reject('r')]).catch(function(e){console.log(e)})"),
+            "r\n"
+        );
+        // allSettled never rejects; statuses in order
+        assert_eq!(
+            out("Promise.allSettled([Promise.resolve(1),Promise.reject('e'),3])\
+                .then(function(a){\
+                    console.log(a[0].status+':'+a[0].value+'|'+a[1].status+':'+a[1].reason+'|'+a[2].status)\
+                })"),
+            "fulfilled:1|rejected:e|fulfilled\n"
+        );
+        assert_eq!(
+            out("Promise.allSettled([]).then(function(a){console.log(a.length)})"),
+            "0\n"
+        );
+        // Promise.resolve on a promise is identity
+        assert!(boolean("var p=Promise.resolve(1);Promise.resolve(p)===p"));
+        // unhandled rejection inside all() doesn't double-report members
+        assert_eq!(errmsg("Promise.all([Promise.reject('m')])").split('\n').count(), 1);
+    }
+
+    #[test]
+    fn timers_virtual_clock() {
+        // deadlines order firing, not registration order; sync code first
+        assert_eq!(
+            out("setTimeout(function(){console.log('b')},50);\
+                setTimeout(function(){console.log('a')},10);console.log('sync')"),
+            "sync\na\nb\n"
+        );
+        // cb args pass through; clearTimeout kills a pending timer
+        assert_eq!(
+            out("setTimeout(function(x,y){console.log(x+y)},0,3,4)"),
+            "7\n"
+        );
+        assert_eq!(
+            out("var t=setTimeout(function(){console.log('dead')},0);\
+                clearTimeout(t);console.log('ok')"),
+            "ok\n"
+        );
+        // same deadline = registration order; a timer can schedule a timer
+        assert_eq!(
+            out("setTimeout(function(){console.log('a');setTimeout(function(){console.log('c')},0)},0);\
+                setTimeout(function(){console.log('b')},0)"),
+            "a\nb\nc\n"
+        );
+        // setInterval repeats until cleared (fires at 5,10,15; reader at 20)
+        assert_eq!(
+            out("var n=0;var i=setInterval(function(){n++;if(n==3){clearInterval(i)}},5);\
+                setTimeout(function(){console.log('n='+n)},20)"),
+            "n=3\n"
+        );
+        // clearInterval inside the cb stops it after one fire
+        assert_eq!(
+            out("var n=0;var i=setInterval(function(){n++;clearInterval(i)},1);\
+                setTimeout(function(){console.log('once:'+n)},10)"),
+            "once:1\n"
+        );
+        // clearTimeout with a bogus id is a no-op
+        assert_eq!(out("clearTimeout(999);console.log('ok')"), "ok\n");
+        // non-function cb errors
+        assert!(errmsg("setTimeout(5)").contains("function"));
+    }
+
+    #[test]
+    fn queue_microtask_ordering() {
+        // microtasks (thens + queueMicrotask) all beat timers
+        assert_eq!(
+            out("setTimeout(function(){console.log('t')},0);\
+                queueMicrotask(function(){console.log('m')});\
+                Promise.resolve().then(function(){console.log('p')});\
+                console.log('s')"),
+            "s\nm\np\nt\n"
+        );
+        // a microtask queueing a microtask still beats the timer
+        assert_eq!(
+            out("setTimeout(function(){console.log('t')},0);\
+                queueMicrotask(function(){console.log('m1');queueMicrotask(function(){console.log('m2')})})"),
+            "m1\nm2\nt\n"
+        );
+        // queueMicrotask cb throwing is a drain error, not a throw
+        assert!(errmsg("queueMicrotask(function(){nope()})").contains("nope"));
+        assert!(errmsg("queueMicrotask(3)").contains("function"));
+    }
+
+    #[test]
+    fn async_await() {
+        // async fn returns a promise fulfilled with the return value
+        assert_eq!(
+            out("async function f(){return 5}f().then(function(v){console.log(v)})"),
+            "5\n"
+        );
+        // expr form too
+        assert_eq!(
+            out("var f=async function(){return 8};f().then(function(v){console.log(v)})"),
+            "8\n"
+        );
+        // await unwraps fulfilled promises; non-promises pass through
+        assert_eq!(
+            out("async function f(){var a=await Promise.resolve(2);var b=await 3;\
+                return a+b}f().then(function(v){console.log(v)})"),
+            "5\n"
+        );
+        // await on rejected throws -> the async fn's promise rejects
+        assert_eq!(
+            out("async function f(){await Promise.reject('bad')}\
+                f().catch(function(e){console.log('aw:'+e)})"),
+            "aw:await: bad\n"
+        );
+        // await on pending is a clear error (no suspension exists)
+        assert!(
+            out("async function f(){await new Promise(function(){})}\
+                f().catch(function(e){console.log(e)})")
+            .contains("await on pending promise")
+        );
+        // await outside async is an eval error even though it parses
+        assert!(errmsg("await 1").contains("await outside async"));
+        // ...and inside a plain nested fn too (nearest-fn rule): the error
+        // rejects the async fn's promise
+        assert!(
+            errmsg("async function f(){(function(){await 1})()}f()")
+                .contains("await outside async")
+        );
+        // throw inside async rejects; return adopts a promise
+        assert_eq!(
+            out("async function f(){return Promise.resolve(6)}\
+                f().then(function(v){console.log(v)})"),
+            "6\n"
+        );
+    }
+
+    #[test]
+    fn drain_caps() {
+        // microtask self-requeue is bounded by the step cap
+        let mut it = Interp::new();
+        it.max_steps = 500;
+        assert!(
+            it.run("function q(){queueMicrotask(q)}q()").unwrap_err().0.contains("step")
+        );
+        // an uncleared interval hits the timer cap, not a hang
+        let mut it = Interp::new();
+        let e = it.run("setInterval(function(){},1)").unwrap_err();
+        assert!(e.0.contains("timer cap"), "{}", e.0);
     }
 }

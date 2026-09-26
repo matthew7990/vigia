@@ -113,14 +113,29 @@ pub struct NetCtx {
 #[derive(Debug)]
 pub enum Obj {
     /// property map, insertion order; proto = heap obj id, None = null proto
-    Ordinary { pairs: Vec<(String, Value)>, proto: Option<u32> },
-    Arr { items: Vec<Value>, proto: Option<u32> },
+    Ordinary {
+        pairs: Vec<(String, Value)>,
+        proto: Option<u32>,
+    },
+    Arr {
+        items: Vec<Value>,
+        proto: Option<u32>,
+    },
     /// def carries params+body shared via Rc; env is the captured EnvId.
     /// pairs holds own props ("prototype" is populated at creation).
-    Func { def: Rc<FnDef>, env: u32, proto: Option<u32>, pairs: Vec<(String, Value)> },
+    Func {
+        def: Rc<FnDef>,
+        env: u32,
+        proto: Option<u32>,
+        pairs: Vec<(String, Value)>,
+    },
     /// name+f; pairs holds own props (ctor statics, "prototype"). No proto
     /// field: get_prop falls back to Function.prototype for Natives.
-    Native { name: &'static str, f: NativeFn, pairs: Vec<(String, Value)> },
+    Native {
+        name: &'static str,
+        f: NativeFn,
+        pairs: Vec<(String, Value)>,
+    },
     /// JS handle over a DOM node; valid only while Interp.dom is installed.
     Dom(NodeId),
     /// Promise cell; Promise.prototype is a virtual proto (proto_of).
@@ -208,7 +223,11 @@ impl Protos {
 
 /// u32::MAX sentinel -> None (proto not installed).
 pub(crate) fn po(p: u32) -> Option<u32> {
-    if p == u32::MAX { None } else { Some(p) }
+    if p == u32::MAX {
+        None
+    } else {
+        Some(p)
+    }
 }
 
 /// Value arena. `cap` is a hard limit on live slots (objs + strs). The
@@ -398,7 +417,11 @@ impl Interp {
             ^ 0x9E3779B97F4A7C15;
         let mut it = Interp {
             heap: Heap::with_cap(cap),
-            envs: vec![Env { vars: HashMap::new(), parent: None, free: false }],
+            envs: vec![Env {
+                vars: HashMap::new(),
+                parent: None,
+                free: false,
+            }],
             dom: None,
             dom_objs: HashMap::new(),
             listeners: HashMap::new(),

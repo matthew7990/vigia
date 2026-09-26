@@ -7,11 +7,12 @@
 //!   - in-flight call values (call_vals): callee, `this`, args - Rust
 //!     locals are invisible to the marker, so call_value roots them here
 //!   - last completion value and cur_native
-//!   - queued work: microtasks (cb/arg/next), timers (cb/args), event
-//!     listeners
+//!   - queued work: microtasks (cb/arg/next), timers (cb/args),
+//!     event listeners
 //!   - the DOM wrapper cache (dom_objs) and the shared protos
-//!   - every interned string: intern entries stay live so literal ids
-//!     never dangle
+//!   - every interned string: intern entries stay live so literal
+//!     ids never dangle
+//!
 //! A marked Obj::Func marks its captured env transitively, which is what
 //! keeps a closure's defining frame alive after it would otherwise drop.
 //!
@@ -57,7 +58,9 @@ impl Marker {
             let mut did = false;
             while let Some(id) = self.ow.pop() {
                 did = true;
-                let Some(o) = it.heap.objs.get(id as usize) else { continue };
+                let Some(o) = it.heap.objs.get(id as usize) else {
+                    continue;
+                };
                 if self.objs[id as usize] || matches!(o, Obj::Freed) {
                     continue;
                 }
@@ -101,9 +104,7 @@ impl Marker {
                                 }
                             }
                         }
-                        PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => {
-                            self.val(*v)
-                        }
+                        PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => self.val(*v),
                     },
                     Obj::Dom(_) | Obj::Freed => {}
                 }
@@ -116,7 +117,9 @@ impl Marker {
             }
             while let Some(id) = self.ew.pop() {
                 did = true;
-                let Some(e) = it.envs.get(id as usize) else { continue };
+                let Some(e) = it.envs.get(id as usize) else {
+                    continue;
+                };
                 if self.envs[id as usize] || e.free {
                     continue;
                 }
@@ -258,7 +261,11 @@ impl Interp {
         // a recycled obj id must not inherit "handled rejection" status
         self.handled_promises
             .retain(|id| m.objs.get(*id as usize).copied().unwrap_or(false));
-        GcStats { freed_objs, freed_strs, freed_envs }
+        GcStats {
+            freed_objs,
+            freed_strs,
+            freed_envs,
+        }
     }
 }
 

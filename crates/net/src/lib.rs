@@ -100,6 +100,9 @@ impl Response {
     }
 }
 
+// TlsStream is a few KB of handshake state; boxing just to quiet the
+// lint buys nothing for a two-variant enum.
+#[allow(clippy::large_enum_variant)]
 enum Conn {
     Plain(TcpStream),
     Tls(vigia_tls::TlsStream),
@@ -140,7 +143,10 @@ impl<C: Read> Metered<C> {
         let n = self.inner.read(buf)?;
         self.n += n;
         if self.n > MAX_WIRE {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "wire cap exceeded"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "wire cap exceeded",
+            ));
         }
         Ok(n)
     }
@@ -198,7 +204,7 @@ fn run(
                 .map(|(_, v)| v.trim().to_string())
                 .ok_or(Error::Protocol("redirect without location"))?;
             current = res.final_url.join(&loc)?;
-            if matches!(status, 301 | 302 | 303) && method != "GET" {
+            if matches!(status, 301..=303) && method != "GET" {
                 method = "GET";
                 body = None;
             }
@@ -294,7 +300,9 @@ fn request(
         if line.is_empty() {
             break;
         }
-        let (k, v) = line.split_once(':').ok_or(Error::Protocol("bad header line"))?;
+        let (k, v) = line
+            .split_once(':')
+            .ok_or(Error::Protocol("bad header line"))?;
         headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
     }
 
@@ -311,7 +319,10 @@ fn request(
         if te.is_some_and(|t| t.to_ascii_lowercase().contains("chunked")) {
             read_chunked(&mut m)?
         } else if let Some(len) = header(&headers, "content-length") {
-            let n: usize = len.trim().parse().map_err(|_| Error::Protocol("bad content-length"))?;
+            let n: usize = len
+                .trim()
+                .parse()
+                .map_err(|_| Error::Protocol("bad content-length"))?;
             if n > MAX_WIRE {
                 return Err(Error::Limit("content-length over cap"));
             }
@@ -343,7 +354,10 @@ fn request(
 }
 
 fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    headers
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.as_str())
 }
 
 fn parse_status(line: &str) -> Result<u16, Error> {
@@ -386,8 +400,8 @@ fn read_chunked(m: &mut Metered<Conn>) -> Result<Vec<u8>, Error> {
     loop {
         let line = read_line(m, 128)?;
         let size_str = line.split(';').next().unwrap_or("").trim();
-        let size = usize::from_str_radix(size_str, 16)
-            .map_err(|_| Error::Protocol("bad chunk size"))?;
+        let size =
+            usize::from_str_radix(size_str, 16).map_err(|_| Error::Protocol("bad chunk size"))?;
         if size == 0 {
             // Trailer section: read until empty line.
             loop {

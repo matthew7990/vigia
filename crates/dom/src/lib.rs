@@ -35,6 +35,10 @@ impl Interner {
     pub fn len(&self) -> usize {
         self.strings.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.strings.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,24 +99,17 @@ impl Dom {
     }
 
     /// Create an element and append it under `parent`.
-    pub fn element(
-        &mut self,
-        parent: NodeId,
-        tag: &str,
-        attrs: Vec<(String, String)>,
-    ) -> NodeId {
+    pub fn element(&mut self, parent: NodeId, tag: &str, attrs: Vec<(String, String)>) -> NodeId {
         let tag_id = self.interner.intern(tag);
         let attrs = attrs
             .into_iter()
             .map(|(k, v)| (self.interner.intern(&k), v))
             .collect();
-        let id = self.push(
-            Node {
-                parent: Some(parent),
-                children: Vec::new(),
-                data: NodeData::Element(ElementData { tag: tag_id, attrs }),
-            },
-        );
+        let id = self.push(Node {
+            parent: Some(parent),
+            children: Vec::new(),
+            data: NodeData::Element(ElementData { tag: tag_id, attrs }),
+        });
         self.nodes[parent as usize].children.push(id);
         id
     }

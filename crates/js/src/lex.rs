@@ -24,18 +24,34 @@ pub struct Token {
 }
 
 const KWS: &[&str] = &[
-    "var", "let", "const", "function", "return", "if", "else", "while", "for", "break", "continue",
-    "true", "false", "null", "undefined", "typeof", "new", "in", "instanceof", "async", "await",
+    "var",
+    "let",
+    "const",
+    "function",
+    "return",
+    "if",
+    "else",
+    "while",
+    "for",
+    "break",
+    "continue",
+    "true",
+    "false",
+    "null",
+    "undefined",
+    "typeof",
+    "new",
+    "in",
+    "instanceof",
+    "async",
+    "await",
 ];
 
 /// Longest first: prefix order decides `>>>=` vs `>>>` vs `>>` vs `>`.
 const PUNCTS: &[&str] = &[
-    ">>>=",
-    "===", "!==", ">>>", "<<=", ">>=", "=>",
-    "==", "!=", "<=", ">=", "++", "--", "+=", "-=", "*=", "/=", "%=", "&&", "||", "<<", ">>", "&=",
-    "|=", "^=",
-    "=", "<", ">", "+", "-", "*", "/", "%", "!", "~", "&", "|", "^",
-    "(", ")", "[", "]", "{", "}", ",", ";", ".", "?", ":",
+    ">>>=", "===", "!==", ">>>", "<<=", ">>=", "=>", "==", "!=", "<=", ">=", "++", "--", "+=",
+    "-=", "*=", "/=", "%=", "&&", "||", "<<", ">>", "&=", "|=", "^=", "=", "<", ">", "+", "-", "*",
+    "/", "%", "!", "~", "&", "|", "^", "(", ")", "[", "]", "{", "}", ",", ";", ".", "?", ":",
 ];
 
 pub fn lex(src: &str) -> Result<Vec<Token>, JsError> {
@@ -101,7 +117,11 @@ pub fn lex(src: &str) -> Result<Vec<Token>, JsError> {
         out.push(Token { t, pos, nl });
         nl = false;
     }
-    out.push(Token { t: Tok::Eof, pos: i, nl });
+    out.push(Token {
+        t: Tok::Eof,
+        pos: i,
+        nl,
+    });
     Ok(out)
 }
 
@@ -194,7 +214,10 @@ fn string(b: &[u8], i: &mut usize) -> Result<Tok, JsError> {
                     std::str::from_utf8(&b[chunk..*i]).map_err(|_| err("bad utf-8 in string"))?,
                 );
                 *i += 1;
-                let e = b.get(*i).copied().ok_or_else(|| err("unterminated escape"))?;
+                let e = b
+                    .get(*i)
+                    .copied()
+                    .ok_or_else(|| err("unterminated escape"))?;
                 *i += 1;
                 match e {
                     b'n' => s.push('\n'),

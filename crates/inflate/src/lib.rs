@@ -49,7 +49,12 @@ struct Bits<'a> {
 
 impl<'a> Bits<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Bits { data, pos: 0, buf: 0, cnt: 0 }
+        Bits {
+            data,
+            pos: 0,
+            buf: 0,
+            cnt: 0,
+        }
     }
 
     fn need(&mut self, n: u32) -> Result<(), Error> {
@@ -160,7 +165,9 @@ const DIST_EXTRA: [u32; 30] = [
     0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13,
     13,
 ];
-const CLEN_ORDER: [usize; 19] = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+const CLEN_ORDER: [usize; 19] = [
+    16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+];
 
 /// Raw DEFLATE bitstream (no wrapper). `limit` caps output size.
 pub fn inflate(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
@@ -279,7 +286,11 @@ fn dynamic_tables(s: &mut Bits) -> Result<(Huffman, Huffman), Error> {
                 }
             }
             17 | 18 => {
-                let rep = if sym == 17 { 3 + s.take(3)? } else { 11 + s.take(7)? } as usize;
+                let rep = if sym == 17 {
+                    3 + s.take(3)?
+                } else {
+                    11 + s.take(7)?
+                } as usize;
                 if i + rep > nlen + ndist {
                     return Err(Error::Invalid("zero-run overrun"));
                 }
@@ -347,7 +358,7 @@ pub fn zlib_decode(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
     if data.len() >= 6 {
         let cmf = data[0];
         let flg = data[1];
-        let ok = (cmf & 0x0F) == 8 && ((cmf as usize) << 8 | flg as usize) % 31 == 0;
+        let ok = (cmf & 0x0F) == 8 && ((cmf as usize) << 8 | flg as usize).is_multiple_of(31);
         if ok {
             if flg & 0x20 != 0 {
                 return Err(Error::BadZlib); // preset dictionary unsupported
@@ -423,7 +434,11 @@ const fn build_crc_table() -> [u32; 256] {
         let mut c = n as u32;
         let mut k = 0;
         while k < 8 {
-            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+            c = if c & 1 != 0 {
+                0xEDB8_8320 ^ (c >> 1)
+            } else {
+                c >> 1
+            };
             k += 1;
         }
         table[n] = c;

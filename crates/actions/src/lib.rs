@@ -45,10 +45,7 @@ impl From<vigia_net::Error> for ActionError {
 }
 
 /// First <form>, or the element matching `selector` (must be a form).
-pub fn find_form(
-    dom: &Dom,
-    selector: Option<&str>,
-) -> Result<Option<NodeId>, ActionError> {
+pub fn find_form(dom: &Dom, selector: Option<&str>) -> Result<Option<NodeId>, ActionError> {
     match selector {
         Some(sel) => {
             let hits = vigia_css::query(dom, sel)?;
@@ -56,8 +53,7 @@ pub fn find_form(
                 .into_iter()
                 .find(|&id| dom.tag_name(id) == Some("form")))
         }
-        None => Ok((1..dom.nodes.len() as NodeId)
-            .find(|&id| dom.tag_name(id) == Some("form"))),
+        None => Ok((1..dom.nodes.len() as NodeId).find(|&id| dom.tag_name(id) == Some("form"))),
     }
 }
 
@@ -79,11 +75,15 @@ pub fn form_fields(dom: &Dom, form: NodeId) -> Vec<(String, String)> {
     let mut fields = Vec::new();
 
     for id in order {
-        let Some(tag) = dom.tag_name(id) else { continue };
+        let Some(tag) = dom.tag_name(id) else {
+            continue;
+        };
         if dom.attr(id, "disabled").is_some() {
             continue;
         }
-        let Some(name) = dom.attr(id, "name") else { continue };
+        let Some(name) = dom.attr(id, "name") else {
+            continue;
+        };
         if name.is_empty() {
             continue;
         }
@@ -218,8 +218,9 @@ pub fn submit_node(
     overrides: &[(String, String)],
     jar: &mut CookieJar,
 ) -> Result<vigia_net::Response, ActionError> {
-
-    let enctype = dom.attr(form, "enctype").unwrap_or("application/x-www-form-urlencoded");
+    let enctype = dom
+        .attr(form, "enctype")
+        .unwrap_or("application/x-www-form-urlencoded");
     if enctype.to_ascii_lowercase().contains("multipart") {
         return Err(ActionError::Unsupported("multipart/form-data"));
     }
@@ -267,7 +268,10 @@ pub fn fill(dom: &mut Dom, ref_n: usize, value: &str) -> Result<NodeId, ActionEr
 
     match dom.tag_name(node) {
         Some("input") => {
-            if matches!(dom.attr(node, "type").unwrap_or("text"), "checkbox" | "radio") {
+            if matches!(
+                dom.attr(node, "type").unwrap_or("text"),
+                "checkbox" | "radio"
+            ) {
                 // checkable inputs keep their markup `value`; fill only toggles
                 if matches!(value, "" | "off" | "false" | "0") {
                     dom.remove_attr(node, "checked");
@@ -315,11 +319,13 @@ pub fn click(
                 }
                 cur = dom.parent(p);
             }
-            Err(ActionError::NotFound("interactive element outside any form"))
+            Err(ActionError::NotFound(
+                "interactive element outside any form",
+            ))
         }
-        Some("select") | Some("textarea") => {
-            Err(ActionError::Unsupported("select/textarea need fill, not click"))
-        }
+        Some("select") | Some("textarea") => Err(ActionError::Unsupported(
+            "select/textarea need fill, not click",
+        )),
         _ => Err(ActionError::NotFound("not interactive")),
     }
 }

@@ -44,7 +44,9 @@ pub(crate) fn to_num(h: &Heap, v: Value) -> f64 {
                 return 0.0;
             }
             if let Some(x) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                return u64::from_str_radix(x, 16).map(|n| n as f64).unwrap_or(f64::NAN);
+                return u64::from_str_radix(x, 16)
+                    .map(|n| n as f64)
+                    .unwrap_or(f64::NAN);
             }
             s.parse().unwrap_or(f64::NAN)
         }
@@ -58,7 +60,11 @@ pub(crate) fn fmt_num(n: f64) -> String {
         return "NaN".into();
     }
     if n.is_infinite() {
-        return if n > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+        return if n > 0.0 {
+            "Infinity".into()
+        } else {
+            "-Infinity".into()
+        };
     }
     if n.fract() == 0.0 && n.abs() < 9e15 {
         (n as i64).to_string()
@@ -71,7 +77,13 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
     match v {
         Value::Undef => "undefined".into(),
         Value::Null => "null".into(),
-        Value::Bool(b) => if b { "true".into() } else { "false".into() },
+        Value::Bool(b) => {
+            if b {
+                "true".into()
+            } else {
+                "false".into()
+            }
+        }
         Value::Num(n) => fmt_num(n),
         Value::Str(id) => h.get_str(id).into(),
         Value::Obj(id) => match h.obj(id) {
@@ -85,7 +97,10 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
                 .join(","),
             Obj::Ordinary { .. } => "[object Object]".into(),
             Obj::Func { def, .. } => {
-                format!("function {}() {{ [code] }}", def.name.as_deref().unwrap_or(""))
+                format!(
+                    "function {}() {{ [code] }}",
+                    def.name.as_deref().unwrap_or("")
+                )
             }
             Obj::Native { name, .. } => format!("function {name}() {{ [native code] }}"),
             Obj::Dom(_) => "[object Node]".into(),
@@ -171,16 +186,17 @@ const MAX_PROTO_HOPS: u32 = 64;
 /// An object's own (non-inherited) prop. Arr owns "length" + indices.
 fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
     match h.obj(id) {
-        Obj::Ordinary { pairs, .. }
-        | Obj::Func { pairs, .. }
-        | Obj::Native { pairs, .. } => {
+        Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
             pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
         }
         Obj::Arr { items, .. } => {
             if key == "length" {
                 return Some(Value::Num(items.len() as f64));
             }
-            key.parse::<usize>().ok().and_then(|i| items.get(i)).copied()
+            key.parse::<usize>()
+                .ok()
+                .and_then(|i| items.get(i))
+                .copied()
         }
         Obj::Dom(_) | Obj::Promise(_) | Obj::Freed => None,
     }
@@ -190,9 +206,7 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
 /// Dom has none.
 fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
     match h.obj(id) {
-        Obj::Ordinary { proto, .. } | Obj::Arr { proto, .. } | Obj::Func { proto, .. } => {
-            *proto
-        }
+        Obj::Ordinary { proto, .. } | Obj::Arr { proto, .. } | Obj::Func { proto, .. } => *proto,
         Obj::Native { .. } => po(protos.function_),
         Obj::Promise(_) => po(protos.promise),
         Obj::Dom(_) | Obj::Freed => None,
@@ -203,7 +217,9 @@ fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
 fn walk_props(h: &Heap, protos: &Protos, start: Option<u32>, key: &str) -> Result<Value, JsError> {
     let mut cur = start;
     for _ in 0..MAX_PROTO_HOPS {
-        let Some(id) = cur else { return Ok(Value::Undef) };
+        let Some(id) = cur else {
+            return Ok(Value::Undef);
+        };
         if let Some(v) = own_prop(h, id, key) {
             return Ok(v);
         }
@@ -230,12 +246,7 @@ fn has_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> bool {
 
 /// `v[key]`: own props, then proto chain, then Undef. Primitives map to
 /// their protos (Str keeps `length` first).
-pub(crate) fn get_prop(
-    h: &Heap,
-    protos: &Protos,
-    v: Value,
-    key: &str,
-) -> Result<Value, JsError> {
+pub(crate) fn get_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> Result<Value, JsError> {
     match v {
         Value::Obj(id) => walk_props(h, protos, Some(id), key),
         Value::Str(id) => {
@@ -247,7 +258,11 @@ pub(crate) fn get_prop(
         Value::Num(_) => walk_props(h, protos, po(protos.number), key),
         Value::Undef | Value::Null => Err(err(format!(
             "cannot read '{key}' of {}",
-            if matches!(v, Value::Null) { "null" } else { "undefined" }
+            if matches!(v, Value::Null) {
+                "null"
+            } else {
+                "undefined"
+            }
         ))),
         _ => Ok(Value::Undef),
     }
@@ -257,9 +272,7 @@ pub(crate) fn get_prop(
 pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<(), JsError> {
     match v {
         Value::Obj(id) => match h.obj_mut(id) {
-            Obj::Ordinary { pairs, .. }
-            | Obj::Func { pairs, .. }
-            | Obj::Native { pairs, .. } => {
+            Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
                 match pairs.iter_mut().find(|(k, _)| k == key) {
                     Some(slot) => slot.1 = val,
                     None => pairs.push((key.to_string(), val)),
@@ -344,7 +357,10 @@ impl Interp {
     /// Fresh Ordinary under Object.prototype.
     pub(crate) fn obj_plain(&mut self) -> Result<u32, JsError> {
         let proto = po(self.protos.object);
-        self.heap.alloc_obj(Obj::Ordinary { pairs: Vec::new(), proto })
+        self.heap.alloc_obj(Obj::Ordinary {
+            pairs: Vec::new(),
+            proto,
+        })
     }
 
     /// Fresh Ordinary with props, under Object.prototype.
@@ -375,11 +391,13 @@ impl Interp {
     /// push a Native method onto a pairs-holding obj (proto bag or ctor).
     /// Heap-cap edge: skips silently when there's no room.
     fn put(&mut self, on: u32, name: &'static str, f: NativeFn) {
-        let Ok(n) = self.heap.alloc_obj(nat(name, f)) else { return };
+        let Ok(n) = self.heap.alloc_obj(nat(name, f)) else {
+            return;
+        };
         match self.heap.obj_mut(on) {
-            Obj::Ordinary { pairs, .. }
-            | Obj::Func { pairs, .. }
-            | Obj::Native { pairs, .. } => pairs.push((name.into(), Value::Obj(n))),
+            Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
+                pairs.push((name.into(), Value::Obj(n)))
+            }
             _ => {}
         }
     }
@@ -394,7 +412,9 @@ impl Interp {
     ) {
         let mut pairs = Vec::with_capacity(statics.len() + 1);
         for (n, m) in statics {
-            let Ok(id) = self.heap.alloc_obj(nat(n, *m)) else { return };
+            let Ok(id) = self.heap.alloc_obj(nat(n, *m)) else {
+                return;
+            };
             pairs.push((n.to_string(), Value::Obj(id)));
         }
         if let Some(pt) = po(proto) {
@@ -409,7 +429,10 @@ impl Interp {
     /// u32::MAX on heap-cap failure.
     fn proto_bag(&mut self, methods: &[(&'static str, NativeFn)]) -> u32 {
         let proto = po(self.protos.object);
-        let Ok(id) = self.heap.alloc_obj(Obj::Ordinary { pairs: vec![], proto }) else {
+        let Ok(id) = self.heap.alloc_obj(Obj::Ordinary {
+            pairs: vec![],
+            proto,
+        }) else {
             return u32::MAX;
         };
         for (n, f) in methods {
@@ -422,16 +445,17 @@ impl Interp {
     /// Cap edge: protos left as u32::MAX when there's no room - property
     /// lookup then degrades to own props only.
     pub(crate) fn install_protos(&mut self) {
-        let Ok(object) = self.heap.alloc_obj(Obj::Ordinary { pairs: vec![], proto: None })
-        else {
+        let Ok(object) = self.heap.alloc_obj(Obj::Ordinary {
+            pairs: vec![],
+            proto: None,
+        }) else {
             return;
         };
         self.protos.object = object;
         self.put(object, "hasOwnProperty", n_has_own);
         self.put(object, "toString", n_obj_to_string);
 
-        self.protos.function_ =
-            self.proto_bag(&[("call", n_fn_call), ("apply", n_fn_apply)]);
+        self.protos.function_ = self.proto_bag(&[("call", n_fn_call), ("apply", n_fn_apply)]);
         self.protos.array = self.proto_bag(&[
             ("push", n_arr_push),
             ("pop", n_arr_pop),
@@ -510,7 +534,12 @@ impl Interp {
                 ("create", n_obj_create),
             ],
         );
-        self.ctor("Array", n_array, pr.array, &[("isArray", n_is_array), ("of", n_array_of)]);
+        self.ctor(
+            "Array",
+            n_array,
+            pr.array,
+            &[("isArray", n_is_array), ("of", n_array_of)],
+        );
         self.ctor("String", n_string_cast, pr.string, &[]);
         self.ctor("Number", n_number_cast, pr.number, &[]);
         self.ctor("Boolean", n_boolean_cast, u32::MAX, &[]);
@@ -572,9 +601,10 @@ impl Interp {
         }
         if let Ok(p) = self.heap.alloc_obj(nat("parse", n_json_parse)) {
             if let Ok(s) = self.heap.alloc_obj(nat("stringify", n_json_stringify)) {
-                if let Ok(j) =
-                    self.obj_pairs(vec![("parse".into(), Value::Obj(p)), ("stringify".into(), Value::Obj(s))])
-                {
+                if let Ok(j) = self.obj_pairs(vec![
+                    ("parse".into(), Value::Obj(p)),
+                    ("stringify".into(), Value::Obj(s)),
+                ]) {
                     self.env_declare(0, "JSON", Value::Obj(j));
                 }
             }
@@ -604,7 +634,11 @@ impl Interp {
         if self.envs.len() >= self.max_envs {
             return Err(err("env cap"));
         }
-        self.envs.push(Env { vars: HashMap::new(), parent: Some(parent), free: false });
+        self.envs.push(Env {
+            vars: HashMap::new(),
+            parent: Some(parent),
+            free: false,
+        });
         Ok(self.envs.len() as u32 - 1)
     }
 
@@ -722,7 +756,10 @@ impl Interp {
             Stmt::For(init, test, upd, body) => self.stmt_for(env, init, test, upd, body),
             Stmt::Block(ss) => {
                 // new env only when the block declares something
-                if ss.iter().any(|s| matches!(s, Stmt::VarDecl(_) | Stmt::FnDecl(_))) {
+                if ss
+                    .iter()
+                    .any(|s| matches!(s, Stmt::VarDecl(_) | Stmt::FnDecl(_)))
+                {
                     let e2 = self.new_env(env)?;
                     self.exec_block(ss, e2)
                 } else {
@@ -855,7 +892,10 @@ impl Interp {
                     Value::Obj(p) => Some(p),
                     _ => po(self.protos.object),
                 };
-                let obj = self.heap.alloc_obj(Obj::Ordinary { pairs: vec![], proto })?;
+                let obj = self.heap.alloc_obj(Obj::Ordinary {
+                    pairs: vec![],
+                    proto,
+                })?;
                 let r = self.call_value(f, Value::Obj(obj), &args, None)?;
                 Ok(match r {
                     Value::Obj(_) => r,
@@ -891,10 +931,10 @@ impl Interp {
                             Obj::Promise(PromiseState::Rejected(r)) => {
                                 Err(err(format!("await: {}", to_str(&self.heap, *r))))
                             }
-                            Obj::Promise(PromiseState::Pending { .. }) => Err(err(
-                                "await on pending promise (vigia settles fetch/timer \
-                                 eagerly; pending awaits unsupported)",
-                            )),
+                            Obj::Promise(PromiseState::Pending { .. }) => {
+                                Err(err("await on pending promise (vigia settles fetch/timer \
+                                 eagerly; pending awaits unsupported)"))
+                            }
                             _ => Ok(v),
                         }
                     }
@@ -1108,7 +1148,11 @@ impl Interp {
                 }
                 // proto chains resolve string/array/etc methods to Natives;
                 // `this` = the receiver
-                (get_prop(&self.heap, &self.protos, recv, name)?, recv, Some(name.as_str()))
+                (
+                    get_prop(&self.heap, &self.protos, recv, name)?,
+                    recv,
+                    Some(name.as_str()),
+                )
             }
             Expr::Index(o, ix) => {
                 let recv = self.expr(env, o)?;
@@ -1119,7 +1163,11 @@ impl Interp {
                         return self.call_dom(n, &m, env, arg_es);
                     }
                 }
-                (get_index(&mut self.heap, &self.protos, recv, k)?, recv, None)
+                (
+                    get_index(&mut self.heap, &self.protos, recv, k)?,
+                    recv,
+                    None,
+                )
             }
             Expr::Ident(n) => (self.expr(env, callee)?, Value::Undef, Some(n.as_str())),
             _ => (self.expr(env, callee)?, Value::Undef, None),
@@ -1151,7 +1199,12 @@ impl Interp {
         let c = match self.heap.obj(id) {
             Obj::Func { def, env, .. } => C::Fn(def.clone(), *env),
             Obj::Native { f, .. } => C::Nat(*f),
-            _ => return Err(err(format!("{} is not a function", hint.unwrap_or("object")))),
+            _ => {
+                return Err(err(format!(
+                    "{} is not a function",
+                    hint.unwrap_or("object")
+                )))
+            }
         };
         self.tick()?;
         self.call_depth += 1;
@@ -1215,8 +1268,11 @@ impl Interp {
             match r {
                 Ok(v) => self.promise_resolve(p, v),
                 Err(e) => {
-                    let s =
-                        self.heap.alloc_str(e.0).map(Value::Str).unwrap_or(Value::Undef);
+                    let s = self
+                        .heap
+                        .alloc_str(e.0)
+                        .map(Value::Str)
+                        .unwrap_or(Value::Undef);
                     self.promise_settle(p, true, s);
                 }
             }
@@ -1225,7 +1281,6 @@ impl Interp {
             r
         }
     }
-
 
     /// REPL-style display: objects as JSON, scalars via ToString.
     pub fn inspect(&self, v: Value) -> String {
@@ -1278,9 +1333,11 @@ fn n_fetch(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsErr
     // ctx borrow ends before heap allocs below
     let res = {
         let ctx = it.net.as_mut().unwrap();
-        let url = ctx.base.join(&raw).map_err(|e| err(format!("fetch: {e}")))?;
-        vigia_net::fetch(&url.to_string(), &mut ctx.jar)
-            .map_err(|e| format!("fetch: {e}"))
+        let url = ctx
+            .base
+            .join(&raw)
+            .map_err(|e| err(format!("fetch: {e}")))?;
+        vigia_net::fetch(&url.to_string(), &mut ctx.jar).map_err(|e| format!("fetch: {e}"))
     };
     let p = promise_new(it)?;
     match res {
@@ -1289,16 +1346,29 @@ fn n_fetch(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsErr
                 ("status".into(), Value::Num(res.status as f64)),
                 ("ok".into(), Value::Bool((200..=299).contains(&res.status))),
                 ("redirected".into(), Value::Bool(res.redirects > 0)),
-                ("url".into(), Value::Str(it.heap.alloc_str(res.final_url.to_string())?)),
+                (
+                    "url".into(),
+                    Value::Str(it.heap.alloc_str(res.final_url.to_string())?),
+                ),
                 ("__body".into(), Value::Str(it.heap.alloc_str(res.text())?)),
-                ("text".into(), Value::Obj(it.heap.alloc_obj(nat("text", n_res_text))?)),
-                ("json".into(), Value::Obj(it.heap.alloc_obj(nat("json", n_res_json))?)),
+                (
+                    "text".into(),
+                    Value::Obj(it.heap.alloc_obj(nat("text", n_res_text))?),
+                ),
+                (
+                    "json".into(),
+                    Value::Obj(it.heap.alloc_obj(nat("json", n_res_json))?),
+                ),
             ];
             let resp = Value::Obj(it.obj_pairs(pairs)?);
             it.promise_settle(p, false, resp);
         }
         Err(msg) => {
-            let s = it.heap.alloc_str(msg).map(Value::Str).unwrap_or(Value::Undef);
+            let s = it
+                .heap
+                .alloc_str(msg)
+                .map(Value::Str)
+                .unwrap_or(Value::Undef);
             it.promise_settle(p, true, s);
         }
     }
@@ -1328,11 +1398,18 @@ fn n_res_text(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Js
 fn n_res_json(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
     let b = res_body(it, this)?;
     let p = promise_new(it)?;
-    match Json::parse(&b).map_err(|e| err(e.to_string())).and_then(|j| json_to_val(it, &j)) {
+    match Json::parse(&b)
+        .map_err(|e| err(e.to_string()))
+        .and_then(|j| json_to_val(it, &j))
+    {
         Ok(v) => it.promise_settle(p, false, v),
         // real .json() rejects on a parse error, it doesn't throw
         Err(e) => {
-            let s = it.heap.alloc_str(e.0).map(Value::Str).unwrap_or(Value::Undef);
+            let s = it
+                .heap
+                .alloc_str(e.0)
+                .map(Value::Str)
+                .unwrap_or(Value::Undef);
             it.promise_settle(p, true, s);
         }
     }
@@ -1392,11 +1469,9 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
                     .map(|v| val_to_json(h, *v, depth + 1))
                     .collect::<Result<_, JsError>>()?,
             ),
-            Obj::Func { .. }
-            | Obj::Native { .. }
-            | Obj::Dom(_)
-            | Obj::Promise(_)
-            | Obj::Freed => Json::Null,
+            Obj::Func { .. } | Obj::Native { .. } | Obj::Dom(_) | Obj::Promise(_) | Obj::Freed => {
+                Json::Null
+            }
         },
     })
 }
@@ -1405,7 +1480,11 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
 
 /// Native fn object with an empty own-props bag.
 pub(crate) fn nat(name: &'static str, f: NativeFn) -> Obj {
-    Obj::Native { name, f, pairs: Vec::new() }
+    Obj::Native {
+        name,
+        f,
+        pairs: Vec::new(),
+    }
 }
 
 fn arg(args: &[Value], i: usize) -> Value {
@@ -1476,12 +1555,14 @@ fn n_object(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsErr
 fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
     match v {
         Value::Obj(id) => match h.obj(id) {
-            Obj::Ordinary { pairs, .. }
-            | Obj::Func { pairs, .. }
-            | Obj::Native { pairs, .. } => pairs.clone(),
-            Obj::Arr { items, .. } => {
-                items.iter().enumerate().map(|(i, x)| (i.to_string(), *x)).collect()
+            Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
+                pairs.clone()
             }
+            Obj::Arr { items, .. } => items
+                .iter()
+                .enumerate()
+                .map(|(i, x)| (i.to_string(), *x))
+                .collect(),
             Obj::Dom(_) | Obj::Promise(_) | Obj::Freed => Vec::new(),
         },
         _ => Vec::new(),
@@ -1532,7 +1613,10 @@ fn n_obj_create(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, 
         Value::Null => None,
         _ => return Err(err("create: proto must be an object or null")),
     };
-    Ok(Value::Obj(it.heap.alloc_obj(Obj::Ordinary { pairs: vec![], proto })?))
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Ordinary {
+        pairs: vec![],
+        proto,
+    })?))
 }
 
 // -- Array ctor + statics --------------------------------------------------------
@@ -1603,7 +1687,10 @@ fn n_parse_int(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, J
             radix = 10;
         }
     } else if radix == 16 {
-        t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+        t = t
+            .strip_prefix("0x")
+            .or_else(|| t.strip_prefix("0X"))
+            .unwrap_or(t);
     }
     let mut n: f64 = 0.0;
     let mut any = false;
@@ -1715,7 +1802,11 @@ fn n_arr_pop(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsE
 fn n_arr_shift(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
     let id = this_arr(it, this)?;
     if let Obj::Arr { items, .. } = it.heap.obj_mut(id) {
-        return Ok(if items.is_empty() { Value::Undef } else { items.remove(0) });
+        return Ok(if items.is_empty() {
+            Value::Undef
+        } else {
+            items.remove(0)
+        });
     }
     Err(err("internal: not an array"))
 }
@@ -1780,7 +1871,12 @@ fn n_arr_reduce(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, J
         (items[0], 1)
     };
     for (i, x) in items.iter().enumerate().skip(start) {
-        acc = it.call_value(f, Value::Undef, &[acc, *x, Value::Num(i as f64), this], None)?;
+        acc = it.call_value(
+            f,
+            Value::Undef,
+            &[acc, *x, Value::Num(i as f64), this],
+            None,
+        )?;
     }
     Ok(acc)
 }
@@ -1844,7 +1940,11 @@ fn n_arr_includes(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value,
     let needle = arg(args, 0);
     let items = arr_items(it, id);
     let from = from_idx(to_num(&it.heap, arg(args, 1)), items.len());
-    Ok(Value::Bool(items[from..].iter().any(|x| strict_eq(&it.heap, *x, needle))))
+    Ok(Value::Bool(
+        items[from..]
+            .iter()
+            .any(|x| strict_eq(&it.heap, *x, needle)),
+    ))
 }
 
 fn n_arr_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
@@ -1858,7 +1958,11 @@ fn n_arr_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Js
     };
     let lo = (if a < 0 { len + a } else { a }).clamp(0, len) as usize;
     let hi = (if b < 0 { len + b } else { b }).clamp(0, len) as usize;
-    let sub = if hi > lo { items[lo..hi].to_vec() } else { Vec::new() };
+    let sub = if hi > lo {
+        items[lo..hi].to_vec()
+    } else {
+        Vec::new()
+    };
     Ok(Value::Obj(it.arr_obj(sub)?))
 }
 
@@ -2078,14 +2182,20 @@ fn n_str_index_of(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value,
     let from = from_idx(to_num(&it.heap, arg(args, 1)), chars.len());
     let hay: String = chars[from..].iter().collect();
     Ok(Value::Num(
-        hay.find(&needle).map(|p| (hay[..p].chars().count() + from) as f64).unwrap_or(-1.0),
+        hay.find(&needle)
+            .map(|p| (hay[..p].chars().count() + from) as f64)
+            .unwrap_or(-1.0),
     ))
 }
 
 fn n_str_last_index_of(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
     let s = this_str(it, this);
     let needle = to_str(&it.heap, arg(args, 0));
-    Ok(Value::Num(s.rfind(&needle).map(|p| s[..p].chars().count() as f64).unwrap_or(-1.0)))
+    Ok(Value::Num(
+        s.rfind(&needle)
+            .map(|p| s[..p].chars().count() as f64)
+            .unwrap_or(-1.0),
+    ))
 }
 
 fn n_str_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
@@ -2111,7 +2221,9 @@ fn n_str_substring(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value
     if a > b {
         std::mem::swap(&mut a, &mut b);
     }
-    Ok(Value::Str(it.heap.alloc_str(chars[a as usize..b as usize].iter().collect())?))
+    Ok(Value::Str(it.heap.alloc_str(
+        chars[a as usize..b as usize].iter().collect(),
+    )?))
 }
 
 fn n_str_trim(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
@@ -2164,7 +2276,10 @@ fn n_str_char_at(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, 
     let s = this_str(it, this);
     let i = to_num(&it.heap, arg(args, 0));
     let t = if i >= 0.0 {
-        s.chars().nth(i as usize).map(|c| c.to_string()).unwrap_or_default()
+        s.chars()
+            .nth(i as usize)
+            .map(|c| c.to_string())
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -2175,7 +2290,10 @@ fn n_str_char_code_at(it: &mut Interp, this: Value, args: &[Value]) -> Result<Va
     let s = this_str(it, this);
     let i = to_num(&it.heap, arg(args, 0));
     Ok(Value::Num(if i >= 0.0 {
-        s.chars().nth(i as usize).map(|c| c as u32 as f64).unwrap_or(f64::NAN)
+        s.chars()
+            .nth(i as usize)
+            .map(|c| c as u32 as f64)
+            .unwrap_or(f64::NAN)
     } else {
         f64::NAN
     }))
@@ -2187,7 +2305,9 @@ fn n_str_replace(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, 
     let s = this_str(it, this);
     let needle = to_str(&it.heap, arg(args, 0));
     let repl = to_str(&it.heap, arg(args, 1));
-    Ok(Value::Str(it.heap.alloc_str(s.replacen(&needle, &repl, 1))?))
+    Ok(Value::Str(
+        it.heap.alloc_str(s.replacen(&needle, &repl, 1))?,
+    ))
 }
 
 fn n_str_concat(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
@@ -2201,7 +2321,7 @@ fn n_str_concat(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, J
 fn n_str_repeat(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
     let s = this_str(it, this);
     let n = to_num(&it.heap, arg(args, 0));
-    if !(n >= 0.0) || s.len().saturating_mul(n as usize) > 16_000_000 {
+    if n < 0.0 || n.is_nan() || s.len().saturating_mul(n as usize) > 16_000_000 {
         return Err(err("repeat: bad count"));
     }
     Ok(Value::Str(it.heap.alloc_str(s.repeat(n as usize))?))
@@ -2319,8 +2439,12 @@ fn n_date_iso(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Js
     let days = ms.div_euclid(86_400_000);
     let rem = ms.rem_euclid(86_400_000);
     let (y, mo, d) = civil(days);
-    let (h, mi, s, ms3) =
-        (rem / 3_600_000, rem % 3_600_000 / 60_000, rem % 60_000 / 1000, rem % 1000);
+    let (h, mi, s, ms3) = (
+        rem / 3_600_000,
+        rem % 3_600_000 / 60_000,
+        rem % 60_000 / 1000,
+        rem % 1000,
+    );
     let t = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms3:03}Z");
     Ok(Value::Str(it.heap.alloc_str(t)?))
 }
@@ -2346,18 +2470,23 @@ fn n_math_random(it: &mut Interp, _t: Value, _a: &[Value]) -> Result<Value, JsEr
     Ok(Value::Num((x >> 11) as f64 / 9007199254740992.0))
 }
 fn n_math_max(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
-    Ok(Value::Num(
-        args.iter().fold(f64::NEG_INFINITY, |m, v| m.max(to_num(&it.heap, *v))),
-    ))
+    Ok(Value::Num(args.iter().fold(f64::NEG_INFINITY, |m, v| {
+        m.max(to_num(&it.heap, *v))
+    })))
 }
 fn n_math_min(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
-    Ok(Value::Num(args.iter().fold(f64::INFINITY, |m, v| m.min(to_num(&it.heap, *v)))))
+    Ok(Value::Num(
+        args.iter()
+            .fold(f64::INFINITY, |m, v| m.min(to_num(&it.heap, *v))),
+    ))
 }
 fn n_math_abs(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Num(to_num(&it.heap, arg(args, 0)).abs()))
 }
 fn n_math_pow(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
-    Ok(Value::Num(to_num(&it.heap, arg(args, 0)).powf(to_num(&it.heap, arg(args, 1)))))
+    Ok(Value::Num(
+        to_num(&it.heap, arg(args, 0)).powf(to_num(&it.heap, arg(args, 1))),
+    ))
 }
 fn n_math_sqrt(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Num(to_num(&it.heap, arg(args, 0)).sqrt()))
@@ -2372,7 +2501,9 @@ fn n_math_sqrt(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsEr
 
 /// Fresh pending promise.
 fn promise_new(it: &mut Interp) -> Result<u32, JsError> {
-    it.heap.alloc_obj(Obj::Promise(PromiseState::Pending { handlers: Vec::new() }))
+    it.heap.alloc_obj(Obj::Promise(PromiseState::Pending {
+        handlers: Vec::new(),
+    }))
 }
 
 /// Heap id if `v` is a Promise.
@@ -2412,8 +2543,11 @@ impl Interp {
         if !matches!(st, PromiseState::Pending { .. }) {
             return;
         }
-        let next_state =
-            if rejecting { PromiseState::Rejected(v) } else { PromiseState::Fulfilled(v) };
+        let next_state = if rejecting {
+            PromiseState::Rejected(v)
+        } else {
+            PromiseState::Fulfilled(v)
+        };
         let PromiseState::Pending { handlers } = std::mem::replace(st, next_state) else {
             return;
         };
@@ -2461,8 +2595,7 @@ impl Interp {
             Adopt::Fulfill(u) => self.promise_settle(id, false, u),
             Adopt::Reject(r) => self.promise_settle(id, true, r),
             Adopt::Subscribe => {
-                if let Obj::Promise(PromiseState::Pending { handlers }) = self.heap.obj_mut(pid)
-                {
+                if let Obj::Promise(PromiseState::Pending { handlers }) = self.heap.obj_mut(pid) {
                     handlers.push(ThenHandler {
                         on_fulfill: None,
                         on_reject: None,
@@ -2496,9 +2629,12 @@ impl Interp {
         };
         match s {
             S::Pend => {
-                if let Obj::Promise(PromiseState::Pending { handlers }) = self.heap.obj_mut(id)
-                {
-                    handlers.push(ThenHandler { on_fulfill, on_reject, next });
+                if let Obj::Promise(PromiseState::Pending { handlers }) = self.heap.obj_mut(id) {
+                    handlers.push(ThenHandler {
+                        on_fulfill,
+                        on_reject,
+                        next,
+                    });
                 }
             }
             S::Ful(v) => self.microtasks.push_back(Microtask {
@@ -2621,7 +2757,10 @@ impl Interp {
         }
         for (id, r) in unhandled {
             self.handled_promises.insert(id);
-            errs.push(err(format!("unhandled rejection: {}", to_str(&self.heap, r))));
+            errs.push(err(format!(
+                "unhandled rejection: {}",
+                to_str(&self.heap, r)
+            )));
         }
     }
 }
@@ -2647,7 +2786,11 @@ fn resolver_fn(it: &mut Interp, pid: u32, reject: bool) -> Result<Value, JsError
     // its promise alive through GC (and the marker can follow it).
     Ok(Value::Obj(it.heap.alloc_obj(Obj::Native {
         name: if reject { "reject" } else { "resolve" },
-        f: if reject { n_promise_reject } else { n_promise_resolve },
+        f: if reject {
+            n_promise_reject
+        } else {
+            n_promise_resolve
+        },
         pairs: vec![("__p".into(), Value::Obj(pid))],
     })?))
 }
@@ -2663,7 +2806,11 @@ fn n_promise_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value
     let res = resolver_fn(it, pid, false)?;
     let rej = resolver_fn(it, pid, true)?;
     if let Err(e) = it.call_value(exec, Value::Undef, &[res, rej], None) {
-        let s = it.heap.alloc_str(e.0).map(Value::Str).unwrap_or(Value::Undef);
+        let s = it
+            .heap
+            .alloc_str(e.0)
+            .map(Value::Str)
+            .unwrap_or(Value::Undef);
         it.promise_settle(pid, true, s);
     }
     Ok(Value::Obj(pid))
@@ -2758,7 +2905,11 @@ fn n_finally_throw(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Valu
 
 // -- Promise statics ------------------------------------------------------------
 
-fn n_promise_static_resolve(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+fn n_promise_static_resolve(
+    it: &mut Interp,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
     let v = arg(args, 0);
     if as_promise(it, v).is_some() {
         return Ok(v); // Promise.resolve(promise) IS the promise
@@ -2766,7 +2917,11 @@ fn n_promise_static_resolve(it: &mut Interp, _this: Value, args: &[Value]) -> Re
     resolved(it, v)
 }
 
-fn n_promise_static_reject(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+fn n_promise_static_reject(
+    it: &mut Interp,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
     let p = promise_new(it)?;
     it.promise_settle(p, true, arg(args, 0));
     Ok(Value::Obj(p))
@@ -2775,9 +2930,7 @@ fn n_promise_static_reject(it: &mut Interp, _this: Value, args: &[Value]) -> Res
 /// Arg as an Arr's items (no iterable protocol - arrays only).
 fn array_items(it: &Interp, v: Value, who: &str) -> Result<Vec<Value>, JsError> {
     match v {
-        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Arr { .. }) => {
-            Ok(arr_items(it, id))
-        }
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Arr { .. }) => Ok(arr_items(it, id)),
         _ => Err(err(format!("{who} needs an array"))),
     }
 }
@@ -2802,18 +2955,32 @@ fn subscribe_pending(
 ) {
     it.handled_promises.insert(pid);
     if let Obj::Promise(PromiseState::Pending { handlers }) = it.heap.obj_mut(pid) {
-        handlers.push(ThenHandler { on_fulfill, on_reject, next });
+        handlers.push(ThenHandler {
+            on_fulfill,
+            on_reject,
+            next,
+        });
     }
 }
 
 /// Native with __st (the all() state object) + optional __i (member index)
 /// bound in its own props.
-fn member_fn(it: &mut Interp, name: &'static str, f: NativeFn, st: u32, i: Option<usize>) -> Result<Value, JsError> {
+fn member_fn(
+    it: &mut Interp,
+    name: &'static str,
+    f: NativeFn,
+    st: u32,
+    i: Option<usize>,
+) -> Result<Value, JsError> {
     let mut pairs = vec![("__st".into(), Value::Obj(st))];
     if let Some(i) = i {
         pairs.push(("__i".into(), Value::Num(i as f64)));
     }
-    Ok(Value::Obj(it.heap.alloc_obj(Obj::Native { name, f, pairs })?))
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Native {
+        name,
+        f,
+        pairs,
+    })?))
 }
 
 fn bound_state(it: &Interp) -> Result<(u32, usize), JsError> {
@@ -2933,7 +3100,11 @@ fn settled_record(
     rejected: bool,
     v: Value,
 ) -> Result<(), JsError> {
-    let (status, key) = if rejected { ("rejected", "reason") } else { ("fulfilled", "value") };
+    let (status, key) = if rejected {
+        ("rejected", "reason")
+    } else {
+        ("fulfilled", "value")
+    };
     let s = it.heap.alloc_str(status.into())?;
     let o = it.obj_pairs(vec![("status".into(), Value::Str(s)), (key.into(), v)])?;
     all_record(it, st, i, Value::Obj(o))
@@ -2983,7 +3154,11 @@ fn timer_add(it: &mut Interp, args: &[Value], interval: bool) -> Result<Value, J
         }));
     }
     let ms = to_num(&it.heap, arg(args, 1));
-    let ms = if ms.is_finite() && ms > 0.0 { ms as u64 } else { 0 };
+    let ms = if ms.is_finite() && ms > 0.0 {
+        ms as u64
+    } else {
+        0
+    };
     let id = it.next_timer_id;
     it.next_timer_id = it.next_timer_id.wrapping_add(1).max(1);
     it.timers.push(Timer {
@@ -3153,7 +3328,10 @@ mod tests {
         assert_eq!(num("var s=0;var i=0;while(i<10){s+=i;i++}s"), 45.0);
         assert_eq!(num("var s=0;for(var i=0;i<4;i++){s+=i}s"), 6.0);
         assert_eq!(num("var i=0;while(1){i++;if(i>3){break}}i"), 4.0);
-        assert_eq!(num("var s=0;for(var i=0;i<6;i++){if(i%2==0){continue}s+=i}s"), 9.0);
+        assert_eq!(
+            num("var s=0;for(var i=0;i<6;i++){if(i%2==0){continue}s+=i}s"),
+            9.0
+        );
         assert_eq!(num("var x=1;if(x){2}else{3}"), 2.0);
         assert_eq!(num("var x=0;if(x){2}else{3}"), 3.0);
     }
@@ -3172,16 +3350,23 @@ mod tests {
         );
         // fn decl hoists within its block
         assert_eq!(num("f();function f(){return 7}"), 7.0);
-        assert_eq!(num("function o(){return i();function i(){return 9}}o()"), 9.0);
+        assert_eq!(
+            num("function o(){return i();function i(){return 9}}o()"),
+            9.0
+        );
         // missing arg -> undefined
         assert_eq!(disp("function f(a,b){return b}f(1)"), "undefined");
         // named fn expr can self-recurse
-        assert_eq!(num("var f=function g(n){return n<2?1:n*g(n-1)};f(5)"), 120.0);
+        assert_eq!(
+            num("var f=function g(n){return n<2?1:n*g(n-1)};f(5)"),
+            120.0
+        );
         // this binding on member call
         assert_eq!(num("var o={n:7,f:function(){return this.n}};o.f()"), 7.0);
         // unbound call -> this is undefined
-        assert!(errmsg("var o={n:1,g:function(){return this.n}};var h=o.g;h()")
-            .contains("cannot read"));
+        assert!(
+            errmsg("var o={n:1,g:function(){return this.n}};var h=o.g;h()").contains("cannot read")
+        );
     }
 
     #[test]
@@ -3225,7 +3410,10 @@ mod tests {
 
     #[test]
     fn json() {
-        assert_eq!(disp("JSON.stringify({a:1,b:[2,'x']})"), "{\"a\":1,\"b\":[2,\"x\"]}");
+        assert_eq!(
+            disp("JSON.stringify({a:1,b:[2,'x']})"),
+            "{\"a\":1,\"b\":[2,\"x\"]}"
+        );
         assert_eq!(num("JSON.parse('{\"a\":[10,20]}').a[1]"), 20.0);
         let src = "var x='{\"k\":[1,2,{\"z\":null}]}';JSON.stringify(JSON.parse(x))";
         assert_eq!(disp(src), "{\"k\":[1,2,{\"z\":null}]}");
@@ -3267,7 +3455,11 @@ mod tests {
         // test threads have ~2MB stacks: cap depth low, check the guard
         let mut it = Interp::new();
         it.max_call_depth = 200;
-        assert!(it.run("function f(){f()}f()").unwrap_err().0.contains("call depth"));
+        assert!(it
+            .run("function f(){f()}f()")
+            .unwrap_err()
+            .0
+            .contains("call depth"));
     }
 
     #[test]
@@ -3294,7 +3486,9 @@ mod tests {
         // own prop shadows proto prop
         assert_eq!(num("var b=Object.create({x:1});b.x=2;b.x"), 2.0);
         // hasOwnProperty is own-only; the method itself comes via the chain
-        assert!(boolean("var b=Object.create({x:1});b.hasOwnProperty('x') === false"));
+        assert!(boolean(
+            "var b=Object.create({x:1});b.hasOwnProperty('x') === false"
+        ));
         assert!(boolean("({a:1}).hasOwnProperty('a')"));
         assert!(!boolean("({a:1}).hasOwnProperty('toString')"));
         // 'in' walks the chain
@@ -3305,7 +3499,10 @@ mod tests {
         assert_eq!(disp("var o={a:1};o.toString()"), "[object Object]");
         assert_eq!(disp("[1].toString()"), "[object Array]");
         // null-proto object has nothing
-        assert_eq!(disp("typeof Object.create(null).hasOwnProperty"), "undefined");
+        assert_eq!(
+            disp("typeof Object.create(null).hasOwnProperty"),
+            "undefined"
+        );
     }
 
     #[test]
@@ -3316,7 +3513,10 @@ mod tests {
             disp("[7,8].map(function(x,i,a){return i+':'+a.length}).join(',')"),
             "0:2,1:2"
         );
-        assert_eq!(disp("[1,2,3,4].filter(function(x){return x%2==0})"), "[2,4]");
+        assert_eq!(
+            disp("[1,2,3,4].filter(function(x){return x%2==0})"),
+            "[2,4]"
+        );
         assert_eq!(num("[1,2,3,4].reduce(function(a,b){return a+b})"), 10.0);
         assert_eq!(num("[1,2,3,4].reduce(function(a,b){return a+b},10)"), 20.0);
         assert!(errmsg("[].reduce(function(a,b){return a+b})").contains("empty"));
@@ -3338,14 +3538,14 @@ mod tests {
         // sort: default string order, or a comparator
         assert_eq!(disp("[3,1,2].sort()"), "[1,2,3]");
         assert_eq!(disp("[10,9,1].sort()"), "[1,10,9]");
-        assert_eq!(
-            disp("[10,9,1].sort(function(a,b){return a-b})"),
-            "[1,9,10]"
-        );
+        assert_eq!(disp("[10,9,1].sort(function(a,b){return a-b})"), "[1,9,10]");
         // splice: remove + insert, returns removed
         assert_eq!(disp("var a=[1,2,3,4];var r=a.splice(1,2);r"), "[2,3]");
         assert_eq!(disp("var a=[1,2,3,4];a.splice(1,2,'x');a"), "[1,\"x\",4]");
-        assert_eq!(disp("var a=[1,2];a.splice(1,0,'x','y');a"), "[1,\"x\",\"y\",2]");
+        assert_eq!(
+            disp("var a=[1,2];a.splice(1,0,'x','y');a"),
+            "[1,\"x\",\"y\",2]"
+        );
         assert_eq!(disp("[[1,2],[3]].flat()"), "[1,2,3]");
         assert_eq!(disp("[[1,[2]]].flat()"), "[1,[2]]");
         assert_eq!(disp("[[1,[2]]].flat(2)"), "[1,2]");
@@ -3392,7 +3592,10 @@ mod tests {
         assert_eq!(disp("Object.entries({a:1})[0].join('=')"), "a=1");
         assert_eq!(disp("Object.keys([7,8])"), "[\"0\",\"1\"]");
         // assign merges left to right
-        assert_eq!(disp("Object.assign({a:1},{b:2},{a:3})"), "{\"a\":3,\"b\":2}");
+        assert_eq!(
+            disp("Object.assign({a:1},{b:2},{a:3})"),
+            "{\"a\":3,\"b\":2}"
+        );
         // create sets proto
         assert_eq!(num("var o=Object.create({m:5});o.m"), 5.0);
         // Number.prototype + globals
@@ -3445,9 +3648,18 @@ mod tests {
 
     #[test]
     fn fn_call_apply() {
-        assert_eq!(num("function f(a,b){return this.k+a+b}f.call({k:1},2,3)"), 6.0);
-        assert_eq!(num("function f(a,b){return this.k+a+b}f.apply({k:1},[2,3])"), 6.0);
-        assert_eq!(num("var o={k:10};function g(){return this.k}g.call(o)"), 10.0);
+        assert_eq!(
+            num("function f(a,b){return this.k+a+b}f.call({k:1},2,3)"),
+            6.0
+        );
+        assert_eq!(
+            num("function f(a,b){return this.k+a+b}f.apply({k:1},[2,3])"),
+            6.0
+        );
+        assert_eq!(
+            num("var o={k:10};function g(){return this.k}g.call(o)"),
+            10.0
+        );
         // call/apply reach Native fns too (String cast via call)
         assert_eq!(disp("String.call(null,5)"), "5");
     }
@@ -3461,12 +3673,18 @@ mod tests {
         assert!(boolean("Math.random()>=0 && Math.random()<1"));
         assert!(boolean("Math.PI>3.14 && Math.E>2.7"));
         assert_eq!(disp("typeof Date.now()"), "number");
-        assert_eq!(disp("new Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            disp("new Date(0).toISOString()"),
+            "1970-01-01T00:00:00.000Z"
+        );
         assert_eq!(num("new Date(0).getTime()"), 0.0);
         assert_eq!(num("new Date(1234).valueOf()"), 1234.0);
         assert_eq!(disp("Date(0).toISOString()"), "1970-01-01T00:00:00.000Z");
         // day math sanity: 86400000ms = next day
-        assert_eq!(disp("new Date(86400000).toISOString()"), "1970-01-02T00:00:00.000Z");
+        assert_eq!(
+            disp("new Date(86400000).toISOString()"),
+            "1970-01-02T00:00:00.000Z"
+        );
     }
 
     #[test]
@@ -3477,10 +3695,15 @@ mod tests {
             "undefined"
         );
         assert_eq!(
-            num("var p={x:1};for(var i=0;i<200;i++){p=Object.create(p)}p.x === undefined ? 7 : p.x"),
+            num(
+                "var p={x:1};for(var i=0;i<200;i++){p=Object.create(p)}p.x === undefined ? 7 : p.x"
+            ),
             7.0 // x sits deeper than the 64-hop cap
         );
-        assert_eq!(num("var p={x:1};for(var i=0;i<10;i++){p=Object.create(p)}p.x"), 1.0);
+        assert_eq!(
+            num("var p={x:1};for(var i=0;i<10;i++){p=Object.create(p)}p.x"),
+            1.0
+        );
         // tight heap: proto/builtin installs hit the cap and skip; plain
         // own-prop objects still work
         let mut it = Interp::with_cap(128);
@@ -3526,8 +3749,10 @@ mod tests {
         );
         // a second then on the same settled promise queues independently
         assert_eq!(
-            out("var p=Promise.resolve(1);p.then(function(){console.log('a')});\
-                p.then(function(){console.log('b')})"),
+            out(
+                "var p=Promise.resolve(1);p.then(function(){console.log('a')});\
+                p.then(function(){console.log('b')})"
+            ),
             "a\nb\n"
         );
         // instanceof + tag
@@ -3575,9 +3800,7 @@ mod tests {
         assert!(errmsg("Promise.reject('boom')").contains("boom"));
         // a .then without onR forwards the rejection to the next promise,
         // which itself is the unhandled one
-        assert!(
-            errmsg("Promise.reject('x').then(function(){})").contains("unhandled rejection")
-        );
+        assert!(errmsg("Promise.reject('x').then(function(){})").contains("unhandled rejection"));
         // handled in the same script: no error
         assert_eq!(
             out("var p=Promise.reject('x');p.catch(function(r){console.log('ok:'+r)})"),
@@ -3585,14 +3808,18 @@ mod tests {
         );
         // handler returning a settled promise adopts: fulfilled propagates
         assert_eq!(
-            out("Promise.resolve(1).then(function(){return Promise.resolve(9)})\
-                .then(function(v){console.log('rv'+v)})"),
+            out(
+                "Promise.resolve(1).then(function(){return Promise.resolve(9)})\
+                .then(function(v){console.log('rv'+v)})"
+            ),
             "rv9\n"
         );
         // ...and a returned rejected promise rejects the chain
         assert_eq!(
-            out("Promise.resolve(1).then(function(){return Promise.reject('z')})\
-                .catch(function(e){console.log('rz'+e)})"),
+            out(
+                "Promise.resolve(1).then(function(){return Promise.reject('z')})\
+                .catch(function(e){console.log('rz'+e)})"
+            ),
             "rzz\n"
         );
         // handler returning a PENDING promise: the chain follows it; the
@@ -3616,8 +3843,10 @@ mod tests {
         );
         // reject path: f runs, original reason preserved
         assert_eq!(
-            out("Promise.reject('r').finally(function(){console.log('fin')})\
-                .catch(function(e){console.log('c'+e)})"),
+            out(
+                "Promise.reject('r').finally(function(){console.log('fin')})\
+                .catch(function(e){console.log('c'+e)})"
+            ),
             "fin\ncr\n"
         );
         // throwing f overrides the outcome
@@ -3629,8 +3858,10 @@ mod tests {
         );
         // f returning a rejected promise overrides too
         assert_eq!(
-            out("Promise.resolve(9).finally(function(){return Promise.reject('fx')})\
-                .catch(function(e){console.log('rf'+e)})"),
+            out(
+                "Promise.resolve(9).finally(function(){return Promise.reject('fx')})\
+                .catch(function(e){console.log('rf'+e)})"
+            ),
             "rffx\n"
         );
         // non-callable f is a pass-through
@@ -3680,8 +3911,10 @@ mod tests {
     fn promise_race_and_allsettled() {
         // race: first settle wins (here the already-resolved member)
         assert_eq!(
-            out("var r1;Promise.race([new Promise(function(a){r1=a}),Promise.resolve('fast')])\
-                .then(function(v){console.log('w'+v)});r1('slow')"),
+            out(
+                "var r1;Promise.race([new Promise(function(a){r1=a}),Promise.resolve('fast')])\
+                .then(function(v){console.log('w'+v)});r1('slow')"
+            ),
             "wfast\n"
         );
         assert_eq!(
@@ -3708,7 +3941,12 @@ mod tests {
         // Promise.resolve on a promise is identity
         assert!(boolean("var p=Promise.resolve(1);Promise.resolve(p)===p"));
         // unhandled rejection inside all() doesn't double-report members
-        assert_eq!(errmsg("Promise.all([Promise.reject('m')])").split('\n').count(), 1);
+        assert_eq!(
+            errmsg("Promise.all([Promise.reject('m')])")
+                .split('\n')
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -3737,14 +3975,18 @@ mod tests {
         );
         // setInterval repeats until cleared (fires at 5,10,15; reader at 20)
         assert_eq!(
-            out("var n=0;var i=setInterval(function(){n++;if(n==3){clearInterval(i)}},5);\
-                setTimeout(function(){console.log('n='+n)},20)"),
+            out(
+                "var n=0;var i=setInterval(function(){n++;if(n==3){clearInterval(i)}},5);\
+                setTimeout(function(){console.log('n='+n)},20)"
+            ),
             "n=3\n"
         );
         // clearInterval inside the cb stops it after one fire
         assert_eq!(
-            out("var n=0;var i=setInterval(function(){n++;clearInterval(i)},1);\
-                setTimeout(function(){console.log('once:'+n)},10)"),
+            out(
+                "var n=0;var i=setInterval(function(){n++;clearInterval(i)},1);\
+                setTimeout(function(){console.log('once:'+n)},10)"
+            ),
             "once:1\n"
         );
         // clearTimeout with a bogus id is a no-op
@@ -3788,8 +4030,10 @@ mod tests {
         );
         // await unwraps fulfilled promises; non-promises pass through
         assert_eq!(
-            out("async function f(){var a=await Promise.resolve(2);var b=await 3;\
-                return a+b}f().then(function(v){console.log(v)})"),
+            out(
+                "async function f(){var a=await Promise.resolve(2);var b=await 3;\
+                return a+b}f().then(function(v){console.log(v)})"
+            ),
             "5\n"
         );
         // await on rejected throws -> the async fn's promise rejects
@@ -3799,19 +4043,15 @@ mod tests {
             "aw:await: bad\n"
         );
         // await on pending is a clear error (no suspension exists)
-        assert!(
-            out("async function f(){await new Promise(function(){})}\
+        assert!(out("async function f(){await new Promise(function(){})}\
                 f().catch(function(e){console.log(e)})")
-            .contains("await on pending promise")
-        );
+        .contains("await on pending promise"));
         // await outside async is an eval error even though it parses
         assert!(errmsg("await 1").contains("await outside async"));
         // ...and inside a plain nested fn too (nearest-fn rule): the error
         // rejects the async fn's promise
-        assert!(
-            errmsg("async function f(){(function(){await 1})()}f()")
-                .contains("await outside async")
-        );
+        assert!(errmsg("async function f(){(function(){await 1})()}f()")
+            .contains("await outside async"));
         // throw inside async rejects; return adopts a promise
         assert_eq!(
             out("async function f(){return Promise.resolve(6)}\
@@ -3825,9 +4065,11 @@ mod tests {
         // microtask self-requeue is bounded by the step cap
         let mut it = Interp::new();
         it.max_steps = 500;
-        assert!(
-            it.run("function q(){queueMicrotask(q)}q()").unwrap_err().0.contains("step")
-        );
+        assert!(it
+            .run("function q(){queueMicrotask(q)}q()")
+            .unwrap_err()
+            .0
+            .contains("step"));
         // an uncleared interval hits the timer cap, not a hang
         let mut it = Interp::new();
         let e = it.run("setInterval(function(){},1)").unwrap_err();

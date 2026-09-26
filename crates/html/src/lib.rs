@@ -34,7 +34,10 @@ pub fn parse(input: &str, dom: &mut Dom) -> u32 {
             match peek(bytes, pos + 1) {
                 Some(b'!') => {
                     if input[pos..].starts_with("<!--") {
-                        let end = input[pos..].find("-->").map(|i| pos + i).unwrap_or(bytes.len());
+                        let end = input[pos..]
+                            .find("-->")
+                            .map(|i| pos + i)
+                            .unwrap_or(bytes.len());
                         let inner = &input[pos + 4..end.min(bytes.len())];
                         dom.comment(*open.last().unwrap(), inner);
                         pos = (end + 3).min(bytes.len());
@@ -46,7 +49,10 @@ pub fn parse(input: &str, dom: &mut Dom) -> u32 {
                 Some(b'/') => {
                     let (name, next) = read_name(bytes, pos + 2);
                     let name = name.to_ascii_lowercase();
-                    if let Some(idx) = open.iter().rposition(|&id| dom.tag_name(id) == Some(name.as_str())) {
+                    if let Some(idx) = open
+                        .iter()
+                        .rposition(|&id| dom.tag_name(id) == Some(name.as_str()))
+                    {
                         open.truncate(idx);
                     }
                     pos = skip_past_gt(bytes, next);
@@ -58,7 +64,10 @@ pub fn parse(input: &str, dom: &mut Dom) -> u32 {
                     next = after;
 
                     if IMPLIED_END.contains(&name.as_str()) {
-                        if let Some(idx) = open.iter().rposition(|&id| dom.tag_name(id) == Some(name.as_str())) {
+                        if let Some(idx) = open
+                            .iter()
+                            .rposition(|&id| dom.tag_name(id) == Some(name.as_str()))
+                        {
                             open.truncate(idx);
                         }
                     }
@@ -95,7 +104,10 @@ pub fn parse(input: &str, dom: &mut Dom) -> u32 {
                 }
             }
         } else {
-            let end = input[pos..].find('<').map(|i| pos + i).unwrap_or(bytes.len());
+            let end = input[pos..]
+                .find('<')
+                .map(|i| pos + i)
+                .unwrap_or(bytes.len());
             let text = &input[pos..end];
             if !text.trim().is_empty() {
                 dom.text(*open.last().unwrap(), &decode(text));
@@ -118,15 +130,15 @@ fn skip_past_gt(bytes: &[u8], from: usize) -> usize {
 }
 
 /// Read an identifier (tag/attr name) starting at `from`. Returns (name, next_pos).
-fn read_name<'a>(bytes: &'a [u8], from: usize) -> (&'a str, usize) {
+fn read_name(bytes: &[u8], from: usize) -> (&str, usize) {
     let mut end = from;
-    while end < bytes.len() && !bytes[end].is_ascii_whitespace() && !matches!(bytes[end], b'/' | b'>' | b'=') {
+    while end < bytes.len()
+        && !bytes[end].is_ascii_whitespace()
+        && !matches!(bytes[end], b'/' | b'>' | b'=')
+    {
         end += 1;
     }
-    (
-        std::str::from_utf8(&bytes[from..end]).unwrap_or(""),
-        end,
-    )
+    (std::str::from_utf8(&bytes[from..end]).unwrap_or(""), end)
 }
 
 /// Parse attributes after a tag name. Returns (attrs, self_closing, next_pos).

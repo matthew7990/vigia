@@ -56,7 +56,7 @@ fn is_special(scheme: &str) -> bool {
     default_port(scheme).is_some()
 }
 
-fn split_once_opt<'a>(s: &'a str, pat: char) -> (&'a str, Option<&'a str>) {
+fn split_once_opt(s: &str, pat: char) -> (&str, Option<&str>) {
     match s.split_once(pat) {
         Some((a, b)) => (a, Some(b)),
         None => (s, None),
@@ -111,7 +111,11 @@ impl Url {
 
         let (no_frag, frag) = split_once_opt(after, '#');
         let (pq, query) = split_once_opt(no_frag, '?');
-        let mut path = if pq.is_empty() { "/".to_string() } else { pq.to_string() };
+        let mut path = if pq.is_empty() {
+            "/".to_string()
+        } else {
+            pq.to_string()
+        };
         normalize_path(&mut path);
         path = pct_encode(&path, C_PATH);
         Ok(Url {
@@ -119,7 +123,7 @@ impl Url {
             host,
             port,
             path,
-            query: query.map(|q| pct_encode(&q, C_QUERY)),
+            query: query.map(|q| pct_encode(q, C_QUERY)),
             fragment: frag.map(str::to_string),
         })
     }
@@ -149,7 +153,11 @@ impl Url {
             scheme = self.scheme.clone();
             host = h;
             port = p;
-            path = if pq.is_empty() { "/".to_string() } else { pq.to_string() };
+            path = if pq.is_empty() {
+                "/".to_string()
+            } else {
+                pq.to_string()
+            };
             query = q.map(str::to_string);
         } else if rest.starts_with('/') {
             scheme = self.scheme.clone();
@@ -209,7 +217,9 @@ impl Url {
     }
 
     pub fn port_or_default(&self) -> u16 {
-        self.port.or_else(|| default_port(&self.scheme)).unwrap_or(80)
+        self.port
+            .or_else(|| default_port(&self.scheme))
+            .unwrap_or(80)
     }
 
     /// path + query, never empty - what goes on the request line.
@@ -296,12 +306,15 @@ const C_PATH: &str = " \"<>\\^`{|}";
 const C_QUERY: &str = " \"#<>";
 
 fn pct_encode(s: &str, extra: &str) -> String {
-    if !s.bytes().any(|b| b < 0x20 || b >= 0x7F || extra.contains(b as char)) {
+    if !s
+        .bytes()
+        .any(|b| !(0x20..0x7F).contains(&b) || extra.contains(b as char))
+    {
         return s.to_string();
     }
     let mut out = String::with_capacity(s.len());
     for &b in s.as_bytes() {
-        if b < 0x20 || b >= 0x7F || extra.contains(b as char) {
+        if !(0x20..0x7F).contains(&b) || extra.contains(b as char) {
             let _ = std::fmt::Write::write_fmt(&mut out, format_args!("%{b:02X}"));
         } else {
             out.push(b as char);
@@ -364,10 +377,7 @@ mod tests {
         let b = Url::parse("https://a.com/dir/page").unwrap();
         assert_eq!(b.join("x").unwrap().to_string(), "https://a.com/dir/x");
         assert_eq!(b.join("/y").unwrap().to_string(), "https://a.com/y");
-        assert_eq!(
-            b.join("//b.com/z").unwrap().to_string(),
-            "https://b.com/z"
-        );
+        assert_eq!(b.join("//b.com/z").unwrap().to_string(), "https://b.com/z");
         assert_eq!(
             b.join("?q=1").unwrap().to_string(),
             "https://a.com/dir/page?q=1"

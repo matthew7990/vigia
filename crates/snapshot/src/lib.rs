@@ -17,13 +17,43 @@ const INLINE_TAGS: &[&str] = &[
 
 /// Pure-structure containers: collapsed when they carry no kept attributes.
 const COLLAPSE_TAGS: &[&str] = &[
-    "html", "body", "head", "div", "span", "section", "article", "header", "footer", "main",
-    "colgroup", "tbody", "thead", "tfoot", "tr", "dl", "dd", "dt", "figure", "figcaption",
-    "picture", "fieldset", "legend", "center", "hgroup",
+    "html",
+    "body",
+    "head",
+    "div",
+    "span",
+    "section",
+    "article",
+    "header",
+    "footer",
+    "main",
+    "colgroup",
+    "tbody",
+    "thead",
+    "tfoot",
+    "tr",
+    "dl",
+    "dd",
+    "dt",
+    "figure",
+    "figcaption",
+    "picture",
+    "fieldset",
+    "legend",
+    "center",
+    "hgroup",
 ];
 
 const KEPT_ATTRS: &[&str] = &[
-    "id", "type", "name", "placeholder", "value", "role", "aria-label", "alt", "title",
+    "id",
+    "type",
+    "name",
+    "placeholder",
+    "value",
+    "role",
+    "aria-label",
+    "alt",
+    "title",
 ];
 
 /// Elements an agent can act on - they get `#n` refs.
@@ -37,7 +67,9 @@ const KEEP_LINE: &[&str] = &[
 fn role_of(tag: &str, attrs: &[(u32, String)], dom: &Dom) -> String {
     match tag {
         "a" => "link".into(),
-        t if t.len() == 2 && t.starts_with('h') && t.as_bytes()[1].is_ascii_digit() => "heading".into(),
+        t if t.len() == 2 && t.starts_with('h') && t.as_bytes()[1].is_ascii_digit() => {
+            "heading".into()
+        }
         "p" => "paragraph".into(),
         "img" => "image".into(),
         "button" => "button".into(),
@@ -86,10 +118,8 @@ fn collect_inline(dom: &Dom, id: NodeId, out: &mut String) {
                 out.push(' ');
                 out.push_str(t);
             }
-            NodeData::Element(el) => {
-                if INLINE_TAGS.contains(&dom.interner.resolve(el.tag)) {
-                    collect_inline(dom, c, out);
-                }
+            NodeData::Element(el) if INLINE_TAGS.contains(&dom.interner.resolve(el.tag)) => {
+                collect_inline(dom, c, out);
             }
             _ => {}
         }

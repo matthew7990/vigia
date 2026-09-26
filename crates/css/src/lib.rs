@@ -18,11 +18,11 @@ pub enum Combinator {
 pub enum AttrOp {
     Exists,
     Eq,
-    Includes,   // ~=
-    DashMatch,  // |=
-    Prefix,     // ^=
-    Suffix,     // $=
-    Substring,  // *=
+    Includes,  // ~=
+    DashMatch, // |=
+    Prefix,    // ^=
+    Suffix,    // $=
+    Substring, // *=
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +148,10 @@ fn parse_complex(s: &str) -> Result<Selector, CssError> {
     if compounds.is_empty() {
         return err("empty selector");
     }
-    Ok(Selector { compounds, combinators })
+    Ok(Selector {
+        compounds,
+        combinators,
+    })
 }
 
 /// Parse one compound starting at chars[i]. Returns (compound, next_index).
@@ -156,7 +159,12 @@ fn parse_compound(chars: &[char], mut i: usize) -> Result<(Compound, usize), Css
     let mut c = Compound::default();
 
     // Optional tag or *.
-    if i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '*' || chars[i] == '-' || chars[i] == '_') {
+    if i < chars.len()
+        && (chars[i].is_ascii_alphanumeric()
+            || chars[i] == '*'
+            || chars[i] == '-'
+            || chars[i] == '_')
+    {
         let start = i;
         while i < chars.len()
             && (chars[i].is_ascii_alphanumeric() || matches!(chars[i], '-' | '_' | '*' | '|'))
@@ -164,7 +172,11 @@ fn parse_compound(chars: &[char], mut i: usize) -> Result<(Compound, usize), Css
             i += 1;
         }
         let name: String = chars[start..i].iter().collect();
-        c.tag = if name == "*" { None } else { Some(name.to_ascii_lowercase()) };
+        c.tag = if name == "*" {
+            None
+        } else {
+            Some(name.to_ascii_lowercase())
+        };
     }
 
     loop {
@@ -200,7 +212,12 @@ fn parse_compound(chars: &[char], mut i: usize) -> Result<(Compound, usize), Css
         }
     }
 
-    if c.tag.is_none() && c.id.is_none() && c.classes.is_empty() && c.attrs.is_empty() && c.pseudos.is_empty() {
+    if c.tag.is_none()
+        && c.id.is_none()
+        && c.classes.is_empty()
+        && c.attrs.is_empty()
+        && c.pseudos.is_empty()
+    {
         return err("expected selector component");
     }
     Ok((c, i))
@@ -370,7 +387,10 @@ pub fn query(dom: &Dom, input: &str) -> Result<Vec<NodeId>, CssError> {
         if !matches!(dom.node(id).data, NodeData::Element(_)) || !attached(dom, id) {
             continue;
         }
-        if groups.iter().any(|g| matches_at(dom, id, g, g.compounds.len() - 1)) {
+        if groups
+            .iter()
+            .any(|g| matches_at(dom, id, g, g.compounds.len() - 1))
+        {
             out.push(id);
         }
     }
@@ -477,7 +497,11 @@ fn matches_compound(dom: &Dom, id: NodeId, c: &Compound) -> bool {
     }
     if !c.classes.is_empty() {
         let have = dom.attr(id, "class").unwrap_or("");
-        if !c.classes.iter().all(|cls| have.split_whitespace().any(|h| h == cls)) {
+        if !c
+            .classes
+            .iter()
+            .all(|cls| have.split_whitespace().any(|h| h == cls))
+        {
             return false;
         }
     }

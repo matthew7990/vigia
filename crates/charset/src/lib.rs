@@ -105,15 +105,45 @@ fn decode_win1252(bytes: &[u8]) -> String {
 }
 
 const WIN1252_HIGH: [Option<&'static str>; 32] = [
-    Some("€"), None, Some("‚"), Some("ƒ"), Some("„"), Some("…"), Some("†"), Some("‡"),
-    Some("ˆ"), Some("‰"), Some("Š"), Some("‹"), Some("Œ"), None, Some("Ž"), None,
-    None, Some("‘"), Some("’"), Some("“"), Some("”"), Some("•"), Some("–"), Some("—"),
-    Some("˜"), Some("™"), Some("š"), Some("›"), Some("œ"), None, Some("ž"), Some("Ÿ"),
+    Some("€"),
+    None,
+    Some("‚"),
+    Some("ƒ"),
+    Some("„"),
+    Some("…"),
+    Some("†"),
+    Some("‡"),
+    Some("ˆ"),
+    Some("‰"),
+    Some("Š"),
+    Some("‹"),
+    Some("Œ"),
+    None,
+    Some("Ž"),
+    None,
+    None,
+    Some("‘"),
+    Some("’"),
+    Some("“"),
+    Some("”"),
+    Some("•"),
+    Some("–"),
+    Some("—"),
+    Some("˜"),
+    Some("™"),
+    Some("š"),
+    Some("›"),
+    Some("œ"),
+    None,
+    Some("ž"),
+    Some("Ÿ"),
 ];
 
 fn decode_utf16(bytes: &[u8], little_endian: bool) -> String {
     let units: Vec<u16> = bytes
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| {
             if little_endian {
                 u16::from_le_bytes([c[0], c[1]])
@@ -147,9 +177,7 @@ pub fn charset_of(content_type: Option<&str>) -> Option<Cow<'_, str>> {
     let pos = ct.to_ascii_lowercase().find("charset")?;
     let rest = &ct[pos + 7..];
     let rest = rest.trim_start_matches([' ', '=', '"', '\'']);
-    let end = rest
-        .find(|c: char| matches!(c, ';' | ' ' | '"' | '\''))
-        .unwrap_or(rest.len());
+    let end = rest.find([';', ' ', '"', '\'']).unwrap_or(rest.len());
     Some(Cow::Borrowed(&rest[..end]))
 }
 

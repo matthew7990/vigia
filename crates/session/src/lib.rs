@@ -32,7 +32,9 @@ impl CookieJar {
     pub fn store_header(&mut self, url: &Url, header: &str) {
         let mut parts = header.split(';');
         let Some(nv) = parts.next() else { return };
-        let Some((name, value)) = nv.split_once('=') else { return };
+        let Some((name, value)) = nv.split_once('=') else {
+            return;
+        };
 
         let mut cookie = Cookie {
             name: name.trim().to_string(),
@@ -60,7 +62,8 @@ impl CookieJar {
                 cookie.http_only = true;
             }
         }
-        self.cookies.retain(|c| !(c.name == cookie.name && c.domain == cookie.domain));
+        self.cookies
+            .retain(|c| !(c.name == cookie.name && c.domain == cookie.domain));
         self.cookies.push(cookie);
     }
 
@@ -84,6 +87,10 @@ impl CookieJar {
 
     pub fn len(&self) -> usize {
         self.cookies.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cookies.is_empty()
     }
 
     /// Load a persisted jar. Missing file = empty jar; malformed lines are
@@ -225,7 +232,10 @@ mod tests {
     fn path_boundary() {
         let mut jar = CookieJar::new();
         jar.store_header(&u("https://a.com/app/"), "s=1; Path=/app");
-        assert_eq!(jar.header_for(&u("https://a.com/app/x")), Some("s=1".into()));
+        assert_eq!(
+            jar.header_for(&u("https://a.com/app/x")),
+            Some("s=1".into())
+        );
         assert_eq!(jar.header_for(&u("https://a.com/apple")), None);
     }
 }

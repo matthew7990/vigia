@@ -95,7 +95,10 @@ fn collect_scripts(dom: &Dom) -> Vec<ScriptSource> {
             .unwrap_or("")
             .trim()
             .to_ascii_lowercase();
-        if !matches!(ty.as_str(), "" | "text/javascript" | "application/javascript" | "module") {
+        if !matches!(
+            ty.as_str(),
+            "" | "text/javascript" | "application/javascript" | "module"
+        ) {
             continue;
         }
         match dom.attr(id, "src") {
@@ -415,8 +418,12 @@ impl Interp {
     fn new_event(&mut self, ty: &str, target: NodeId) -> Result<Value, JsError> {
         let ty = Value::Str(self.heap.alloc_str(ty.to_string())?);
         let tgt = self.dom_wrap(target)?;
-        let pd = self.heap.alloc_obj(nat("preventDefault", n_event_prevent_default))?;
-        let sp = self.heap.alloc_obj(nat("stopPropagation", n_event_stop_propagation))?;
+        let pd = self
+            .heap
+            .alloc_obj(nat("preventDefault", n_event_prevent_default))?;
+        let sp = self
+            .heap
+            .alloc_obj(nat("stopPropagation", n_event_stop_propagation))?;
         Ok(Value::Obj(self.obj_pairs(vec![
             ("type".into(), ty),
             ("target".into(), tgt),
@@ -432,8 +439,12 @@ impl Interp {
     fn normalize_event(&mut self, ev: Value, target: NodeId) -> Result<(), JsError> {
         let tgt = self.dom_wrap(target)?;
         set_prop(&mut self.heap, ev, "target", tgt)?;
-        let pd = self.heap.alloc_obj(nat("preventDefault", n_event_prevent_default))?;
-        let sp = self.heap.alloc_obj(nat("stopPropagation", n_event_stop_propagation))?;
+        let pd = self
+            .heap
+            .alloc_obj(nat("preventDefault", n_event_prevent_default))?;
+        let sp = self
+            .heap
+            .alloc_obj(nat("stopPropagation", n_event_stop_propagation))?;
         for (k, v) in [
             ("currentTarget", Value::Null),
             ("defaultPrevented", Value::Bool(false)),
@@ -471,7 +482,10 @@ impl Interp {
     }
 
     fn event_stopped(&self, ev: Value) -> bool {
-        matches!(get_prop(&self.heap, &self.protos, ev, "__stopped"), Ok(Value::Bool(true)))
+        matches!(
+            get_prop(&self.heap, &self.protos, ev, "__stopped"),
+            Ok(Value::Bool(true))
+        )
     }
 
     fn event_prevented(&self, ev: Value) -> bool {
@@ -672,7 +686,11 @@ impl Interp {
                     self.str_val(s)
                 }
                 "tagName" => {
-                    let t = self.dom_ref()?.tag_name(id).unwrap_or("").to_ascii_uppercase();
+                    let t = self
+                        .dom_ref()?
+                        .tag_name(id)
+                        .unwrap_or("")
+                        .to_ascii_uppercase();
                     self.str_val(t)
                 }
                 "id" => self.attr_val(id, "id"),
@@ -900,9 +918,12 @@ impl Interp {
 
 // ---- event natives ------------------------------------------------------
 
-fn n_event_prevent_default(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
-    set_prop(&mut it.heap, this, "defaultPrevented", Value::Bool(true))
-        .map(|()| Value::Undef)
+fn n_event_prevent_default(
+    it: &mut Interp,
+    this: Value,
+    _args: &[Value],
+) -> Result<Value, JsError> {
+    set_prop(&mut it.heap, this, "defaultPrevented", Value::Bool(true)).map(|()| Value::Undef)
 }
 
 fn n_event_stop_propagation(
@@ -960,18 +981,36 @@ mod tests {
         let mut it = interp(PAGE);
         assert_eq!(ev(&mut it, "document.getElementById('a').id"), "a");
         assert_eq!(ev(&mut it, "document.getElementById('nope')"), "null");
-        assert_eq!(ev(&mut it, "document.querySelector('#a p').textContent"), "one");
+        assert_eq!(
+            ev(&mut it, "document.querySelector('#a p').textContent"),
+            "one"
+        );
         assert_eq!(ev(&mut it, "document.querySelectorAll('#a p').length"), "2");
-        assert_eq!(ev(&mut it, "document.querySelectorAll('.nope').length"), "0");
-        assert_eq!(ev(&mut it, "document.getElementsByTagName('input').length"), "1");
-        assert_eq!(ev(&mut it, "document.getElementsByTagName('*').length > 3"), "true");
+        assert_eq!(
+            ev(&mut it, "document.querySelectorAll('.nope').length"),
+            "0"
+        );
+        assert_eq!(
+            ev(&mut it, "document.getElementsByTagName('input').length"),
+            "1"
+        );
+        assert_eq!(
+            ev(&mut it, "document.getElementsByTagName('*').length > 3"),
+            "true"
+        );
         // element-scoped query sees only its own subtree
         assert_eq!(
-            ev(&mut it, "document.getElementById('a').querySelectorAll('p').length"),
+            ev(
+                &mut it,
+                "document.getElementById('a').querySelectorAll('p').length"
+            ),
             "2"
         );
         assert_eq!(
-            ev(&mut it, "document.getElementById('a').querySelectorAll('input').length"),
+            ev(
+                &mut it,
+                "document.getElementById('a').querySelectorAll('input').length"
+            ),
             "0"
         );
         assert!(errmsg(&mut it, "document.querySelector('[')").contains("css"));
@@ -980,8 +1019,12 @@ mod tests {
     #[test]
     fn text_content() {
         let mut it = interp(PAGE);
-        assert_eq!(ev(&mut it, "document.getElementById('a').textContent"), "one two bold");
-        it.run("document.getElementById('a').textContent = 'flat'").unwrap();
+        assert_eq!(
+            ev(&mut it, "document.getElementById('a').textContent"),
+            "one two bold"
+        );
+        it.run("document.getElementById('a').textContent = 'flat'")
+            .unwrap();
         let dom = it.take_dom();
         let a = vigia_css::query(&dom, "#a").unwrap()[0];
         assert_eq!(vigia_actions::text_content(&dom, a), "flat");
@@ -995,7 +1038,8 @@ mod tests {
             ev(&mut it, "document.getElementById('a').innerHTML"),
             "<p>x &amp; y</p><br>"
         );
-        it.run("document.body.innerHTML = '<h1>INJ</h1><p>t</p>'").unwrap();
+        it.run("document.body.innerHTML = '<h1>INJ</h1><p>t</p>'")
+            .unwrap();
         let dom = it.take_dom();
         let h1 = vigia_css::query(&dom, "h1").unwrap();
         assert_eq!(vigia_actions::text_content(&dom, h1[0]), "INJ");
@@ -1005,10 +1049,28 @@ mod tests {
     #[test]
     fn attributes() {
         let mut it = interp(PAGE);
-        assert_eq!(ev(&mut it, "var e=document.getElementById('i');e.getAttribute('value')"), "v1");
-        assert_eq!(ev(&mut it, "document.getElementById('i').hasAttribute('checked')"), "true");
-        assert_eq!(ev(&mut it, "document.getElementById('i').hasAttribute('nope')"), "false");
-        assert_eq!(ev(&mut it, "document.getElementById('i').getAttribute('nope')"), "null");
+        assert_eq!(
+            ev(
+                &mut it,
+                "var e=document.getElementById('i');e.getAttribute('value')"
+            ),
+            "v1"
+        );
+        assert_eq!(
+            ev(
+                &mut it,
+                "document.getElementById('i').hasAttribute('checked')"
+            ),
+            "true"
+        );
+        assert_eq!(
+            ev(&mut it, "document.getElementById('i').hasAttribute('nope')"),
+            "false"
+        );
+        assert_eq!(
+            ev(&mut it, "document.getElementById('i').getAttribute('nope')"),
+            "null"
+        );
         it.run("var e=document.getElementById('i');e.setAttribute('data-k','7');e.removeAttribute('value')").unwrap();
         let dom = it.take_dom();
         let i = vigia_css::query(&dom, "#i").unwrap()[0];
@@ -1022,7 +1084,10 @@ mod tests {
         assert_eq!(ev(&mut it, "document.getElementById('a').className"), "x y");
         assert_eq!(ev(&mut it, "document.getElementById('l').href"), "/next");
         assert_eq!(ev(&mut it, "document.getElementById('i').checked"), "true");
-        assert_eq!(ev(&mut it, "document.getElementById('i').disabled"), "false");
+        assert_eq!(
+            ev(&mut it, "document.getElementById('i').disabled"),
+            "false"
+        );
         it.run(
             "var e=document.getElementById('i');e.id='j';e.value='v2';e.checked=false;e.disabled=true",
         )
@@ -1037,22 +1102,34 @@ mod tests {
     #[test]
     fn tree_walk() {
         let mut it = interp(PAGE);
-        assert_eq!(ev(&mut it, "document.getElementById('a').children.length"), "2");
+        assert_eq!(
+            ev(&mut it, "document.getElementById('a').children.length"),
+            "2"
+        );
         assert_eq!(
             ev(&mut it, "document.getElementById('a').children[0].tagName"),
             "P"
         );
         // childNodes on <p>two <b>bold</b></p> mixes text + element
         assert_eq!(
-            ev(&mut it, "document.querySelectorAll('#a p')[1].childNodes.length"),
+            ev(
+                &mut it,
+                "document.querySelectorAll('#a p')[1].childNodes.length"
+            ),
             "2"
         );
         assert_eq!(
-            ev(&mut it, "document.querySelectorAll('#a p')[1].childNodes[0].nodeType"),
+            ev(
+                &mut it,
+                "document.querySelectorAll('#a p')[1].childNodes[0].nodeType"
+            ),
             "3"
         );
         assert_eq!(
-            ev(&mut it, "document.querySelectorAll('#a p')[1].childNodes[0].textContent"),
+            ev(
+                &mut it,
+                "document.querySelectorAll('#a p')[1].childNodes[0].textContent"
+            ),
             "two "
         );
         assert_eq!(
@@ -1069,7 +1146,8 @@ mod tests {
             "var h=document.createElement('h1');h.textContent='INJ';document.body.appendChild(h)",
         )
         .unwrap();
-        it.run("document.getElementById('a').appendChild(document.getElementById('l'))").unwrap();
+        it.run("document.getElementById('a').appendChild(document.getElementById('l'))")
+            .unwrap();
         it.run("document.getElementById('i').remove()").unwrap();
         let dom = it.take_dom();
         let h1 = vigia_css::query(&dom, "body > h1").unwrap();
@@ -1082,14 +1160,19 @@ mod tests {
         // removeChild returns the detached node
         let mut it = interp("<body><div id=a><b id=b>x</b></div></body>");
         assert_eq!(
-            ev(&mut it, "document.getElementById('a').removeChild(document.getElementById('b')).tagName"),
+            ev(
+                &mut it,
+                "document.getElementById('a').removeChild(document.getElementById('b')).tagName"
+            ),
             "B"
         );
         assert_eq!(ev(&mut it, "document.getElementById('b')"), "null");
         let dom = it.take_dom();
         assert!(vigia_css::query(&dom, "#b").unwrap().is_empty());
-        assert!(errmsg(&mut interp("<body></body>"), "document.body.appendChild(1)")
-            .contains("needs a node"));
+        assert!(
+            errmsg(&mut interp("<body></body>"), "document.body.appendChild(1)")
+                .contains("needs a node")
+        );
     }
 
     #[test]
@@ -1148,9 +1231,7 @@ mod tests {
 
     /// Serve one response per connection on a throwaway port; returns the
     /// port and the request lines observed.
-    fn serve(
-        bodies: Vec<String>,
-    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+    fn serve(bodies: Vec<String>) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
         use std::io::{Read, Write};
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
@@ -1199,9 +1280,8 @@ mod tests {
 
     #[test]
     fn listeners_bubble_and_stop() {
-        let mut it = interp(
-            r#"<body><div id=a onclick="log.push('inline')"><p id=p>one</p></div></body>"#,
-        );
+        let mut it =
+            interp(r#"<body><div id=a onclick="log.push('inline')"><p id=p>one</p></div></body>"#);
         it.run(
             "var log=[];\
              var a=document.getElementById('a');\
@@ -1241,7 +1321,10 @@ mod tests {
             ),
             "1"
         );
-        assert_eq!(ev(&mut it, "e.removeEventListener('click',h);e.click();n"), "1");
+        assert_eq!(
+            ev(&mut it, "e.removeEventListener('click',h);e.click();n"),
+            "1"
+        );
         assert!(errmsg(&mut it, "e.addEventListener('click',1)").contains("function"));
     }
 
@@ -1249,7 +1332,13 @@ mod tests {
     fn dispatch_event_and_prevent_default() {
         let mut it = interp(r#"<body><a id=l href="/nope">x</a></body>"#);
         // no listeners -> dispatchEvent returns true
-        assert_eq!(ev(&mut it, "document.getElementById('l').dispatchEvent({type:'click'})"), "true");
+        assert_eq!(
+            ev(
+                &mut it,
+                "document.getElementById('l').dispatchEvent({type:'click'})"
+            ),
+            "true"
+        );
         // preventDefault flips defaultPrevented and the return value
         it.run(
             "var l=document.getElementById('l');\
@@ -1326,10 +1415,18 @@ mod tests {
     #[test]
     fn fetch_needs_page_context() {
         let mut it = Interp::new();
-        assert!(it.run("fetch('/x')").unwrap_err().0.contains("page context"));
+        assert!(it
+            .run("fetch('/x')")
+            .unwrap_err()
+            .0
+            .contains("page context"));
         // installed even with a dom but no net ctx
         let mut it = interp("<body></body>");
-        assert!(it.run("fetch('/x')").unwrap_err().0.contains("page context"));
+        assert!(it
+            .run("fetch('/x')")
+            .unwrap_err()
+            .0
+            .contains("page context"));
     }
 
     #[test]
@@ -1357,8 +1454,7 @@ mod tests {
         let out = it.run_scripts(
             d,
             Some(NetCtx {
-                base: vigia_url::Url::parse(&format!("http://127.0.0.1:{port}/dir/page"))
-                    .unwrap(),
+                base: vigia_url::Url::parse(&format!("http://127.0.0.1:{port}/dir/page")).unwrap(),
                 jar: CookieJar::new(),
             }),
         );
@@ -1448,7 +1544,11 @@ mod tests {
             }),
         );
         assert_eq!(out.errors.len(), 1);
-        assert!(out.errors[0].0.contains("unhandled rejection"), "{}", out.errors[0].0);
+        assert!(
+            out.errors[0].0.contains("unhandled rejection"),
+            "{}",
+            out.errors[0].0
+        );
         assert!(out.errors[0].0.contains("fetch"), "{}", out.errors[0].0);
     }
 
@@ -1612,8 +1712,16 @@ mod tests {
         );
         // skipped, but each leaves an error entry as the signal
         assert_eq!(out.errors.len(), 2);
-        assert!(out.errors[0].0.contains("data scheme"), "{}", out.errors[0].0);
-        assert!(out.errors[1].0.contains("javascript scheme"), "{}", out.errors[1].0);
+        assert!(
+            out.errors[0].0.contains("data scheme"),
+            "{}",
+            out.errors[0].0
+        );
+        assert!(
+            out.errors[1].0.contains("javascript scheme"),
+            "{}",
+            out.errors[1].0
+        );
         assert_eq!(page_title(&out.dom), "ok");
     }
 

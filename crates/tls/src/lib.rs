@@ -40,7 +40,8 @@ impl std::io::Write for TlsStream {
 /// Wrap an already-connected TCP stream in TLS, verifying `host` against the
 /// Mozilla root set. `host` is bare (no port, no IPv6 brackets).
 pub fn connect(tcp: TcpStream, host: &str) -> Result<TlsStream, String> {
-    let name = ServerName::try_from(host.to_string()).map_err(|e| format!("bad server name: {e}"))?;
+    let name =
+        ServerName::try_from(host.to_string()).map_err(|e| format!("bad server name: {e}"))?;
     let conn = ClientConnection::new(std::sync::Arc::new(config().clone()), name)
         .map_err(|e| e.to_string())?;
     Ok(TlsStream(StreamOwned::new(conn, tcp)))

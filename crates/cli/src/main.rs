@@ -46,7 +46,7 @@ fn fmt_num(n: usize) -> String {
     let s = n.to_string();
     let mut out = String::new();
     for (i, c) in s.chars().enumerate() {
-        if i > 0 && (s.len() - i) % 3 == 0 {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -131,11 +131,19 @@ fn parse_dom(
 }
 
 fn profile_path(name: &str) -> Option<std::path::PathBuf> {
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
         return None;
     }
     let home = std::env::var_os("HOME")?;
-    Some(std::path::PathBuf::from(home).join(".vigia/profiles").join(format!("{name}.jar")))
+    Some(
+        std::path::PathBuf::from(home)
+            .join(".vigia/profiles")
+            .join(format!("{name}.jar")),
+    )
 }
 
 /// One audit entry as a JSONL line; `tab` adds the parallel-tab field.

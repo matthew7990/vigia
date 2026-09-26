@@ -17,7 +17,13 @@ const MAX_DEPTH: u32 = 400;
 
 pub fn parse_program(src: &str) -> Result<Vec<Stmt>, JsError> {
     let t = lex(src)?;
-    let mut p = P { t, i: 0, depth: 0, in_fn: 0, in_loop: 0 };
+    let mut p = P {
+        t,
+        i: 0,
+        depth: 0,
+        in_fn: 0,
+        in_loop: 0,
+    };
     let mut stmts = Vec::new();
     while !p.at_eof() {
         stmts.push(p.stmt()?);
@@ -89,7 +95,11 @@ impl P {
     }
 
     fn unexp(&self, what: &str) -> JsError {
-        err(format!("{what}, got {:?} at byte {}", self.peek(), self.pos()))
+        err(format!(
+            "{what}, got {:?} at byte {}",
+            self.peek(),
+            self.pos()
+        ))
     }
 
     fn ident(&mut self) -> R<String> {
@@ -213,7 +223,11 @@ impl P {
                 let is_break = matches!(self.peek(), Tok::Kw("break"));
                 self.i += 1;
                 self.semi()?;
-                Ok(if is_break { Stmt::Break } else { Stmt::Continue })
+                Ok(if is_break {
+                    Stmt::Break
+                } else {
+                    Stmt::Continue
+                })
             }
             _ => {
                 let e = self.expr()?;
@@ -239,7 +253,11 @@ impl P {
         let mut v = Vec::new();
         loop {
             let name = self.ident()?;
-            let init = if self.eat_p("=") { Some(self.expr()?) } else { None };
+            let init = if self.eat_p("=") {
+                Some(self.expr()?)
+            } else {
+                None
+            };
             v.push((name, init));
             if !self.eat_p(",") {
                 break;
@@ -267,7 +285,12 @@ impl P {
         self.in_fn += 1;
         let body = self.block_body();
         self.in_fn -= 1;
-        Ok(Rc::new(FnDef { name, params, body: body?, is_async }))
+        Ok(Rc::new(FnDef {
+            name,
+            params,
+            body: body?,
+            is_async,
+        }))
     }
 
     fn for_stmt(&mut self) -> R<Stmt> {
@@ -275,7 +298,10 @@ impl P {
         self.exp_p("(")?;
         let init = if self.eat_p(";") {
             None
-        } else if matches!(self.peek(), Tok::Kw("var") | Tok::Kw("let") | Tok::Kw("const")) {
+        } else if matches!(
+            self.peek(),
+            Tok::Kw("var") | Tok::Kw("let") | Tok::Kw("const")
+        ) {
             self.i += 1;
             let d = self.var_decls()?;
             self.exp_p(";")?;
@@ -285,9 +311,17 @@ impl P {
             self.exp_p(";")?;
             Some(Box::new(Stmt::Expr(e)))
         };
-        let test = if self.at_p(";") { None } else { Some(self.expr()?) };
+        let test = if self.at_p(";") {
+            None
+        } else {
+            Some(self.expr()?)
+        };
         self.exp_p(";")?;
-        let upd = if self.at_p(")") { None } else { Some(self.expr()?) };
+        let upd = if self.at_p(")") {
+            None
+        } else {
+            Some(self.expr()?)
+        };
         self.exp_p(")")?;
         self.in_loop += 1;
         let b = self.stmt();
@@ -447,7 +481,11 @@ impl P {
                 break;
             }
         }
-        let args = if self.at_p("(") { self.args()? } else { Vec::new() };
+        let args = if self.at_p("(") {
+            self.args()?
+        } else {
+            Vec::new()
+        };
         Ok(Expr::New(Box::new(c), args))
     }
 
@@ -567,7 +605,11 @@ impl P {
                             Tok::Kw(k) => k.to_string(),
                             Tok::Str(s) => s,
                             Tok::Num(n) => fmt_num(n),
-                            t => return Err(err(format!("expected object key, got {t:?} at byte {pos}"))),
+                            t => {
+                                return Err(err(format!(
+                                    "expected object key, got {t:?} at byte {pos}"
+                                )))
+                            }
                         };
                         // `{x}` shorthand = `{x: x}`
                         let val = if self.eat_p(":") {
@@ -647,7 +689,10 @@ mod tests {
 
     #[test]
     fn decls() {
-        match parse_program("function f(a,b){return a}").unwrap().remove(0) {
+        match parse_program("function f(a,b){return a}")
+            .unwrap()
+            .remove(0)
+        {
             Stmt::FnDecl(d) => assert_eq!(d.params.len(), 2),
             s => panic!("{s:?}"),
         }

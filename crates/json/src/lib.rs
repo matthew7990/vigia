@@ -53,12 +53,6 @@ impl Json {
         Some(cur)
     }
 
-    pub fn to_string(&self) -> String {
-        let mut s = String::new();
-        self.write(&mut s);
-        s
-    }
-
     fn write(&self, out: &mut String) {
         match self {
             Json::Null => out.push_str("null"),
@@ -94,6 +88,14 @@ impl Json {
                 out.push('}');
             }
         }
+    }
+}
+
+impl std::fmt::Display for Json {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut s = String::new();
+        self.write(&mut s);
+        f.write_str(&s)
     }
 }
 
@@ -171,14 +173,23 @@ fn string(b: &[u8], i: &mut usize) -> Result<String, JsonError> {
         match b.get(*i).copied() {
             None => return Err(JsonError("unterminated string", *i)),
             Some(b'"') => {
-                out.push_str(std::str::from_utf8(&b[chunk_start..*i]).map_err(|_| JsonError("bad utf-8", *i))?);
+                out.push_str(
+                    std::str::from_utf8(&b[chunk_start..*i])
+                        .map_err(|_| JsonError("bad utf-8", *i))?,
+                );
                 *i += 1;
                 return Ok(out);
             }
             Some(b'\\') => {
-                out.push_str(std::str::from_utf8(&b[chunk_start..*i]).map_err(|_| JsonError("bad utf-8", *i))?);
+                out.push_str(
+                    std::str::from_utf8(&b[chunk_start..*i])
+                        .map_err(|_| JsonError("bad utf-8", *i))?,
+                );
                 *i += 1;
-                let e = b.get(*i).copied().ok_or(JsonError("unterminated escape", *i))?;
+                let e = b
+                    .get(*i)
+                    .copied()
+                    .ok_or(JsonError("unterminated escape", *i))?;
                 *i += 1;
                 match e {
                     b'"' => out.push('"'),
@@ -196,7 +207,9 @@ fn string(b: &[u8], i: &mut usize) -> Result<String, JsonError> {
                             if b.get(*i) == Some(&b'\\') && b.get(*i + 1) == Some(&b'u') {
                                 *i += 2;
                                 let lo = hex4(b, i)?;
-                                let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3FF);
+                                let cp = 0x10000
+                                    + ((hi - 0xD800) << 10)
+                                    + (lo.wrapping_sub(0xDC00) & 0x3FF);
                                 out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
                             } else {
                                 out.push('\u{FFFD}');
@@ -288,7 +301,10 @@ mod tests {
     fn roundtrip() {
         let src = r#"{"a":1,"b":[true,null,"x\ny"],"c":{"d":-2.5}}"#;
         let v = Json::parse(src).unwrap();
-        assert_eq!(v.to_string(), r#"{"a":1,"b":[true,null,"x\ny"],"c":{"d":-2.5}}"#);
+        assert_eq!(
+            v.to_string(),
+            r#"{"a":1,"b":[true,null,"x\ny"],"c":{"d":-2.5}}"#
+        );
     }
 
     #[test]
@@ -318,7 +334,10 @@ mod tests {
 
     #[test]
     fn next_data_style() {
-        let v = Json::parse(r#"{"props":{"pageProps":{"items":[1,2,3]}},"page":"/products","buildId":"abc"}"#).unwrap();
+        let v = Json::parse(
+            r#"{"props":{"pageProps":{"items":[1,2,3]}},"page":"/products","buildId":"abc"}"#,
+        )
+        .unwrap();
         assert_eq!(v.get("props.pageProps.items.2"), Some(&Json::Num(3.0)));
         assert_eq!(v.get("page"), Some(&Json::Str("/products".into())));
     }

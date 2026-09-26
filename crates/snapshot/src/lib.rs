@@ -23,7 +23,7 @@ const COLLAPSE_TAGS: &[&str] = &[
 ];
 
 const KEPT_ATTRS: &[&str] = &[
-    "id", "class", "type", "name", "placeholder", "value", "role", "aria-label", "alt", "title",
+    "id", "type", "name", "placeholder", "value", "role", "aria-label", "alt", "title",
 ];
 
 /// Elements an agent can act on - they get `#n` refs.
@@ -190,14 +190,20 @@ impl Snapshotter {
                     }
                     return;
                 }
-                // Elements with neither text, kept attrs, nor semantics don't render.
+                // An element with no own payload (no direct text, no kept
+                // attrs, not interactive, not a landmark) collapses too:
+                // children surface at this depth. Collapse, not skip - the
+                // subtree may hold interactive elements that interactive_refs
+                // counts, and skipping them would misalign #n numbering.
                 if text.is_empty()
                     && !has_kept_attrs
                     && !interactive
                     && !KEEP_LINE.contains(&tag)
                     && !INLINE_TAGS.contains(&tag)
-                    && !matches!(tag, "li" | "td" | "th" | "p" | "option" | "label")
                 {
+                    for &child in dom.children(id) {
+                        self.write_node(dom, child, depth, out);
+                    }
                     return;
                 }
 
@@ -320,6 +326,20 @@ mod tests {
         let out = snapshot(&dom);
         assert!(out.contains("#3"), "got:\n{out}");
         assert!(!out.contains("/hidden"), "got:\n{out}");
+    }
+
+    #[test]
+    fn unknown_wrappers_collapse_not_skip() {
+        // <custom-x><a> used to skip the whole subtree: the link was counted
+        // by interactive_refs but never printed, so #1 resolved to nothing.
+        let mut dom = Dom::new();
+        let root = dom.root();
+        let x = dom.element(root, "custom-x", vec![]);
+        let a = dom.element(x, "a", vec![("href".into(), "/in".into())]);
+        dom.text(a, "inside");
+        let out = snapshot(&dom);
+        assert!(out.contains("link #1 'inside' -> /in"), "got:\n{out}");
+        assert_eq!(interactive_refs(&dom).len(), 1);
     }
 
     #[test]

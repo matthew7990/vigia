@@ -1,13 +1,9 @@
 [package]
-name = "vigia"
-description = "AI-native browser runtime CLI"
+name = "vigia-run"
+description = ".vig script runner: sequential ops over one fetch + live DOM, with audit"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-
-[[bin]]
-name = "vigia"
-path = "src/main.rs"
 
 [dependencies]
 vigia-actions = { path = "../actions" }
@@ -15,8 +11,7 @@ vigia-css = { path = "../css" }
 vigia-dom = { path = "../dom" }
 vigia-html = { path = "../html" }
 vigia-json = { path = "../json" }
-vigia-mem = { path = "../mem" }
 vigia-net = { path = "../net" }
-vigia-run = { path = "../run" }
 vigia-session = { path = "../session" }
 vigia-snapshot = { path = "../snapshot" }
+vigia-url = { path = "../url" }

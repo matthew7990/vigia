@@ -124,6 +124,7 @@ dependencies = [
  "vigia-json",
  "vigia-mem",
  "vigia-net",
+ "vigia-run",
  "vigia-session",
  "vigia-snapshot",
 ]
@@ -183,6 +184,21 @@ dependencies = [
  "vigia-inflate",
  "vigia-session",
  "vigia-tls",
+ "vigia-url",
+]
+
+[[package]]
+name = "vigia-run"
+version = "0.1.0"
+dependencies = [
+ "vigia-actions",
+ "vigia-css",
+ "vigia-dom",
+ "vigia-html",
+ "vigia-json",
+ "vigia-net",
+ "vigia-session",
+ "vigia-snapshot",
  "vigia-url",
 ]
 

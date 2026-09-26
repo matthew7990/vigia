@@ -17,6 +17,7 @@ const USAGE: &str = "vigia - AI-native browser runtime
   vigia click <url> <#n>                 follow snapshot ref (link/submit)
   vigia submit <url> [-f css] -d k=v..   fill + submit a form (login flows)
   vigia json <url> [a.b.0]               embedded JSON (__NEXT_DATA__, ld+json)
+  vigia run <file.vig> [--audit log.jsonl]  multi-step script + audit trail
 
   --profile <name>                       persistent cookie jar (~/.vigia/profiles)
 
@@ -289,6 +290,58 @@ fn main() {
                 eprintln!("no embedded JSON blocks found");
             }
             report(&format!("{} blocks", found));
+        }
+        "run" => {
+            // The url-position arg is the .vig script path here.
+            let mut audit_path = None;
+            let mut i = 0;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--audit" if i + 1 < args.len() => {
+                        audit_path = Some(args[i + 1].clone());
+                        i += 2;
+                    }
+                    _ => fail(format!("bad arg: {}", args[i])),
+                }
+            }
+            let src = std::fs::read_to_string(&url)
+                .unwrap_or_else(|e| fail(format!("cannot read {url}: {e}")));
+            let stmts = match vigia_run::parse_script(&src) {
+                Ok(s) => s,
+                Err(e) => fail(format!("run failed at line {}: {}", e.0, e.1)),
+            };
+            let mut audit = Vec::new();
+            let mut emit = |s: &str| {
+                print!("{s}");
+                if !s.ends_with('\n') {
+                    println!();
+                }
+            };
+            let result = vigia_run::run(&stmts, &mut jar, &mut audit, &mut emit);
+            if let Some(p) = &audit_path {
+                let mut text = String::new();
+                for e in &audit {
+                    let line = vigia_json::Json::Obj(vec![
+                        ("line".into(), vigia_json::Json::Num(e.line as f64)),
+                        ("op".into(), vigia_json::Json::Str(e.op.into())),
+                        ("arg".into(), vigia_json::Json::Str(e.arg.clone())),
+                        ("status".into(), vigia_json::Json::Num(e.status as f64)),
+                        (
+                            "ms".into(),
+                            vigia_json::Json::Num((e.ms * 1000.0).round() / 1000.0),
+                        ),
+                        ("ok".into(), vigia_json::Json::Bool(e.ok)),
+                    ]);
+                    let _ = writeln!(text, "{}", line.to_string());
+                }
+                if let Err(e) = std::fs::write(p, text) {
+                    eprintln!("warn: audit write failed: {e}");
+                }
+            }
+            match result {
+                Ok(()) => report(&format!("{} steps", audit.len())),
+                Err(e) => fail(format!("run failed at line {}: {}", e.0, e.1)),
+            }
         }
         _ => {
             eprint!("{USAGE}");

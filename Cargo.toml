@@ -10,6 +10,7 @@ members = [
     "crates/json",
     "crates/mem",
     "crates/net",
+    "crates/run",
     "crates/session",
     "crates/snapshot",
     "crates/tls",

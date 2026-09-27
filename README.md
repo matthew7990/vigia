@@ -197,12 +197,14 @@ Working:
   events with bubbling plus constructible `Event`/`CustomEvent`/
   `MouseEvent`/`KeyboardEvent` and `document.createEvent`,
   `document.cookie` read/write on the session jar, external `src=`
-  scripts, Promise + microtasks + virtual-clock timers + `async`/`await`,
+  scripts (static and dynamically injected, with `load`/`error`),
+  Promise + microtasks + virtual-clock timers + `async`/`await`,
   Promise-returning `fetch`, `navigator.sendBeacon`, mark-sweep GC
 - Browser persona (no layout engine behind it): `navigator` constants
   plus `userAgentData`, `plugins`/`mimeTypes`, `connection`,
   `geolocation`, `indexedDB`, hardware fields; `screen` + viewport dims;
-  `performance.now`/`timeOrigin`; `document` props (`compatMode`,
+  `performance.now`/`timeOrigin`; `MessageChannel` for schedulers;
+  `document` props (`compatMode`,
   `hidden`, `hasFocus`, ...); `getComputedStyle` snapshot;
   `HTMLCanvasElement` 2d with real pixels (`fillRect`, `drawImage`,
   `getImageData`/`putImageData`, BMP `toDataURL`; paths, text and

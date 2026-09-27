@@ -215,6 +215,18 @@ impl Dom {
         self.nodes[parent as usize].children.push(id);
     }
 
+    /// Link `id` under `parent` right before `before` (which must be a
+    /// child of `parent`); `None` appends. Caller must detach first and
+    /// check for cycles, like `append_child_node`.
+    pub fn insert_before_node(&mut self, parent: NodeId, id: NodeId, before: Option<NodeId>) {
+        self.nodes[id as usize].parent = Some(parent);
+        let kids = &mut self.nodes[parent as usize].children;
+        match before.and_then(|b| kids.iter().position(|&c| c == b)) {
+            Some(i) => kids.insert(i, id),
+            None => kids.push(id),
+        }
+    }
+
     /// Drop all children links; the child nodes stay in the arena, orphaned.
     pub fn clear_children(&mut self, id: NodeId) {
         for c in std::mem::take(&mut self.nodes[id as usize].children) {

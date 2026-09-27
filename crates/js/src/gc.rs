@@ -115,7 +115,7 @@ impl Marker {
                             self.ow.push(*p);
                         }
                     }
-                    Obj::Dom(_) | Obj::Freed => {}
+                    Obj::Dom(_) | Obj::Style { .. } | Obj::Freed => {}
                 }
             }
             while let Some(id) = self.sw.pop() {

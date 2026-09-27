@@ -190,6 +190,9 @@ pub enum Obj {
     },
     /// JS handle over a DOM node; valid only while Interp.dom is installed.
     Dom(NodeId),
+    /// Live CSS declaration block for an element: reads/writes go to the
+    /// element's `style` attribute on every access (no cached copy).
+    Style { node: NodeId },
     /// Compiled regex: `pat`/`flags` are Str ids (GC roots), `last_index`
     /// counts chars (not bytes). The compiled AST is immutable Rust data.
     RegExp {

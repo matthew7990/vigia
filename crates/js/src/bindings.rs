@@ -134,37 +134,48 @@ fn esc_attr(v: &str, out: &mut String) {
     }
 }
 
+/// Serialize one node (element with its subtree, text, comment).
+fn serialize_node(dom: &Dom, id: NodeId, out: &mut String) {
+    match &dom.node(id).data {
+        NodeData::Element(el) => {
+            let tag = dom.interner.resolve(el.tag).to_string();
+            out.push('<');
+            out.push_str(&tag);
+            for (k, v) in &el.attrs {
+                out.push(' ');
+                out.push_str(dom.interner.resolve(*k));
+                out.push_str("=\"");
+                esc_attr(v, out);
+                out.push('"');
+            }
+            out.push('>');
+            if !VOID.contains(&tag.as_str()) {
+                for c in dom.children(id).to_vec() {
+                    serialize_node(dom, c, out);
+                }
+                out.push_str("</");
+                out.push_str(&tag);
+                out.push('>');
+            }
+        }
+        NodeData::Text(t) => esc_text(t, out),
+        NodeData::Comment(t) => {
+            out.push_str("<!--");
+            out.push_str(t);
+            out.push_str("-->");
+        }
+        NodeData::Document => {
+            for c in dom.children(id).to_vec() {
+                serialize_node(dom, c, out);
+            }
+        }
+    }
+}
+
 /// innerHTML getter: children of `id` serialized as HTML.
 fn serialize_into(dom: &Dom, id: NodeId, out: &mut String) {
-    for &c in dom.children(id) {
-        match &dom.node(c).data {
-            NodeData::Element(el) => {
-                let tag = dom.interner.resolve(el.tag);
-                out.push('<');
-                out.push_str(tag);
-                for (k, v) in &el.attrs {
-                    out.push(' ');
-                    out.push_str(dom.interner.resolve(*k));
-                    out.push_str("=\"");
-                    esc_attr(v, out);
-                    out.push('"');
-                }
-                out.push('>');
-                if !VOID.contains(&tag) {
-                    serialize_into(dom, c, out);
-                    out.push_str("</");
-                    out.push_str(tag);
-                    out.push('>');
-                }
-            }
-            NodeData::Text(t) => esc_text(t, out),
-            NodeData::Comment(t) => {
-                out.push_str("<!--");
-                out.push_str(t);
-                out.push_str("-->");
-            }
-            NodeData::Document => {}
-        }
+    for c in dom.children(id).to_vec() {
+        serialize_node(dom, c, out);
     }
 }
 
@@ -308,6 +319,89 @@ impl Interp {
             }
         }
         None
+    }
+
+    pub(crate) fn as_style(&self, v: Value) -> Option<NodeId> {
+        if let Value::Obj(id) = v {
+            if let Obj::Style { node } = self.heap.obj(id) {
+                return Some(*node);
+            }
+        }
+        None
+    }
+
+    /// `style="a: b; c: d"` <-> declaration list (names lowercased).
+    fn parse_style(attr: &str) -> Vec<(String, String)> {
+        attr.split(';')
+            .filter_map(|d| {
+                let (k, v) = d.split_once(':')?;
+                let k = k.trim().to_lowercase();
+                if k.is_empty() {
+                    return None;
+                }
+                Some((k, v.trim().to_string()))
+            })
+            .collect()
+    }
+
+    fn render_style(decls: &[(String, String)]) -> String {
+        decls
+            .iter()
+            .map(|(k, v)| format!("{k}: {v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Live read of one style property (or cssText/length).
+    pub(crate) fn style_get(&mut self, node: NodeId, key: &str) -> Result<Value, JsError> {
+        let attr = self
+            .dom_ref()?
+            .attr(node, "style")
+            .unwrap_or("")
+            .to_string();
+        if key == "cssText" {
+            return self.str_val(attr);
+        }
+        let decls = Self::parse_style(&attr);
+        if key == "length" {
+            return Ok(Value::Num(decls.len() as f64));
+        }
+        let key = key.to_lowercase();
+        match decls.iter().find(|(k, _)| *k == key) {
+            Some((_, v)) => self.str_val(v.clone()),
+            None => Ok(Value::Undef),
+        }
+    }
+
+    /// Live write: upsert (empty value removes), cssText replaces all.
+    pub(crate) fn style_set(&mut self, node: NodeId, key: &str, val: Value) -> Result<(), JsError> {
+        if key == "length" {
+            return Ok(()); // readonly in real JS; sloppy no-op
+        }
+        if key == "cssText" {
+            let t = to_str(&self.heap, val);
+            self.dom_mut()?.set_attr(node, "style", &t);
+            return Ok(());
+        }
+        let attr = self
+            .dom_ref()?
+            .attr(node, "style")
+            .unwrap_or("")
+            .to_string();
+        let mut decls = Self::parse_style(&attr);
+        let key = key.to_lowercase();
+        let t = to_str(&self.heap, val);
+        if t.trim().is_empty() {
+            decls.retain(|(k, _)| *k != key);
+        } else {
+            match decls.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, v)) => *v = t.trim().to_string(),
+                None => decls.push((key, t.trim().to_string())),
+            }
+        }
+        self.dom_mut()?
+            .set_attr(node, "style", &Self::render_style(&decls));
+        Ok(())
     }
 
     /// Wrap a node, reusing the cached wrapper so === identity holds.
@@ -688,6 +782,11 @@ impl Interp {
                     serialize_into(self.dom_ref()?, id, &mut s);
                     self.str_val(s)
                 }
+                "outerHTML" => {
+                    let mut s = String::new();
+                    serialize_node(self.dom_ref()?, id, &mut s);
+                    self.str_val(s)
+                }
                 "tagName" => {
                     let t = self
                         .dom_ref()?
@@ -700,6 +799,10 @@ impl Interp {
                 "className" => self.attr_val(id, "class"),
                 "value" => self.attr_val(id, "value"),
                 "href" => self.attr_val(id, "href"),
+                "style" => {
+                    let s = self.heap.alloc_obj(Obj::Style { node: id })?;
+                    Ok(Value::Obj(s))
+                }
                 "checked" => Ok(Value::Bool(self.dom_ref()?.attr(id, "checked").is_some())),
                 "disabled" => Ok(Value::Bool(self.dom_ref()?.attr(id, "disabled").is_some())),
                 _ => Ok(Value::Undef),
@@ -777,6 +880,19 @@ impl Interp {
                 }
             }
             _ => {}
+        }
+        Ok(())
+    }
+
+    /// `n` must not be `id` itself or one of its ancestors.
+    fn check_cycle(&self, id: NodeId, n: NodeId, op: &str) -> Result<(), JsError> {
+        let dom = self.dom_ref()?;
+        let mut cur = Some(id);
+        while let Some(p) = cur {
+            if p == n {
+                return Err(err(format!("cyclic {op}")));
+            }
+            cur = dom.parent(p);
         }
         Ok(())
     }
@@ -876,19 +992,33 @@ impl Interp {
                 let Some(n) = self.as_node(a) else {
                     return Err(err("appendChild needs a node"));
                 };
-                {
-                    let dom = self.dom_ref()?;
-                    let mut cur = Some(id);
-                    while let Some(p) = cur {
-                        if p == n {
-                            return Err(err("cyclic appendChild"));
-                        }
-                        cur = dom.parent(p);
-                    }
-                }
+                self.check_cycle(id, n, "appendChild")?;
                 let dom = self.dom_mut()?;
                 dom.detach(n);
                 dom.append_child_node(id, n);
+                Ok(a)
+            }
+            "insertBefore" => {
+                let a = arg(0);
+                let Some(n) = self.as_node(a) else {
+                    return Err(err("insertBefore needs a node"));
+                };
+                self.check_cycle(id, n, "insertBefore")?;
+                let before = match arg(1) {
+                    Value::Null | Value::Undef => None,
+                    b => {
+                        let Some(m) = self.as_node(b) else {
+                            return Err(err("insertBefore needs a node or null"));
+                        };
+                        if self.dom_ref()?.parent(m) != Some(id) {
+                            return Err(err("insertBefore: not a child"));
+                        }
+                        Some(m)
+                    }
+                };
+                let dom = self.dom_mut()?;
+                dom.detach(n);
+                dom.insert_before_node(id, n, before);
                 Ok(a)
             }
             "removeChild" => {
@@ -1176,6 +1306,33 @@ mod tests {
             errmsg(&mut interp("<body></body>"), "document.body.appendChild(1)")
                 .contains("needs a node")
         );
+    }
+
+    #[test]
+    fn insert_before_and_style() {
+        let mut it = interp("<body><div id=a><b id=b>x</b></div></body>");
+        it.run(
+            "var a=document.getElementById('a');var c=document.createElement('i');c.textContent='n';a.insertBefore(c,document.getElementById('b'))",
+        )
+        .unwrap();
+        assert_eq!(
+            ev(&mut it, "document.getElementById('a').innerHTML"),
+            "<i>n</i><b id=\"b\">x</b>"
+        );
+        // null ref appends; foreign ref errors.
+        it.run("var d=document.createElement('u');a.insertBefore(d,null)")
+            .unwrap();
+        assert!(ev(&mut it, "document.getElementById('a').innerHTML").contains("<u></u>"));
+        assert!(errmsg(&mut it, "a.insertBefore(d,document.body)").contains("not a child"));
+        // Live style block round-trips through the attribute.
+        it.run("var e=document.createElement('div');e.style.display='none';e.style.opacity='0.5';document.body.appendChild(e)").unwrap();
+        assert_eq!(ev(&mut it, "e.style.display"), "none");
+        assert_eq!(ev(&mut it, "e.style.length"), "2");
+        assert!(ev(&mut it, "e.style.cssText").contains("display: none"));
+        assert!(ev(&mut it, "e.outerHTML").contains("style=\"display: none; opacity: 0.5\""));
+        it.run("e.style.display=''").unwrap();
+        assert_eq!(ev(&mut it, "e.style.length"), "1");
+        assert_eq!(ev(&mut it, "e.style.missing"), "undefined");
     }
 
     #[test]

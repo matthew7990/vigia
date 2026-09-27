@@ -105,6 +105,8 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
             Obj::Native { name, .. } => format!("function {name}() {{ [native code] }}"),
             Obj::Dom(_) => "[object Node]".into(),
             Obj::Promise(_) => "[object Promise]".into(),
+            // No Dom access here: String(style) gives the tag, use cssText.
+            Obj::Style { .. } => "[object CSSStyleDeclaration]".into(),
             Obj::RegExp { pat, flags, .. } => {
                 format!("/{}/{}", h.get_str(*pat), h.get_str(*flags))
             }
@@ -217,7 +219,7 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
             "dotAll" => Some(Value::Bool(compiled.flags.dot_all)),
             _ => None,
         },
-        Obj::Dom(_) | Obj::Promise(_) | Obj::Freed => None,
+        Obj::Dom(_) | Obj::Promise(_) | Obj::Style { .. } | Obj::Freed => None,
     }
 }
 
@@ -229,6 +231,7 @@ fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
         Obj::Native { .. } => po(protos.function_),
         Obj::Promise(_) => po(protos.promise),
         Obj::RegExp { proto, .. } => *proto,
+        Obj::Style { .. } => po(protos.object),
         Obj::Dom(_) | Obj::Freed => None,
     }
 }
@@ -262,6 +265,53 @@ fn has_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> bool {
         cur = proto_of(h, protos, id);
     }
     false
+}
+
+/// `v[key]`: DOM node, live style block, or plain lookup.
+impl Interp {
+    fn recv_get(&mut self, v: Value, key: &str) -> Result<Value, JsError> {
+        if let Some(n) = self.as_node(v) {
+            return self.dom_get(n, key);
+        }
+        if let Some(n) = self.as_style(v) {
+            return self.style_get(n, key);
+        }
+        get_prop(&self.heap, &self.protos, v, key)
+    }
+
+    fn recv_get_idx(&mut self, v: Value, k: Value) -> Result<Value, JsError> {
+        if let Some(n) = self.as_node(v) {
+            let key = to_str(&self.heap, k);
+            return self.dom_get(n, &key);
+        }
+        if let Some(n) = self.as_style(v) {
+            let key = to_str(&self.heap, k);
+            return self.style_get(n, &key);
+        }
+        get_index(&mut self.heap, &self.protos, v, k)
+    }
+
+    fn recv_set(&mut self, v: Value, key: &str, val: Value) -> Result<(), JsError> {
+        if let Some(n) = self.as_node(v) {
+            return self.dom_set(n, key, val);
+        }
+        if let Some(n) = self.as_style(v) {
+            return self.style_set(n, key, val);
+        }
+        set_prop(&mut self.heap, v, key, val)
+    }
+
+    fn recv_set_idx(&mut self, v: Value, k: Value, val: Value) -> Result<(), JsError> {
+        if let Some(n) = self.as_node(v) {
+            let key = to_str(&self.heap, k);
+            return self.dom_set(n, &key, val);
+        }
+        if let Some(n) = self.as_style(v) {
+            let key = to_str(&self.heap, k);
+            return self.style_set(n, &key, val);
+        }
+        set_index(&mut self.heap, v, k, val)
+    }
 }
 
 /// `v[key]`: own props, then proto chain, then Undef. Primitives map to
@@ -1054,10 +1104,7 @@ impl Interp {
             Expr::Call(c, args) => self.call(env, c, args),
             Expr::Member(o, name) => {
                 let v = self.expr(env, o)?;
-                match self.as_node(v) {
-                    Some(n) => self.dom_get(n, name),
-                    None => get_prop(&self.heap, &self.protos, v, name),
-                }
+                self.recv_get(v, name)
             }
             Expr::Regex { pat, flags } => make_regexp(self, pat, flags),
             Expr::Tpl(parts, tail) => {
@@ -1074,13 +1121,7 @@ impl Interp {
             Expr::Index(o, ix) => {
                 let v = self.expr(env, o)?;
                 let k = self.expr(env, ix)?;
-                match self.as_node(v) {
-                    Some(n) => {
-                        let key = to_str(&self.heap, k);
-                        self.dom_get(n, &key)
-                    }
-                    None => get_index(&mut self.heap, &self.protos, v, k),
-                }
+                self.recv_get_idx(v, k)
             }
             Expr::Func(def) => Ok(Value::Obj(self.func_obj(def.clone(), env)?)),
             Expr::New(c, args) => {
@@ -1294,21 +1335,12 @@ impl Interp {
                 .ok_or_else(|| err(format!("{n} is not defined"))),
             Expr::Member(o, k) => {
                 let v = self.expr(env, o)?;
-                match self.as_node(v) {
-                    Some(n) => self.dom_get(n, k),
-                    None => get_prop(&self.heap, &self.protos, v, k),
-                }
+                self.recv_get(v, k)
             }
             Expr::Index(o, ix) => {
                 let v = self.expr(env, o)?;
                 let k = self.expr(env, ix)?;
-                match self.as_node(v) {
-                    Some(n) => {
-                        let key = to_str(&self.heap, k);
-                        self.dom_get(n, &key)
-                    }
-                    None => get_index(&mut self.heap, &self.protos, v, k),
-                }
+                self.recv_get_idx(v, k)
             }
             _ => Err(err("bad assignment target")),
         }
@@ -1324,21 +1356,12 @@ impl Interp {
             }
             Expr::Member(o, k) => {
                 let t = self.expr(env, o)?;
-                match self.as_node(t) {
-                    Some(n) => self.dom_set(n, k, v),
-                    None => set_prop(&mut self.heap, t, k, v),
-                }
+                self.recv_set(t, k, v)
             }
             Expr::Index(o, ix) => {
                 let t = self.expr(env, o)?;
                 let k = self.expr(env, ix)?;
-                match self.as_node(t) {
-                    Some(n) => {
-                        let key = to_str(&self.heap, k);
-                        self.dom_set(n, &key, v)
-                    }
-                    None => set_index(&mut self.heap, t, k, v),
-                }
+                self.recv_set_idx(t, k, v)
             }
             _ => Err(err("bad assignment target")),
         }
@@ -1479,7 +1502,11 @@ impl Interp {
                 Obj::Ordinary { pairs, .. }
                 | Obj::Func { pairs, .. }
                 | Obj::Native { pairs, .. } => Ok(pairs.clone()),
-                Obj::RegExp { .. } | Obj::Promise(_) | Obj::Dom(_) | Obj::Freed => Ok(vec![]),
+                Obj::RegExp { .. }
+                | Obj::Promise(_)
+                | Obj::Dom(_)
+                | Obj::Style { .. }
+                | Obj::Freed => Ok(vec![]),
             },
         }
     }
@@ -1553,10 +1580,7 @@ impl Interp {
                     }
                     parent = cur;
                     method = Some(name.clone());
-                    cur = match self.as_node(cur) {
-                        Some(n) => self.dom_get(n, name)?,
-                        None => get_prop(&self.heap, &self.protos, cur, name)?,
-                    };
+                    cur = self.recv_get(cur, name)?;
                 }
                 OptOp::Index(key, opt) => {
                     if matches!(cur, Value::Null | Value::Undef) {
@@ -1576,13 +1600,7 @@ impl Interp {
                         Value::Str(s) => Some(self.heap.get_str(s).to_string()),
                         _ => None,
                     };
-                    cur = match self.as_node(recv) {
-                        Some(n) => {
-                            let kk = to_str(&self.heap, k);
-                            self.dom_get(n, &kk)?
-                        }
-                        None => get_index(&mut self.heap, &self.protos, recv, k)?,
-                    };
+                    cur = self.recv_get_idx(recv, k)?;
                 }
                 OptOp::Call(arg_es, opt) => {
                     if matches!(cur, Value::Null | Value::Undef) {
@@ -2022,6 +2040,7 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
                 Json::Null
             }
             Obj::RegExp { .. } => Json::Obj(vec![]),
+            Obj::Style { .. } => Json::Obj(vec![]),
         },
     })
 }
@@ -2085,6 +2104,7 @@ fn n_obj_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
             Obj::Dom(_) => "[object Node]",
             Obj::Promise(_) => "[object Promise]",
             Obj::RegExp { .. } => "[object RegExp]",
+            Obj::Style { .. } => "[object CSSStyleDeclaration]",
             Obj::Ordinary { .. } | Obj::Freed => "[object Object]",
         },
     };
@@ -2114,7 +2134,9 @@ fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
                 .enumerate()
                 .map(|(i, x)| (i.to_string(), *x))
                 .collect(),
-            Obj::Dom(_) | Obj::Promise(_) | Obj::RegExp { .. } | Obj::Freed => Vec::new(),
+            Obj::Dom(_) | Obj::Promise(_) | Obj::RegExp { .. } | Obj::Style { .. } | Obj::Freed => {
+                Vec::new()
+            }
         },
         _ => Vec::new(),
     }

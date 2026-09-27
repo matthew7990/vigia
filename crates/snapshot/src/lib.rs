@@ -194,7 +194,7 @@ impl Snapshotter {
     fn write_node(&mut self, dom: &Dom, id: NodeId, depth: usize, out: &mut String) {
         let indent = "  ".repeat(depth);
         match &dom.node(id).data {
-            NodeData::Document => {
+            NodeData::Document | NodeData::Fragment => {
                 for &child in dom.children(id) {
                     self.write_node(dom, child, depth, out);
                 }

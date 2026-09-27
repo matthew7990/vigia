@@ -11,6 +11,9 @@ use crate::ast::{
     ClassCtor, ClassMember, Expr, FnDef, MemberKind, ObjEntry, OptOp, Pat, Stmt, VarDecl, VarKind,
 };
 use crate::{
+    bindings::{
+        WIN_EVENTS, n_win_add_event_listener, n_win_dispatch_event, n_win_remove_event_listener,
+    },
     err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
     Protos, ThenHandler, Timer, TypedKind, Value,
 };
@@ -130,8 +133,8 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
                 Some(s) => format!("Symbol({})", h.get_str(*s)),
                 None => "Symbol()".into(),
             },
-            Obj::Dom(_) => "[object Node]".into(),
-            Obj::Promise(_) => "[object Promise]".into(),
+            Obj::Dom { .. } => "[object Node]".into(),
+            Obj::Promise { .. } => "[object Promise]".into(),
             Obj::Accessor { .. } => "[object Accessor]".into(),
             // No Dom access here: String(style) gives the tag, use cssText.
             Obj::Style { .. } => "[object CSSStyleDeclaration]".into(),
@@ -318,8 +321,8 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
             "dotAll" => Some(Value::Bool(compiled.flags.dot_all)),
             _ => None,
         },
-        Obj::Dom(_)
-        | Obj::Promise(_)
+        Obj::Promise { pairs, .. } => pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v),
+        Obj::Dom { .. }
         | Obj::Style { .. }
         | Obj::Accessor { .. }
         | Obj::Symbol { .. }
@@ -334,7 +337,7 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
 /// Heap id of `id`'s prototype. Natives get the Function proto virtually;
 /// Dom has none. Proxies forward live to the target's proto
 /// (getPrototypeOf trap is a documented gap).
-fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
+pub(crate) fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
     let id = proxy_resolve(h, id);
     match h.obj(id) {
         Obj::Ordinary { proto, .. }
@@ -345,7 +348,7 @@ fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
         | Obj::Typed { proto, .. }
         | Obj::DView { proto, .. } => *proto,
         Obj::Native { .. } => po(protos.function_),
-        Obj::Promise(_) => po(protos.promise),
+        Obj::Promise { .. } => po(protos.promise),
         Obj::RegExp { proto, .. } => *proto,
         Obj::Accessor { proto, .. } => *proto,
         Obj::Symbol { proto, .. } => *proto,
@@ -353,14 +356,15 @@ fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
         Obj::Set { proto, .. } => *proto,
         Obj::WeakMap { proto, .. } => *proto,
         Obj::Style { .. } => po(protos.object),
+        Obj::Dom { proto, .. } => *proto,
         // Deep chains past the resolve cap read as proto-less (gap).
         Obj::Proxy { .. } => None,
-        Obj::Dom(_) | Obj::Freed => None,
+        Obj::Freed => None,
     }
 }
 
 /// Walk `start` then its proto chain; first own prop wins. Cap hops.
-fn walk_props(h: &Heap, protos: &Protos, start: Option<u32>, key: &str) -> Result<Value, JsError> {
+pub(crate) fn walk_props(h: &Heap, protos: &Protos, start: Option<u32>, key: &str) -> Result<Value, JsError> {
     let mut cur = start;
     for _ in 0..MAX_PROTO_HOPS {
         let Some(id) = cur else {
@@ -403,9 +407,28 @@ impl Interp {
             if matches!(self.heap.obj(id), Obj::Proxy { .. }) {
                 return self.proxy_get(id, key, v);
             }
+            // `window` is the global scope live: env 0 first, own snapshot
+            // pairs (builtin writes like defineProperty land there) after.
+            if Some(id) == self.wind {
+                if let Some(val) = self.env_get(0, key) {
+                    return self.invoke_getter(val, v, key);
+                }
+            }
         }
         if let Some(n) = self.as_node(v) {
-            return self.dom_get(n, key);
+            let r = self.dom_get(n, key)?;
+            // Unknown DOM keys fall back to the wrapper's proto chain
+            // (constructor, hasOwnProperty, inherited bag methods).
+            if !matches!(r, Value::Undef) {
+                return self.invoke_getter(r, v, key);
+            }
+            if let Value::Obj(wid) = v {
+                if let Some(p) = proto_of(&self.heap, &self.protos, wid) {
+                    let val = walk_props(&self.heap, &self.protos, Some(p), key)?;
+                    return self.invoke_getter(val, v, key);
+                }
+            }
+            return Ok(Value::Undef);
         }
         if let Some(n) = self.as_style(v) {
             return self.style_get(n, key);
@@ -424,6 +447,12 @@ impl Interp {
             if matches!(self.heap.obj(id), Obj::Proxy { .. }) {
                 let key = to_str(&self.heap, k);
                 return self.proxy_get(id, &key, v);
+            }
+            if Some(id) == self.wind {
+                let key = to_str(&self.heap, k);
+                if let Some(val) = self.env_get(0, &key) {
+                    return self.invoke_getter(val, v, &key);
+                }
             }
         }
         if let Some(n) = self.as_node(v) {
@@ -458,6 +487,11 @@ impl Interp {
             if matches!(self.heap.obj(id), Obj::Proxy { .. }) {
                 return self.proxy_set(id, key, val, v);
             }
+            // `window.x = v` declares a real global (V8 parity).
+            if Some(id) == self.wind {
+                self.env_declare(0, key, val);
+                return Ok(());
+            }
         }
         if let Some(n) = self.as_node(v) {
             return self.dom_set(n, key, val);
@@ -477,6 +511,11 @@ impl Interp {
             if matches!(self.heap.obj(id), Obj::Proxy { .. }) {
                 let key = to_str(&self.heap, k);
                 return self.proxy_set(id, &key, val, v);
+            }
+            if Some(id) == self.wind {
+                let key = to_str(&self.heap, k);
+                self.env_declare(0, &key, val);
+                return Ok(());
             }
         }
         if let Some(n) = self.as_node(v) {
@@ -672,8 +711,8 @@ pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<
         Value::Obj(id) => match h.obj(id) {
             Obj::Arr { .. } => "array",
             Obj::RegExp { .. } => "regexp",
-            Obj::Promise(_) => "promise",
-            Obj::Dom(_) => "node",
+            Obj::Promise { .. } => "promise",
+            Obj::Dom { .. } => "node",
             Obj::Style { .. } => "style",
             Obj::Accessor { .. } => "accessor",
             Obj::Symbol { .. } => "symbol",
@@ -755,6 +794,14 @@ pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<
                 *last_index = last_num;
                 Ok(())
             }
+            // Promises take expandos (deferred resolve/reject helpers).
+            Obj::Promise { pairs, .. } => {
+                match pairs.iter_mut().find(|(k, _)| k == key) {
+                    Some(slot) => slot.1 = val,
+                    None => pairs.push((key.to_string(), val)),
+                }
+                Ok(())
+            }
             // Buffers and views are non-extensible: every write is a
             // sloppy no-op.
             Obj::Buf { .. } | Obj::DView { .. } => Ok(()),
@@ -780,7 +827,7 @@ fn get_index(h: &mut Heap, protos: &Protos, v: Value, k: Value) -> Result<Value,
                 Obj::Typed { elems, .. } if n >= 0.0 && n.fract() == 0.0 => {
                     Ok(elems.get(n as usize).map(|e| Value::Num(*e)).unwrap_or(Value::Undef))
                 }
-                Obj::Dom(_) => Ok(Value::Undef),
+                Obj::Dom { .. } => Ok(Value::Undef),
                 _ => {
                     let key = to_str(h, k);
                     get_prop(h, protos, v, &key)
@@ -848,17 +895,22 @@ fn set_index(h: &mut Heap, v: Value, k: Value, val: Value) -> Result<(), JsError
             }
             if matches!(h.obj(id), Obj::Arr { .. }) {
                 let n = to_num(h, k);
-                if !(n >= 0.0 && n.fract() == 0.0 && n <= 10_000_000.0) {
-                    return Err(err("bad array index"));
-                }
-                let i = n as usize;
-                if let Obj::Arr { items, .. } = h.obj_mut(id) {
-                    if i >= items.len() {
-                        items.resize(i + 1, Value::Undef);
+                // Canonical indices grow the array (capped: absurdly
+                // large indices become named props instead of a sparse
+                // giant - documented gap); anything else is an expando,
+                // like V8 (a[-1], a["x"] never throw).
+                if n >= 0.0 && n.fract() == 0.0 && n <= 10_000_000.0 {
+                    let i = n as usize;
+                    if let Obj::Arr { items, .. } = h.obj_mut(id) {
+                        if i >= items.len() {
+                            items.resize(i + 1, Value::Undef);
+                        }
+                        items[i] = val;
                     }
-                    items[i] = val;
+                    return Ok(());
                 }
-                return Ok(());
+                let key = to_str(h, k);
+                return set_prop(h, v, &key, val);
             }
             let key = to_str(h, k);
             set_prop(h, v, &key, val)
@@ -1359,6 +1411,99 @@ impl Interp {
         ]);
         self.protos.textencoder = self.proto_bag(&[("encode", n_te_encode)]);
         self.protos.textdecoder = self.proto_bag(&[("decode", n_td_decode)]);
+        // DOM hierarchy: Node <- Element <- HTMLElement (+ per-tag
+        // interfaces), Node <- DocumentFragment <- ShadowRoot, Node <-
+        // Document. Bags chained manually (proto_bag parents to Object);
+        // each carries its `constructor`. All ctors throw on `new`
+        // ("Illegal constructor") - instanceof/prototype use only.
+        let dom_ifaces: &[(&str, &str)] = &[
+            ("Node", ""),
+            ("Element", "Node"),
+            ("HTMLElement", "Element"),
+            ("Document", "Node"),
+            ("DocumentFragment", "Node"),
+            ("ShadowRoot", "DocumentFragment"),
+            ("HTMLInputElement", "HTMLElement"),
+            ("HTMLFormElement", "HTMLElement"),
+            ("HTMLSelectElement", "HTMLElement"),
+            ("HTMLTextAreaElement", "HTMLElement"),
+            ("HTMLButtonElement", "HTMLElement"),
+            ("HTMLAnchorElement", "HTMLElement"),
+            ("HTMLImageElement", "HTMLElement"),
+            ("HTMLIFrameElement", "HTMLElement"),
+            ("SVGElement", "Element"),
+        ];
+        // Field setter per interface (match keeps this a closed set).
+        let set_bag = |it: &mut Interp, name: &str, bag: u32| {
+            match name {
+                "Node" => it.protos.dom_node = bag,
+                "Element" => it.protos.dom_element = bag,
+                "HTMLElement" => it.protos.dom_htmlelement = bag,
+                "Document" => it.protos.dom_document = bag,
+                "ShadowRoot" => it.protos.dom_shadowroot = bag,
+                "DocumentFragment" => it.protos.dom_documentfragment = bag,
+                "HTMLInputElement" => it.protos.dom_input = bag,
+                "HTMLFormElement" => it.protos.dom_form = bag,
+                "HTMLSelectElement" => it.protos.dom_select = bag,
+                "HTMLTextAreaElement" => it.protos.dom_textarea = bag,
+                "HTMLButtonElement" => it.protos.dom_button = bag,
+                "HTMLAnchorElement" => it.protos.dom_anchor = bag,
+                "HTMLImageElement" => it.protos.dom_image = bag,
+                "HTMLIFrameElement" => it.protos.dom_iframe = bag,
+                "SVGElement" => it.protos.dom_svg = bag,
+                _ => {}
+            }
+        };
+        let get_bag = |it: &Interp, name: &str| match name {
+            "Node" => it.protos.dom_node,
+            "Element" => it.protos.dom_element,
+            "HTMLElement" => it.protos.dom_htmlelement,
+            "Document" => it.protos.dom_document,
+            "ShadowRoot" => it.protos.dom_shadowroot,
+            "DocumentFragment" => it.protos.dom_documentfragment,
+            "HTMLInputElement" => it.protos.dom_input,
+            "HTMLFormElement" => it.protos.dom_form,
+            "HTMLSelectElement" => it.protos.dom_select,
+            "HTMLTextAreaElement" => it.protos.dom_textarea,
+            "HTMLButtonElement" => it.protos.dom_button,
+            "HTMLAnchorElement" => it.protos.dom_anchor,
+            "HTMLImageElement" => it.protos.dom_image,
+            "HTMLIFrameElement" => it.protos.dom_iframe,
+            "SVGElement" => it.protos.dom_svg,
+            _ => u32::MAX,
+        };
+        for (name, _parent) in dom_ifaces {
+            let bag = self.proto_bag(&[]);
+            set_bag(self, name, bag);
+            self.ctor(name, n_dom_illegal, bag, &[]);
+        }
+        // Re-parent the bags under their DOM parents (cap-safe: bags may
+        // be u32::MAX sentinels, in which case there is nothing to link
+        // and instanceof degrades to false).
+        let link = |it: &mut Interp, bag: u32, parent: u32| {
+            if bag == u32::MAX || parent == u32::MAX {
+                return;
+            }
+            if let Obj::Ordinary { proto, .. } = it.heap.obj_mut(bag) {
+                *proto = Some(parent);
+            }
+        };
+        for (name, parent) in dom_ifaces {
+            if !parent.is_empty() {
+                let (b, p) = (get_bag(self, name), get_bag(self, parent));
+                link(self, b, p);
+            }
+        }
+        // Constructor backlinks on the bags (V8: El.prototype.constructor).
+        for (name, _parent) in dom_ifaces {
+            let bag = get_bag(self, name);
+            if bag == u32::MAX {
+                continue;
+            }
+            if let Some(c) = self.env_get(0, name) {
+                let _ = set_prop(&mut self.heap, Value::Obj(bag), "constructor", c);
+            }
+        }
         // Map/Set/WeakMap prototypes; `size` is an accessor (no data slot).
         // (One block per kind: sharing `self` mutably across a table would
         // need unsafe, which this codebase forbids outside vigia-mem.)
@@ -1485,7 +1630,7 @@ impl Interp {
         );
         self.ctor("Number", n_number_cast, pr.number, &[]);
         self.ctor("Boolean", n_boolean_cast, u32::MAX, &[]);
-        self.ctor("Date", n_date, pr.date, &[("now", n_date_now)]);
+        self.ctor("Date", n_date, pr.date, &[("now", n_date_now), ("UTC", n_date_utc)]);
         self.ctor(
             "URL",
             n_url_ctor,
@@ -1626,6 +1771,9 @@ impl Interp {
             ("queueMicrotask", n_queue_microtask),
             ("atob", n_atob),
             ("btoa", n_btoa),
+            ("addEventListener", n_win_add_event_listener),
+            ("removeEventListener", n_win_remove_event_listener),
+            ("dispatchEvent", n_win_dispatch_event),
         ] {
             if let Ok(id) = self.heap.alloc_obj(nat(n, f)) {
                 self.env_declare(0, n, Value::Obj(id));
@@ -1645,6 +1793,23 @@ impl Interp {
             ("sqrt", n_math_sqrt),
             ("fround", n_math_fround),
             ("trunc", n_math_trunc),
+            ("sin", n_math_sin),
+            ("cos", n_math_cos),
+            ("tan", n_math_tan),
+            ("asin", n_math_asin),
+            ("acos", n_math_acos),
+            ("atan", n_math_atan),
+            ("atan2", n_math_atan2),
+            ("sinh", n_math_sinh),
+            ("cosh", n_math_cosh),
+            ("tanh", n_math_tanh),
+            ("exp", n_math_exp),
+            ("log", n_math_log),
+            ("cbrt", n_math_cbrt),
+            ("hypot", n_math_hypot),
+            ("sign", n_math_sign),
+            ("clz32", n_math_clz32),
+            ("imul", n_math_imul),
         ] {
             match self.heap.alloc_obj(nat(n, f)) {
                 Ok(id) => mp.push((n.into(), Value::Obj(id))),
@@ -1653,12 +1818,32 @@ impl Interp {
         }
         mp.push(("PI".into(), Value::Num(std::f64::consts::PI)));
         mp.push(("E".into(), Value::Num(std::f64::consts::E)));
+        mp.push(("SQRT2".into(), Value::Num(std::f64::consts::SQRT_2)));
+        mp.push(("SQRT1_2".into(), Value::Num(std::f64::consts::FRAC_1_SQRT_2)));
+        mp.push(("LN2".into(), Value::Num(std::f64::consts::LN_2)));
+        mp.push(("LN10".into(), Value::Num(std::f64::consts::LN_10)));
+        mp.push(("LOG2E".into(), Value::Num(std::f64::consts::LOG2_E)));
+        mp.push(("LOG10E".into(), Value::Num(std::f64::consts::LOG10_E)));
         if let Ok(m) = self.obj_pairs(mp) {
             self.env_declare(0, "Math", Value::Obj(m));
         }
         if let Ok(log) = self.heap.alloc_obj(nat("log", n_console_log)) {
-            if let Ok(c) = self.obj_pairs(vec![("log".into(), Value::Obj(log))]) {
-                self.env_declare(0, "console", Value::Obj(c));
+            if let Ok(err) = self.heap.alloc_obj(nat("error", n_console_diag)) {
+                if let Ok(warn) = self.heap.alloc_obj(nat("warn", n_console_diag)) {
+                    if let Ok(info) = self.heap.alloc_obj(nat("info", n_console_diag)) {
+                        if let Ok(dbg) = self.heap.alloc_obj(nat("debug", n_console_diag)) {
+                            if let Ok(c) = self.obj_pairs(vec![
+                                ("log".into(), Value::Obj(log)),
+                                ("error".into(), Value::Obj(err)),
+                                ("warn".into(), Value::Obj(warn)),
+                                ("info".into(), Value::Obj(info)),
+                                ("debug".into(), Value::Obj(dbg)),
+                            ]) {
+                                self.env_declare(0, "console", Value::Obj(c));
+                            }
+                        }
+                    }
+                }
             }
         }
         if let Ok(p) = self.heap.alloc_obj(nat("parse", n_json_parse)) {
@@ -1781,8 +1966,12 @@ impl Interp {
     }
 
     fn exec_block_run(&mut self, stmts: &[Stmt], env: u32) -> Result<Flow, JsError> {
+        // Hoist + record: Stmt::FnDecl below skips recorded defs so each
+        // declaration materializes exactly once per entry.
+        let hbase = self.hoisted.len();
         for s in stmts {
             if let Stmt::FnDecl(def) = s {
+                self.hoisted.push(Rc::as_ptr(def));
                 let f = self.func_obj(def.clone(), env)?;
                 if let Some(n) = &def.name {
                     self.env_declare(env, n, Value::Obj(f));
@@ -1796,16 +1985,21 @@ impl Interp {
                 }
             }
         }
+        let mut r = Ok(Flow::Normal);
         for s in stmts {
             self.tick()?;
             // safepoint: the previous statement's temporaries are consumed
             self.maybe_gc();
             match self.stmt(env, s)? {
                 Flow::Normal => {}
-                f => return Ok(f),
+                f => {
+                    r = Ok(f);
+                    break;
+                }
             }
         }
-        Ok(Flow::Normal)
+        self.hoisted.truncate(hbase);
+        r
     }
 
     fn stmt(&mut self, env: u32, s: &Stmt) -> Result<Flow, JsError> {
@@ -1847,10 +2041,15 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::FnDecl(def) => {
-                // Direct members were already hoisted; (re)declaring here
-                // is a harmless overwrite - and it covers single-statement
-                // positions (`if (x) function f(){}`) that no hoist pass
-                // visits. Mirror Annex-B into function scope when nested.
+                // Hoisted above (block entry or function entry): skip, so
+                // the declaration materializes exactly once - recreating
+                // would orphan the prototype installed between (Babel
+                // _inherits' `n.prototype`). Unvisited positions (nested
+                // blocks no pass reaches... in practice always visited)
+                // still declare on execution, with the Annex-B mirror.
+                if self.hoisted.contains(&(Rc::as_ptr(def) as *const FnDef)) {
+                    return Ok(Flow::Normal);
+                }
                 let f = self.func_obj(def.clone(), env)?;
                 if let Some(n) = &def.name {
                     self.env_declare(env, n, Value::Obj(f));
@@ -2094,6 +2293,7 @@ impl Interp {
                 }
                 Stmt::FnDecl(def) => {
                     if let Some(n) = &def.name {
+                        self.hoisted.push(Rc::as_ptr(def));
                         let f = self.func_obj(def.clone(), fenv)?;
                         self.env_declare(fenv, n, Value::Obj(f));
                     }
@@ -2346,9 +2546,11 @@ impl Interp {
                     keys.extend((0..elems.len()).map(|i| i.to_string()));
                     keys.extend(pairs.iter().map(|(k, _)| k.clone()));
                 }
+                Obj::Promise { pairs, .. } => {
+                    keys.extend(pairs.iter().map(|(k, _)| k.clone()));
+                }
                 Obj::RegExp { .. }
-                | Obj::Promise(_)
-                | Obj::Dom(_)
+                | Obj::Dom { .. }
                 | Obj::Style { .. }
                 | Obj::Accessor { .. }
                 | Obj::Symbol { .. }
@@ -2497,6 +2699,16 @@ impl Interp {
             Expr::Call(c, args) => self.call(env, c, args),
             Expr::Member(o, name) => {
                 let v = self.expr(env, o)?;
+                if matches!(v, Value::Null | Value::Undef)
+                    && std::env::var_os("VIGIA_JSENVDUMP").is_some()
+                {
+                    self.dump_envs(env);
+                    let dbg = format!("{o:?}");
+                    eprintln!(
+                        "js? .{name} of nullish from {:.300}",
+                        dbg.chars().take(300).collect::<String>()
+                    );
+                }
                 self.recv_get(v, name)
             }
             Expr::Regex { pat, flags } => make_regexp(self, pat, flags),
@@ -2514,6 +2726,16 @@ impl Interp {
             Expr::Index(o, ix) => {
                 let v = self.expr(env, o)?;
                 let k = self.expr(env, ix)?;
+                if matches!(v, Value::Null | Value::Undef)
+                    && std::env::var_os("VIGIA_JSENVDUMP").is_some()
+                {
+                    self.dump_envs(env);
+                    let dbg = format!("{o:?}[{:?}]", ix);
+                    eprintln!(
+                        "js? index of nullish from {:.300}",
+                        dbg.chars().take(300).collect::<String>()
+                    );
+                }
                 self.recv_get_idx(v, k)
             }
             Expr::Func(def) => Ok(Value::Obj(self.func_obj(def.clone(), env)?)),
@@ -2648,11 +2870,11 @@ impl Interp {
                         // async fn's own rejection, not an unhandled one
                         self.handled_promises.insert(pid);
                         match self.heap.obj(pid) {
-                            Obj::Promise(PromiseState::Fulfilled(u)) => Ok(*u),
+                            Obj::Promise { st: PromiseState::Fulfilled(u), .. } => Ok(*u),
                             // the reason value itself is thrown, so a
                             // try/catch around the await sees it verbatim
-                            Obj::Promise(PromiseState::Rejected(r)) => Err(JsError::Throw(*r)),
-                            Obj::Promise(PromiseState::Pending { .. }) => {
+                            Obj::Promise { st: PromiseState::Rejected(r), .. } => Err(JsError::Throw(*r)),
+                            Obj::Promise { st: PromiseState::Pending { .. }, .. } => {
                                 Err(err("await on pending promise (vigia settles fetch/timer \
                                  eagerly; pending awaits unsupported)"))
                             }
@@ -2699,6 +2921,15 @@ impl Interp {
 
     fn delete_key(&mut self, t: Value, key: &str, kval: Option<Value>) -> Result<Value, JsError> {
         match t {
+            // `delete window.x` drops the live global (and any snapshot
+            // leftover from the set_dom seeding).
+            Value::Obj(id) if Some(id) == self.wind => {
+                self.envs[0].vars.remove(key);
+                if let Obj::Ordinary { pairs, .. } = self.heap.obj_mut(id) {
+                    pairs.retain(|(k, _)| k != key);
+                }
+                Ok(Value::Bool(true))
+            }
             Value::Obj(id) if matches!(self.heap.obj(id), Obj::Proxy { .. }) => {
                 self.proxy_delete(id, key, kval)
             }
@@ -2708,6 +2939,12 @@ impl Interp {
                     | Obj::Func { pairs, .. }
                     | Obj::Native { pairs, .. } = self.heap.obj_mut(id)
                     {
+                        pairs.retain(|(k, _)| k != key);
+                    }
+                    Ok(Value::Bool(true))
+                }
+                Obj::Promise { .. } => {
+                    if let Obj::Promise { pairs, .. } = self.heap.obj_mut(id) {
                         pairs.retain(|(k, _)| k != key);
                     }
                     Ok(Value::Bool(true))
@@ -2737,7 +2974,7 @@ impl Interp {
                     }
                     Ok(Value::Bool(true))
                 }
-                Obj::Dom(n) => {
+                Obj::Dom { node: n, .. } => {
                     let n = *n;
                     // Attribute-mapped props drop the attribute; expando
                     // keys were never stored, so nothing to do.
@@ -2829,6 +3066,17 @@ impl Interp {
             _ => {
                 let lv = self.expr(env, l)?;
                 let rv = self.expr(env, r)?;
+                if *op == *"instanceof"
+                    && !matches!(rv, Value::Obj(_))
+                    && std::env::var_os("VIGIA_JSENVDUMP").is_some()
+                {
+                    self.dump_envs(env);
+                    eprintln!(
+                        "js? instanceof rhs from {:.250} (lhs {:.120})",
+                        format!("{r:?}").chars().take(250).collect::<String>(),
+                        format!("{l:?}").chars().take(120).collect::<String>()
+                    );
+                }
                 self.apply_bin(op, lv, rv)
             }
         }
@@ -2875,6 +3123,12 @@ impl Interp {
                     {
                         Value::Bool(self.proxy_has(id, &key)?)
                     }
+                    // `in window` sees live globals too (field borrows:
+                    // envs/protos are disjoint from the heap borrow h).
+                    Value::Obj(id) if Some(id) == self.wind => Value::Bool(
+                        self.envs[0].vars.get(&key).is_some()
+                            || has_prop(h, &self.protos, r, &key),
+                    ),
                     Value::Obj(_) => Value::Bool(has_prop(h, &self.protos, r, &key)),
                     _ => return Err(err("'in' needs an object on the right")),
                 }
@@ -2888,7 +3142,12 @@ impl Interp {
                     {
                         get_prop(h, &self.protos, r, "prototype")?
                     }
-                    _ => return Err(err("instanceof: right side is not a function")),
+                    _ => {
+                        return Err(self.err_chain(format!(
+                            "instanceof: {} is not a function",
+                            self.inspect(r).chars().take(60).collect::<String>()
+                        )));
+                    }
                 };
                 let Value::Obj(tid) = target else {
                     return Ok(Value::Bool(false));
@@ -3223,9 +3482,9 @@ impl Interp {
                 Obj::Ordinary { pairs, .. }
                 | Obj::Func { pairs, .. }
                 | Obj::Native { pairs, .. } => Ok(pairs.clone()),
+                Obj::Promise { pairs, .. } => Ok(pairs.clone()),
                 Obj::RegExp { .. }
-                | Obj::Promise(_)
-                | Obj::Dom(_)
+                | Obj::Dom { .. }
                 | Obj::Style { .. }
                 | Obj::Accessor { .. }
                 | Obj::Symbol { .. }
@@ -3238,6 +3497,30 @@ impl Interp {
                 | Obj::Freed => Ok(vec![]),
                 }
             }
+        }
+    }
+
+    /// Trace aid: one-line value description (setProto logging).
+    fn describe(&self, v: Value) -> String {
+        match v {
+            Value::Obj(id) => match self.heap.obj(id) {
+                Obj::Func { def, .. } => {
+                    format!("fn:{}#{}", def.name.clone().unwrap_or_else(|| "?".into()), id)
+                }
+                Obj::Native { name, .. } => format!("nat:{name}#{id}"),
+                Obj::Ordinary { .. } => format!("ordinary#{id}"),
+                Obj::Arr { .. } => format!("array#{id}"),
+                _ => format!("obj#{id}"),
+            },
+            _ => self.inspect(v),
+        }
+    }
+
+    /// Trace aid: proto slot description.
+    fn describe_any_proto(&self, p: Option<u32>) -> String {
+        match p {
+            Some(id) => self.describe(Value::Obj(id)),
+            None => "null".into(),
         }
     }
 
@@ -3320,6 +3603,17 @@ impl Interp {
                 if let Some(n) = self.as_node(recv) {
                     return self.call_dom(n, name, env, arg_es);
                 }
+                // Window event methods (addEventListener & co live on no
+                // node): route to the sentinel registry, else fall through
+                // to ordinary property lookup below.
+                if let Value::Obj(id) = recv {
+                    if Some(id) == self.wind {
+                        let args = self.eval_args(env, arg_es)?;
+                        if let Some(v) = self.event_method(WIN_EVENTS, name, &args)? {
+                            return Ok(v);
+                        }
+                    }
+                }
                 // proto chains resolve string/array/etc methods to Natives;
                 // `this` = the receiver. Getters apply like a plain read.
                 (
@@ -3336,7 +3630,7 @@ impl Interp {
                 let recv = self.expr(env, o)?;
                 let k = self.expr(env, ix)?;
                 if let (Value::Obj(id), Value::Str(s)) = (recv, k) {
-                    if let Obj::Dom(n) = self.heap.obj(id) {
+                    if let Obj::Dom { node: n, .. } = self.heap.obj(id) {
                         let (n, m) = (*n, self.heap.get_str(s).to_string());
                         return self.call_dom(n, &m, env, arg_es);
                     }
@@ -3352,8 +3646,7 @@ impl Interp {
                     None,
                 )
             }
-            Expr::Ident(n) => (self.expr(env, callee)?, Value::Undef, Some(n.as_str())),
-            Expr::SuperProp(k) => {
+            Expr::Ident(n) => (self.expr(env, callee)?, Value::Undef, Some(n.as_str())),            Expr::SuperProp(k) => {
                 let sup = self
                     .super_stack
                     .last()
@@ -3384,11 +3677,25 @@ impl Interp {
         };
         // Trace aid: what non-function value sits in callee position.
         if std::env::var_os("VIGIA_JSTRACE").is_some() && !matches!(f, Value::Obj(_)) {
+            let dbg = format!("{callee:?}");
             eprintln!(
-                "js? callee {:?} holds {}",
+                "js? callee {:?} holds {} from {:.200} (this {})",
                 hint.unwrap_or("?"),
-                self.inspect(f)
+                self.inspect(f),
+                dbg.chars().take(200).collect::<String>(),
+                self.inspect(this)
             );
+            // Innermost function's body: shows the call site + guard.
+            if let Some(&fid) = self.js_stack.last() {
+                if let Obj::Func { def, .. } = self.heap.obj(fid) {
+                    let bdbg = format!("{:?}", def.body);
+                    eprintln!(
+                        "js? body {:.1200}",
+                        bdbg.chars().take(1200).collect::<String>()
+                    );
+                }
+            }
+            self.dump_envs(env);
         }
         if let Value::Obj(id) = f {
             if let Obj::Func { def, .. } = self.heap.obj(id) {
@@ -3559,6 +3866,8 @@ impl Interp {
                 let sup = self.func_super(id);
                 // Hoist `var`s (as undefined) and nested function
                 // declarations before params: defaults may read them.
+                // Truncated with the rest below (hoisted-list discipline).
+                let hbase = self.hoisted.len();
                 self.hoist_vars(&def.body, cenv)?;
                 for (i, (p, d)) in def.params.iter().enumerate() {
                     let mut v = args.get(i).copied().unwrap_or(Value::Undef);
@@ -3661,6 +3970,7 @@ impl Interp {
                 self.js_stack.pop();
                 self.fn_async = prev_async;
                 self.func_env = prev_fenv;
+                self.hoisted.truncate(hbase);
                 (def.is_async, r)
             }
             C::Nat(nf) => {
@@ -3782,6 +4092,12 @@ fn n_console_log(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value,
     it.out.push_str(&line);
     it.out.push('\n');
     Ok(Value::Undef)
+}
+
+/// console.error/warn/info/debug: same sink as log (no stderr split -
+/// the harness reads `out` for diagnostics).
+fn n_console_diag(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    n_console_log(it, Value::Undef, args)
 }
 
 fn n_json_parse(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
@@ -4000,7 +4316,7 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
                     .map(|v| val_to_json(h, *v, depth + 1))
                     .collect::<Result<_, JsError>>()?,
             ),
-            Obj::Func { .. } | Obj::Native { .. } | Obj::Dom(_) | Obj::Promise(_) | Obj::Freed => {
+            Obj::Func { .. } | Obj::Native { .. } | Obj::Dom { .. } | Obj::Promise { .. } | Obj::Freed => {
                 Json::Null
             }
             Obj::RegExp { .. } => Json::Obj(vec![]),
@@ -4119,8 +4435,8 @@ fn n_obj_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
         Value::Obj(id) => match it.heap.obj(id) {
             Obj::Arr { .. } => "[object Array]",
             Obj::Func { .. } | Obj::Native { .. } => "[object Function]",
-            Obj::Dom(_) => "[object Node]",
-            Obj::Promise(_) => "[object Promise]",
+            Obj::Dom { .. } => "[object Node]",
+            Obj::Promise { .. } => "[object Promise]",
             Obj::RegExp { .. } => "[object RegExp]",
             Obj::Accessor { .. } => "[object Accessor]",
             Obj::Symbol { .. } => "[object Symbol]",
@@ -4185,8 +4501,8 @@ fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
                 out.extend(pairs.iter().cloned());
                 out
             }
-            Obj::Dom(_)
-            | Obj::Promise(_)
+            Obj::Promise { pairs, .. } => pairs.clone(),
+            Obj::Dom { .. }
             | Obj::RegExp { .. }
             | Obj::Style { .. }
             | Obj::Accessor { .. }
@@ -4247,10 +4563,18 @@ fn n_obj_create(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, 
         Value::Null => None,
         _ => return Err(err("create: proto must be an object or null")),
     };
-    Ok(Value::Obj(it.heap.alloc_obj(Obj::Ordinary {
+    let obj = Value::Obj(it.heap.alloc_obj(Obj::Ordinary {
         pairs: vec![],
         proto,
-    })?))
+    })?);
+    // Optional descriptors ({key: {value/get/set,...}}) install like
+    // defineProperty each (Babel _inherits' constructor backlink).
+    if let Value::Obj(_) = arg(args, 1) {
+        for (k, d) in own_pairs(&it.heap, arg(args, 1)) {
+            define_one(it, obj, &k, d)?;
+        }
+    }
+    Ok(obj)
 }
 
 /// Object.freeze(o): no-op that returns the object (nothing enforces
@@ -4379,6 +4703,9 @@ fn describe_own(it: &mut Interp, target: Value, key: &str) -> Result<Value, JsEr
     let found = match target {
         Value::Obj(id) => match it.heap.obj(id) {
             Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
+                pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+            }
+            Obj::Promise { pairs, .. } => {
                 pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
             }
             Obj::Arr { items, pairs, .. } => {
@@ -4522,6 +4849,9 @@ fn n_obj_set_proto(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Valu
         Value::Null => None,
         _ => return Err(err("setPrototypeOf: proto must be an object or null")),
     };
+    if std::env::var_os("VIGIA_JSTRACE").is_some() {
+        eprintln!("js? setProto {} -> {}", it.describe(target), it.describe_any_proto(proto));
+    }
     let Value::Obj(id) = target else {
         return Err(err("setPrototypeOf: target must be an object"));
     };
@@ -5465,6 +5795,50 @@ fn n_date(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError
 fn n_date_now(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
     let _ = it;
     Ok(Value::Num(now_ms()))
+}
+
+/// days since epoch from y/m/d (Hinnant days_from_civil, inverse of civil).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = ((m as i64 + 9) % 12) as i64;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Date.UTC(y, m0, d=1, h=0, min=0, s=0, ms=0): month is 0-based,
+/// years 0-99 map to 1900+y, out-of-range fields overflow like V8.
+fn n_date_utc(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let num = |i: usize, dflt: f64| match arg(args, i) {
+        Value::Undef => dflt,
+        v => to_num(&it.heap, v),
+    };
+    if matches!(arg(args, 0), Value::Undef) {
+        return Ok(Value::Num(f64::NAN));
+    }
+    // Non-finite components poison the whole computation (V8 parity).
+    for i in 0..7 {
+        if !matches!(arg(args, i), Value::Undef) && !to_num(&it.heap, arg(args, i)).is_finite() {
+            return Ok(Value::Num(f64::NAN));
+        }
+    }
+    let mut y = num(0, 0.0).trunc() as i64;
+    if (0..=99).contains(&y) {
+        y += 1900;
+    }
+    // Month overflow folds into the year before the civil conversion.
+    let m = num(1, 0.0).trunc() as i64;
+    let y = y + m.div_euclid(12);
+    let mo = (m.rem_euclid(12) + 1) as u32;
+    let ms = num(6, 0.0)
+        + 1000.0 * num(5, 0.0)
+        + 60_000.0 * num(4, 0.0)
+        + 3_600_000.0 * num(3, 0.0)
+        + 86_400_000.0 * (num(2, 1.0) - 1.0)
+        + 86_400_000.0 * days_from_civil(y, mo, 1) as f64;
+    Ok(Value::Num(ms))
 }
 
 // -- URL -----------------------------------------------------------------------------
@@ -7435,7 +7809,26 @@ fn n_reflect_construct(it: &mut Interp, _this: Value, args: &[Value]) -> Result<
         Value::Undef => Vec::new(),
         _ => return Err(err("Reflect.construct needs an argument list")),
     };
-    it.construct_value(arg(args, 0), &argv)
+    let target = arg(args, 0);
+    // newTarget (Babel _createSuper's native path): `this` gets
+    // newTarget.prototype while the target ctor runs on it.
+    if matches!(arg(args, 2), Value::Undef) {
+        return it.construct_value(target, &argv);
+    }
+    let nt = arg(args, 2);
+    let proto = match get_prop(&it.heap, &it.protos, nt, "prototype")? {
+        Value::Obj(p) => Some(p),
+        _ => po(it.protos.object),
+    };
+    let obj = it.heap.alloc_obj(Obj::Ordinary {
+        pairs: Vec::new(),
+        proto,
+    })?;
+    let r = it.call_value(target, Value::Obj(obj), &argv, None)?;
+    Ok(match r {
+        Value::Obj(_) => r,
+        _ => Value::Obj(obj),
+    })
 }
 
 fn n_reflect_apply(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
@@ -7819,6 +8212,74 @@ fn n_math_trunc(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsE
     Ok(Value::Num(to_num(&it.heap, arg(args, 0)).trunc()))
 }
 
+/// One-arg float ops straight through Rust (same IEEE results as V8).
+macro_rules! math_unary {
+    ($name:ident, $meth:ident) => {
+        fn $name(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+            Ok(Value::Num(to_num(&it.heap, arg(args, 0)).$meth()))
+        }
+    };
+}
+math_unary!(n_math_sin, sin);
+math_unary!(n_math_cos, cos);
+math_unary!(n_math_tan, tan);
+math_unary!(n_math_asin, asin);
+math_unary!(n_math_acos, acos);
+math_unary!(n_math_atan, atan);
+math_unary!(n_math_sinh, sinh);
+math_unary!(n_math_cosh, cosh);
+math_unary!(n_math_tanh, tanh);
+math_unary!(n_math_exp, exp);
+math_unary!(n_math_log, ln);
+math_unary!(n_math_cbrt, cbrt);
+
+fn n_math_atan2(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(
+        to_num(&it.heap, arg(args, 0)).atan2(to_num(&it.heap, arg(args, 1))),
+    ))
+}
+
+fn n_math_hypot(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    // Naive sum-of-squares (overflowBalanced paths are a gap - V8 avoids
+    // intermediate overflow; bundles use modest magnitudes).
+    let mut acc = 0.0;
+    for a in args {
+        let n = to_num(&it.heap, *a);
+        acc += n * n;
+    }
+    Ok(Value::Num(acc.sqrt()))
+}
+
+fn n_math_sign(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = to_num(&it.heap, arg(args, 0));
+    Ok(Value::Num(if n.is_nan() {
+        f64::NAN
+    } else if n == 0.0 {
+        n // ±0 preserved
+    } else if n > 0.0 {
+        1.0
+    } else {
+        -1.0
+    }))
+}
+
+fn n_math_clz32(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    // ToUint32 then leading zeros (NaN/Infinity -> 32 via the zero word).
+    let n = to_num(&it.heap, arg(args, 0)).trunc();
+    let u = if !n.is_finite() {
+        0u32
+    } else {
+        (((n % 4294967296.0) + 4294967296.0) % 4294967296.0) as u32
+    };
+    Ok(Value::Num(u.leading_zeros() as f64))
+}
+
+fn n_math_imul(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    let a = to_i32(&it.heap, arg(args, 0));
+    let b = to_i32(&it.heap, arg(args, 1));
+    Ok(Value::Num(a.wrapping_mul(b) as f64))
+}
+
 // -- base64 globals ---------------------------------------------------------------
 // atob/btoa over Latin-1 strings (browser parity: whitespace stripped,
 // missing padding tolerated, bad chars throw).
@@ -7832,6 +8293,12 @@ fn b64_val(c: u8) -> Option<u8> {
         b'/' => Some(63),
         _ => None,
     }
+}
+
+/// DOM interface ctors (Element, Node, ...): V8 throws on `new`
+/// ("Illegal constructor") - only instanceof/prototype use them here.
+fn n_dom_illegal(_it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    Err(err("Illegal constructor"))
 }
 
 /// `Function(p1, .., pn, body)` / `new Function(...)`: params and body
@@ -7930,15 +8397,18 @@ fn n_btoa(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsErro
 
 /// Fresh pending promise.
 fn promise_new(it: &mut Interp) -> Result<u32, JsError> {
-    it.heap.alloc_obj(Obj::Promise(PromiseState::Pending {
-        handlers: Vec::new(),
-    }))
+    it.heap.alloc_obj(Obj::Promise {
+        st: PromiseState::Pending {
+            handlers: Vec::new(),
+        },
+        pairs: Vec::new(),
+    })
 }
 
 /// Heap id if `v` is a Promise.
 fn as_promise(it: &Interp, v: Value) -> Option<u32> {
     match v {
-        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Promise(_)) => Some(id),
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Promise { .. }) => Some(id),
         _ => None,
     }
 }
@@ -7977,7 +8447,7 @@ impl Interp {
     /// an already-settled promise.
     pub(crate) fn promise_settle(&mut self, id: u32, rejecting: bool, v: Value) {
         let st = match self.heap.obj_mut(id) {
-            Obj::Promise(st) => st,
+            Obj::Promise { st, .. } => st,
             _ => return,
         };
         if !matches!(st, PromiseState::Pending { .. }) {
@@ -8027,15 +8497,15 @@ impl Interp {
             Subscribe,
         }
         let act = match self.heap.obj(pid) {
-            Obj::Promise(PromiseState::Fulfilled(u)) => Adopt::Fulfill(*u),
-            Obj::Promise(PromiseState::Rejected(r)) => Adopt::Reject(*r),
+            Obj::Promise { st: PromiseState::Fulfilled(u), .. } => Adopt::Fulfill(*u),
+            Obj::Promise { st: PromiseState::Rejected(r), .. } => Adopt::Reject(*r),
             _ => Adopt::Subscribe,
         };
         match act {
             Adopt::Fulfill(u) => self.promise_settle(id, false, u),
             Adopt::Reject(r) => self.promise_settle(id, true, r),
             Adopt::Subscribe => {
-                if let Obj::Promise(PromiseState::Pending { handlers }) = self.heap.obj_mut(pid) {
+                if let Obj::Promise { st: PromiseState::Pending { handlers }, .. } = self.heap.obj_mut(pid) {
                     handlers.push(ThenHandler {
                         on_fulfill: None,
                         on_reject: None,
@@ -8062,14 +8532,14 @@ impl Interp {
             Rej(Value),
         }
         let s = match self.heap.obj(id) {
-            Obj::Promise(PromiseState::Pending { .. }) => S::Pend,
-            Obj::Promise(PromiseState::Fulfilled(v)) => S::Ful(*v),
-            Obj::Promise(PromiseState::Rejected(r)) => S::Rej(*r),
+            Obj::Promise { st: PromiseState::Pending { .. }, .. } => S::Pend,
+            Obj::Promise { st: PromiseState::Fulfilled(v), .. } => S::Ful(*v),
+            Obj::Promise { st: PromiseState::Rejected(r), .. } => S::Rej(*r),
             _ => S::Pend,
         };
         match s {
             S::Pend => {
-                if let Obj::Promise(PromiseState::Pending { handlers }) = self.heap.obj_mut(id) {
+                if let Obj::Promise { st: PromiseState::Pending { handlers }, .. } = self.heap.obj_mut(id) {
                     handlers.push(ThenHandler {
                         on_fulfill,
                         on_reject,
@@ -8192,7 +8662,7 @@ impl Interp {
         }
         let mut unhandled = Vec::new();
         for i in 0..self.heap.objs.len() as u32 {
-            if let Obj::Promise(PromiseState::Rejected(r)) = self.heap.obj(i) {
+            if let Obj::Promise { st: PromiseState::Rejected(r), .. } = self.heap.obj(i) {
                 if !self.handled_promises.contains(&i) {
                     unhandled.push((i, *r));
                 }
@@ -8216,7 +8686,7 @@ fn bound_prop(it: &Interp, key: &str) -> Result<Value, JsError> {
 
 fn bound_promise(it: &Interp) -> Result<u32, JsError> {
     match bound_prop(it, "__p")? {
-        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Promise(_)) => Ok(id),
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Promise { .. }) => Ok(id),
         _ => Err(err("promise resolver detached")),
     }
 }
@@ -8311,7 +8781,7 @@ fn n_promise_finally(it: &mut Interp, this: Value, args: &[Value]) -> Result<Val
 /// True when `v` is a rejected promise (finally wrappers check f's return).
 fn is_rejected_promise(it: &Interp, v: Value) -> bool {
     matches!(v, Value::Obj(id)
-        if matches!(it.heap.obj(id), Obj::Promise(PromiseState::Rejected(_))))
+        if matches!(it.heap.obj(id), Obj::Promise { st: PromiseState::Rejected(_), .. }))
 }
 
 /// finally on the fulfill path: run f, keep the original value unless f
@@ -8380,8 +8850,8 @@ fn array_items(it: &Interp, v: Value, who: &str) -> Result<Vec<Value>, JsError> 
 /// A promise's immediate state: Some((rejecting, value)) when settled.
 fn settled_state(it: &Interp, pid: u32) -> Option<(bool, Value)> {
     match it.heap.obj(pid) {
-        Obj::Promise(PromiseState::Fulfilled(v)) => Some((false, *v)),
-        Obj::Promise(PromiseState::Rejected(r)) => Some((true, *r)),
+        Obj::Promise { st: PromiseState::Fulfilled(v), .. } => Some((false, *v)),
+        Obj::Promise { st: PromiseState::Rejected(r), .. } => Some((true, *r)),
         _ => None,
     }
 }
@@ -8396,7 +8866,7 @@ fn subscribe_pending(
     next: u32,
 ) {
     it.handled_promises.insert(pid);
-    if let Obj::Promise(PromiseState::Pending { handlers }) = it.heap.obj_mut(pid) {
+    if let Obj::Promise { st: PromiseState::Pending { handlers }, .. } = it.heap.obj_mut(pid) {
         handlers.push(ThenHandler {
             on_fulfill,
             on_reject,
@@ -8824,6 +9294,42 @@ mod tests {
     }
 
     #[test]
+    fn promise_expandos() {
+        // Deferred pattern (i18next): resolve/reject live on the promise.
+        assert_eq!(
+            disp("function defer(){var e,t,n=new Promise(function(a,b){e=a;t=b});n.resolve=e;n.reject=t;return n}\
+                  var d=defer();typeof d.resolve+'|'+typeof d.reject"),
+            "function|function"
+        );
+        assert_eq!(
+            disp("function defer(){var e,n=new Promise(function(a){e=a});n.resolve=e;return n}\
+                  var d=defer();d.resolve(42);d instanceof Promise"),
+            "true"
+        );
+        assert_eq!(disp("var p=new Promise(function(){});p.x=1;p.x"), "1");
+        assert_eq!(disp("var p=new Promise(function(){});p.x=1;Object.keys(p).join()"), "x");
+        assert_eq!(disp("var p=new Promise(function(){});p.x=1;delete p.x;('x' in p)"), "false");
+    }
+
+    #[test]
+    fn fndecl_identity() {
+        // A declaration materializes once per entry: later mutations of
+        // the prototype are visible through the same binding (Babel
+        // _inherits shape: prototype replaced between def and use).
+        assert_eq!(
+            disp("function N(){}N.prototype=Object.create({},{});\
+                  Object.defineProperty(N,'prototype',{writable:false});\
+                  Object.defineProperty(N.prototype,'use',{value:function(){return 7}});\
+                  var zA=new N();zA.use()"),
+            "7"
+        );
+        // Two declarations, last wins, no resurrection of the first.
+        assert_eq!(disp("function f(){return 1}function f(){return 2}f()"), "2");
+        // Identity is stable across the hoist/execute boundary.
+        assert_eq!(disp("function f(){};var g=f;g===f"), "true");
+    }
+
+    #[test]
     fn var_hoisting() {
         // `var` reads undefined before its statement (function scope).
         assert_eq!(disp("var r=typeof v;var v=1;r"), "undefined");
@@ -8942,7 +9448,11 @@ mod tests {
         assert_eq!(disp("Reflect.ownKeys({a:1}).join()"), "a");
         assert_eq!(disp("Reflect.apply(Math.max,null,[2,9])"), "9");
         assert_eq!(disp("function C(a){this.a=a}Reflect.construct(C,['z']).a"), "z");
-        // Reflect.get honors the get trap.
+        // newTarget: proto comes from it while the target ctor runs.
+        assert_eq!(
+            disp("function P(){this.p=1}function C(){}C.prototype={};var o=Reflect.construct(P,[],C);(o instanceof C)+'|'+o.p"),
+            "true|1"
+        );        // Reflect.get honors the get trap.
         assert_eq!(
             disp("Reflect.get(new Proxy({x:1},{get:(o,k)=>42}),'x')"),
             "42"
@@ -9056,6 +9566,46 @@ mod tests {
     }
 
     #[test]
+    fn date_utc() {
+        assert_eq!(disp("Date.UTC(2024,0,15)"), "1705276800000");
+        assert_eq!(disp("Date.UTC(99,0)"), "915148800000");
+        assert_eq!(disp("Date.UTC(2024,0,15,12,30,45,123)"), "1705321845123");
+        assert_eq!(disp("Date.UTC(1970,0,1)"), "0");
+        assert_eq!(disp("Date.UTC(2024,5)"), "1717200000000");
+        assert_eq!(disp("Date.UTC(2023,12)"), "1704067200000");
+        assert_eq!(disp("Date.UTC(2024,-1,1)"), "1701388800000");
+        assert_eq!(disp("isNaN(Date.UTC())"), "true");
+        assert_eq!(disp("isNaN(Date.UTC(NaN))"), "true");
+    }
+
+    #[test]
+    fn console_levels() {
+        assert_eq!(out("console.error('e');console.warn('w');console.info('i');console.debug('d')"), "e\nw\ni\nd\n");
+        assert_eq!(out("console.error()"), "\n");
+    }
+
+    #[test]
+    fn math_full() {
+        assert_eq!(disp("Math.sin(0)"), "0");
+        assert_eq!(disp("Math.cos(0)"), "1");
+        assert_eq!(disp("Math.atan2(1,1)"), "0.7853981633974483");
+        assert_eq!(disp("Math.exp(0)"), "1");
+        assert_eq!(disp("Math.log(Math.E)"), "1");
+        assert_eq!(disp("Math.cbrt(27)"), "3");
+        assert_eq!(disp("Math.hypot(3,4)"), "5");
+        assert_eq!(disp("Math.sign(-3)"), "-1");
+        assert_eq!(disp("Math.clz32(0)"), "32");
+        assert_eq!(disp("Math.clz32(1)"), "31");
+        assert_eq!(disp("Math.clz32(-1)"), "0");
+        assert_eq!(disp("Math.imul(2,4)"), "8");
+        assert_eq!(disp("Math.SQRT2"), "1.4142135623730951");
+        assert_eq!(disp("Math.LN2"), "0.6931471805599453");
+        assert_eq!(disp("Math.LOG2E"), "1.4426950408889634");
+        // The scheduler fallback that motivated this batch.
+        assert_eq!(disp("var st=Math.log,lt=Math.LN2;(function(e){return e>>>=0,0===e?32:31-(st(e)/lt|0)|0})(1)"), "31");
+    }
+
+    #[test]
     fn math_extra() {
         assert_eq!(disp("Math.fround(0.1)===new Float32Array([0.1])[0]"), "true");
         assert_eq!(disp("Math.trunc(3.7)"), "3");
@@ -9108,6 +9658,25 @@ mod tests {
     }
 
     #[test]
+    fn create_with_descriptors() {
+        // Babel _inherits shape: constructor backlink + proto link.
+        assert_eq!(
+            disp("function X(){ }function N(){ }\
+                  N.prototype=Object.create(X.prototype,{constructor:{value:N}});\
+                  N.prototype.constructor===N"),
+            "true"
+        );
+        assert_eq!(
+            disp("function X(){ }function N(){ }\
+                  N.prototype=Object.create(X.prototype,{constructor:{value:N}});\
+                  Object.getPrototypeOf(N.prototype)===X.prototype"),
+            "true"
+        );
+        assert_eq!(disp("var o=Object.create(null);Object.getPrototypeOf(o)"), "null");
+        assert_eq!(disp("var o=Object.create({a:1},{b:{value:2}});o.a+'|'+o.b"), "1|2");
+    }
+
+    #[test]
     fn object_proto_extras() {
         assert_eq!(disp("Object.prototype.isPrototypeOf.call(Array.prototype, [])"), "true");
         assert_eq!(disp("Object.prototype.isPrototypeOf.call({}, [])"), "false");
@@ -9117,6 +9686,17 @@ mod tests {
         assert_eq!(disp("({}).propertyIsEnumerable('x')"), "false");
         assert_eq!(disp("(5).valueOf()"), "5");
         assert_eq!(disp("({a:1}).valueOf().a"), "1");
+    }
+
+    #[test]
+    fn array_expando_index() {
+        // Non-canonical writes are named props, never errors (V8 parity).
+        assert_eq!(disp("var a=[1];a['x']=9;a.x"), "9");
+        assert_eq!(disp("var a=[1];a[-1]=9;a['-1']"), "9");
+        assert_eq!(disp("var a=[1];a[1.5]=9;a['1.5']"), "9");
+        assert_eq!(disp("var a=[1];a['1']=9;a[1]"), "9");
+        assert_eq!(disp("var a=[];a[3]=7;a.length"), "4");
+        assert_eq!(disp("var a=[1];a[1e15]=2;a.length"), "1");
     }
 
     #[test]
@@ -9784,7 +10364,7 @@ mod tests {
     #[test]
     fn limits() {
         // heap cap: concat allocates a fresh slot per iteration
-        let mut it = Interp::with_cap(192);
+        let mut it = Interp::with_cap(20);
         let e = it.run("var s='a';while(1){s=s+s}").unwrap_err();
         assert!(e.to_string().contains("heap cap"), "{e}");
         // step limit
@@ -10050,7 +10630,9 @@ mod tests {
         // tight heap: proto/builtin installs hit the cap and skip; plain
         // own-prop objects still work. The cap tracks the install
         // footprint - every new builtin moves it, update deliberately.
-        let mut it = Interp::with_cap(196);
+        // (300 since the DOM interface batch; the edge is jagged - some
+        // lower values pass alone but not reliably, so keep margin.)
+        let mut it = Interp::with_cap(300);
         assert_eq!(it.run("var o={a:1};o.a").unwrap(), Value::Num(1.0));
     }
 

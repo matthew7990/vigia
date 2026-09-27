@@ -97,22 +97,29 @@ impl Marker {
                             self.val(*v);
                         }
                     }
-                    Obj::Promise(st) => match st {
-                        PromiseState::Pending { handlers } => {
-                            for h in handlers {
-                                if let Some(v) = h.on_fulfill {
-                                    self.val(v);
-                                }
-                                if let Some(v) = h.on_reject {
-                                    self.val(v);
-                                }
-                                if h.next != u32::MAX {
-                                    self.ow.push(h.next);
+                    Obj::Promise { st, pairs, .. } => {
+                        for (_, v) in pairs {
+                            self.val(*v);
+                        }
+                        match st {
+                            PromiseState::Pending { handlers } => {
+                                for h in handlers {
+                                    if let Some(v) = h.on_fulfill {
+                                        self.val(v);
+                                    }
+                                    if let Some(v) = h.on_reject {
+                                        self.val(v);
+                                    }
+                                    if h.next != u32::MAX {
+                                        self.ow.push(h.next);
+                                    }
                                 }
                             }
+                            PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => {
+                                self.val(*v)
+                            }
                         }
-                        PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => self.val(*v),
-                    },
+                    }
                     Obj::RegExp {
                         pat, flags, proto, ..
                     } => {
@@ -122,7 +129,12 @@ impl Marker {
                             self.ow.push(*p);
                         }
                     }
-                    Obj::Dom(_) | Obj::Style { .. } | Obj::Freed => {}
+                    Obj::Dom { proto, .. } => {
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
+                    Obj::Style { .. } | Obj::Freed => {}
                     Obj::Proxy { target, handler } => {
                         self.ow.push(*target);
                         self.ow.push(*handler);
@@ -331,6 +343,21 @@ impl Interp {
             self.protos.float64array,
             self.protos.textencoder,
             self.protos.textdecoder,
+            self.protos.dom_node,
+            self.protos.dom_element,
+            self.protos.dom_htmlelement,
+            self.protos.dom_document,
+            self.protos.dom_shadowroot,
+            self.protos.dom_documentfragment,
+            self.protos.dom_input,
+            self.protos.dom_form,
+            self.protos.dom_select,
+            self.protos.dom_textarea,
+            self.protos.dom_button,
+            self.protos.dom_anchor,
+            self.protos.dom_image,
+            self.protos.dom_iframe,
+            self.protos.dom_svg,
         ] {
             if p != u32::MAX {
                 m.ow.push(p);
@@ -469,12 +496,18 @@ mod tests {
 
     #[test]
     fn timers_and_microtasks_are_roots() {
-        // Cap 1400 (~980 threshold over a ~119 baseline): the top-level
-        // churn forces a collection while the promise handler sits queued
-        // in microtasks; cb1's garbage then triggers another collection
-        // at the drain safepoint between timer callbacks. Order:
-        // microtasks first, then timers by deadline.
-        let mut it = Interp::with_cap(1400);
+        // Tight cap just above the install footprint (self-calibrating:
+        // new builtins move it automatically): the top-level churn forces
+        // a collection while the promise handler sits queued in
+        // microtasks; cb1's garbage then triggers another collection at
+        // the drain safepoint between timer callbacks. Order: microtasks
+        // first, then timers by deadline.
+        let mut it = Interp::with_cap(1_000_000);
+        it.run("0").unwrap();
+        // Headroom for the churn peak (historically ~1170 over install):
+        // tight enough that the 800+900 churn still forces collections,
+        // loose enough for the script's own allocs.
+        it.heap.cap = it.heap.live() + 1200;
         it.run(
             "var out=[];\
              Promise.resolve(9).then(function(v){out.push(v)});\

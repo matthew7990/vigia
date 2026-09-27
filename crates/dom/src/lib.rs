@@ -54,6 +54,9 @@ pub enum NodeData {
     Element(ElementData),
     Text(String),
     Comment(String),
+    /// Detached child list (document.createDocumentFragment): renders as
+    /// bare children; append/insert moves the children, not the node.
+    Fragment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +163,58 @@ impl Dom {
             children: Vec::new(),
             data: NodeData::Comment(text.to_string()),
         })
+    }
+
+    /// Create a detached fragment (document.createDocumentFragment).
+    pub fn fragment_node(&mut self) -> NodeId {
+        self.push(Node {
+            parent: None,
+            children: Vec::new(),
+            data: NodeData::Fragment,
+        })
+    }
+
+    /// Create a detached empty document (document.implementation
+    /// .createHTMLDocument): same arena, invisible to root-scoped
+    /// queries - subtree-scoped reads (body, querySelector) work on it.
+    pub fn document_node(&mut self) -> NodeId {
+        self.push(Node {
+            parent: None,
+            children: Vec::new(),
+            data: NodeData::Document,
+        })
+    }
+
+    /// Deep/shallow copy of one node (cloneNode): detached, same arena.
+    /// Attribute/tag ids are already interned, so Clone reuses them.
+    pub fn clone_node(&mut self, id: NodeId, deep: bool) -> NodeId {
+        let data = self.nodes[id as usize].data.clone();
+        let nid = self.push(Node {
+            parent: None,
+            children: Vec::new(),
+            data,
+        });
+        if deep {
+            let kids = self.nodes[id as usize].children.clone();
+            for k in kids {
+                self.clone_into(k, nid);
+            }
+        }
+        nid
+    }
+
+    fn clone_into(&mut self, src: NodeId, parent: NodeId) {
+        let data = self.nodes[src as usize].data.clone();
+        let nid = self.push(Node {
+            parent: Some(parent),
+            children: Vec::new(),
+            data,
+        });
+        self.nodes[parent as usize].children.push(nid);
+        let kids = self.nodes[src as usize].children.clone();
+        for k in kids {
+            self.clone_into(k, nid);
+        }
     }
 
     fn push(&mut self, node: Node) -> NodeId {
@@ -279,6 +334,13 @@ impl Dom {
             NodeData::Text(t) => self.text(dst_parent, t),
             NodeData::Comment(t) => self.comment(dst_parent, t),
             NodeData::Document => {}
+            // Fragments copy as bare children (adopting innerHTML that
+            // parsed into one never happens - wrapper is an Element).
+            NodeData::Fragment => {
+                for &c in src.children(src_id) {
+                    self.copy_subtree(src, c, dst_parent);
+                }
+            }
         }
     }
 }

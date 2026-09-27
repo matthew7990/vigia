@@ -11,7 +11,7 @@ use vigia_session::CookieJar;
 
 use crate::ast::{Expr, Stmt};
 use crate::eval::{get_prop, nat, set_prop, to_str, truthy};
-use crate::{err, Interp, JsError, NetCtx, Obj, PendingSubmit, Value};
+use crate::{err, po, Interp, JsError, NetCtx, Obj, PendingSubmit, Value};
 
 /// Same list as vigia-html: these never get a close tag when serializing.
 const VOID: &[&str] = &[
@@ -24,6 +24,19 @@ const VOID: &[&str] = &[
 fn first_tag(dom: &Dom, tag: &str) -> Option<NodeId> {
     (1..dom.nodes.len() as NodeId)
         .find(|&i| dom.tag_name(i) == Some(tag) && is_desc(dom, dom.root(), i))
+}
+
+/// First element with `tag` in `anc`'s subtree (for implementation-created
+/// documents living detached in the same arena).
+fn first_desc_tag(dom: &Dom, anc: NodeId, tag: &str) -> Option<NodeId> {
+    let mut stack = dom.children(anc).to_vec();
+    while let Some(n) = stack.pop() {
+        if dom.tag_name(n) == Some(tag) {
+            return Some(n);
+        }
+        stack.extend(dom.children(n).iter().copied());
+    }
+    None
 }
 
 /// First <html>, else the first element under the document root.
@@ -166,7 +179,7 @@ fn serialize_node(dom: &Dom, id: NodeId, out: &mut String) {
             out.push_str(t);
             out.push_str("-->");
         }
-        NodeData::Document => {
+        NodeData::Document | NodeData::Fragment => {
             for c in dom.children(id).to_vec() {
                 serialize_node(dom, c, out);
             }
@@ -180,6 +193,10 @@ fn serialize_into(dom: &Dom, id: NodeId, out: &mut String) {
         serialize_node(dom, c, out);
     }
 }
+
+/// Sentinel listener-map key for `window` (no arena node; must never
+/// reach dom.parent/dom_wrap - dispatch_window handles it separately).
+pub(crate) const WIN_EVENTS: NodeId = u32::MAX;
 
 impl Interp {
     /// Install `dom` plus the document/window/navigator/location globals.
@@ -202,10 +219,28 @@ impl Interp {
             return;
         };
         self.env_declare(0, "document", doc);
-        let (Ok(nav), Ok(loc)) = (
-            self.obj_pairs(vec![("userAgent".into(), Value::Str(ua))]),
+        // Navigator needs several strings; fallible pairs first, then the
+        // object (heap-cap edges skip the install silently, as elsewhere).
+        let nav_pairs: Result<Vec<(String, Value)>, JsError> = (|| {
+            let heap = &mut self.heap;
+            Ok(vec![
+                ("userAgent".into(), Value::Str(ua)),
+                (
+                    "appVersion".into(),
+                    Value::Str(heap.alloc_str("5.0 (X11; Linux x86_64)".into())?),
+                ),
+                ("platform".into(), Value::Str(heap.alloc_str("Linux x86_64".into())?)),
+                ("language".into(), Value::Str(heap.alloc_str("en-US".into())?)),
+                ("onLine".into(), Value::Bool(true)),
+            ])
+        })();
+        let (Ok(nav_pairs), Ok(loc)) = (
+            nav_pairs,
             self.obj_pairs(vec![("href".into(), Value::Str(href))]),
         ) else {
+            return;
+        };
+        let Ok(nav) = self.obj_pairs(nav_pairs) else {
             return;
         };
         self.env_declare(0, "navigator", Value::Obj(nav));
@@ -236,6 +271,7 @@ impl Interp {
             self.env_declare(0, "window", Value::Obj(w));
             self.env_declare(0, "self", Value::Obj(w));
             self.env_declare(0, "globalThis", Value::Obj(w));
+            self.wind = Some(w);
         }
         // WebForms postback helper: __doPostBack('target','arg') sets the
         // hidden fields and submits the first form.
@@ -356,7 +392,7 @@ impl Interp {
     /// NodeId if `v` is a DOM node handle.
     pub(crate) fn as_node(&self, v: Value) -> Option<NodeId> {
         if let Value::Obj(id) = v {
-            if let Obj::Dom(n) = self.heap.obj(id) {
+            if let Obj::Dom { node: n, .. } = self.heap.obj(id) {
                 return Some(*n);
             }
         }
@@ -447,11 +483,36 @@ impl Interp {
     }
 
     /// Wrap a node, reusing the cached wrapper so === identity holds.
+    /// The virtual prototype follows the node kind/tag (inputs answer
+    /// HTMLInputElement.prototype and so on), so instanceof works.
     fn dom_wrap(&mut self, n: NodeId) -> Result<Value, JsError> {
         if let Some(&o) = self.dom_objs.get(&n) {
             return Ok(Value::Obj(o));
         }
-        let o = self.heap.alloc_obj(Obj::Dom(n))?;
+        let proto = {
+            let dom = self.dom_ref()?;
+            match &dom.node(n).data {
+                NodeData::Document => po(self.protos.dom_document),
+                NodeData::Fragment => po(self.protos.dom_documentfragment),
+                NodeData::Element(el) => {
+                    let pr = self.protos;
+                    match dom.interner.resolve(el.tag) {
+                        "input" => po(pr.dom_input),
+                        "form" => po(pr.dom_form),
+                        "select" => po(pr.dom_select),
+                        "textarea" => po(pr.dom_textarea),
+                        "button" => po(pr.dom_button),
+                        "a" => po(pr.dom_anchor),
+                        "img" => po(pr.dom_image),
+                        "iframe" => po(pr.dom_iframe),
+                        "svg" => po(pr.dom_svg),
+                        _ => po(pr.dom_htmlelement),
+                    }
+                }
+                _ => None,
+            }
+        };
+        let o = self.heap.alloc_obj(Obj::Dom { node: n, proto })?;
         self.dom_objs.insert(n, o);
         Ok(Value::Obj(o))
     }
@@ -461,6 +522,14 @@ impl Interp {
             Some(n) => self.dom_wrap(n),
             None => Ok(Value::Null),
         }
+    }
+
+    /// document.implementation facade (fresh object per read, like a host
+    /// object): createHTMLDocument only.
+    fn impl_obj(&mut self) -> Result<Value, JsError> {
+        let m = self.heap.alloc_obj(nat("createHTMLDocument", n_create_html_doc))?;
+        let imp = self.obj_pairs(vec![("createHTMLDocument".into(), Value::Obj(m))])?;
+        Ok(Value::Obj(imp))
     }
 
     fn str_val(&mut self, s: String) -> Result<Value, JsError> {
@@ -525,6 +594,29 @@ impl Interp {
         Ok(ev)
     }
 
+    /// Dispatch at the `window` sentinel: its own listeners only, `this`
+    /// = the window object, no bubble path and no drain (dispatchEvent
+    /// is synchronous, like browsers).
+    pub(crate) fn dispatch_window(&mut self, ty: &str, ev: Value) -> Result<Value, JsError> {
+        let this = self
+            .env_get(0, "window")
+            .unwrap_or(Value::Undef);
+        set_prop(&mut self.heap, ev, "target", this)?;
+        set_prop(&mut self.heap, ev, "currentTarget", this)?;
+        let fns: Vec<Value> = self
+            .listeners
+            .get(&WIN_EVENTS)
+            .map(|v| v.iter().filter(|(t, _)| t == ty).map(|(_, f)| *f).collect())
+            .unwrap_or_default();
+        for f in fns {
+            if self.event_stopped(ev) {
+                break;
+            }
+            self.call_value(f, this, &[ev], None)?;
+        }
+        set_prop(&mut self.heap, ev, "currentTarget", Value::Null)?;
+        Ok(ev)
+    }
     /// Inline `on<ty>` attr source for node `n`, matched case-insensitively
     /// (HTML source may write onClick); Document/Text nodes have none.
     fn inline_handler(&self, n: NodeId, ty: &str) -> Option<String> {
@@ -573,6 +665,27 @@ impl Interp {
         ])?))
     }
 
+    /// Fresh window event object (target/currentTarget filled by the
+    /// dispatch path): same shape as new_event with the window object.
+    fn new_window_event(&mut self, ty: &str) -> Result<Value, JsError> {
+        let ty = Value::Str(self.heap.alloc_str(ty.to_string())?);
+        let tgt = self.env_get(0, "window").unwrap_or(Value::Undef);
+        let pd = self
+            .heap
+            .alloc_obj(nat("preventDefault", n_event_prevent_default))?;
+        let sp = self
+            .heap
+            .alloc_obj(nat("stopPropagation", n_event_stop_propagation))?;
+        Ok(Value::Obj(self.obj_pairs(vec![
+            ("type".into(), ty),
+            ("target".into(), tgt),
+            ("currentTarget".into(), Value::Null),
+            ("defaultPrevented".into(), Value::Bool(false)),
+            ("preventDefault".into(), Value::Obj(pd)),
+            ("stopPropagation".into(), Value::Obj(sp)),
+        ])?))
+    }
+
     /// A user-built object passed to dispatchEvent: overwrite `target` and
     /// fill any missing standard props so a bare `{type:'x'}` works fully.
     fn normalize_event(&mut self, ev: Value, target: NodeId) -> Result<(), JsError> {
@@ -603,7 +716,22 @@ impl Interp {
     /// unlike browsers which wait for the stack to unwind). Returns the
     /// event object; a dispatch error wins over drain errors.
     fn fire(&mut self, target: NodeId, ty: &str) -> Result<Value, JsError> {
-        let ev = self.new_event(ty, target)?;
+        // The window sentinel has no arena node: listeners only + drain.
+        if target == WIN_EVENTS {
+            let ev = self.new_window_event(&ty)?;
+            self.call_vals.push(ev);
+            let r = self.dispatch_window(&ty, ev);
+            let mut errs = Vec::new();
+            self.drain(&mut errs);
+            self.call_vals.pop();
+            return match r {
+                Err(e) => Err(e),
+                Ok(v) => match errs.into_iter().next() {
+                    Some(e) => Err(e),
+                    None => Ok(v),
+                },
+            };
+        }        let ev = self.new_event(ty, target)?;
         // ev must outlive dispatch + drain; drain's GC can't see it as a
         // Rust local, so root it for the call's duration.
         self.call_vals.push(ev);
@@ -644,8 +772,9 @@ impl Interp {
     }
 
     /// Event methods shared by elements and document (listeners live on
-    /// node 0 for the latter). Returns None when `name` isn't one.
-    fn event_method(
+    /// node 0 for the latter, on WIN_EVENTS for window). Returns None
+    /// when `name` isn't one.
+    pub(crate) fn event_method(
         &mut self,
         id: NodeId,
         name: &str,
@@ -689,6 +818,11 @@ impl Interp {
                     }
                     _ => return Err(err("dispatchEvent needs an event object")),
                 };
+                // The window sentinel has no arena node: separate path.
+                if id == WIN_EVENTS {
+                    let ev = self.dispatch_window(&ty, ev)?;
+                    return Ok(Some(Value::Bool(!self.event_prevented(ev))));
+                }
                 self.normalize_event(ev, id)?;
                 let ev = self.dispatch(id, &ty, ev)?;
                 Value::Bool(!self.event_prevented(ev))
@@ -771,6 +905,7 @@ impl Interp {
                     NodeData::Element(_) => 1.0,
                     NodeData::Text(_) => 3.0,
                     NodeData::Comment(_) => 8.0,
+                    NodeData::Fragment => 11.0,
                 };
                 return Ok(Value::Num(n));
             }
@@ -786,6 +921,29 @@ impl Interp {
                 let p = self.dom_ref()?.parent(id);
                 return self.opt_node(p);
             }
+            "ownerDocument" => {
+                // V8: every node belongs to a document (detached ones to
+                // their creator); the document itself has none (null).
+                let n = {
+                    let dom = self.dom_ref()?;
+                    if matches!(dom.node(id).data, NodeData::Document) {
+                        None
+                    } else {
+                        let mut cur = id;
+                        while let Some(p) = dom.parent(cur) {
+                            cur = p;
+                        }
+                        Some(
+                            if matches!(dom.node(cur).data, NodeData::Document) {
+                                cur
+                            } else {
+                                dom.root()
+                            },
+                        )
+                    }
+                };
+                return self.opt_node(n);
+            }
             "children" | "childNodes" => {
                 let all = key == "childNodes";
                 let ids: Vec<NodeId> = {
@@ -798,31 +956,110 @@ impl Interp {
                 };
                 return self.node_arr(ids);
             }
+            "firstChild" | "lastChild" | "firstElementChild" | "lastElementChild" => {
+                let kids: Vec<NodeId> = {
+                    let dom = self.dom_ref()?;
+                    dom.children(id).to_vec()
+                };
+                let elem_only = key.contains("Element");
+                let mut it: Box<dyn Iterator<Item = NodeId>> = if key.starts_with("first") {
+                    Box::new(kids.into_iter())
+                } else {
+                    Box::new(kids.into_iter().rev())
+                };
+                let pick = if elem_only {
+                    let dom = self.dom_ref()?;
+                    it.find(|&c| matches!(dom.node(c).data, NodeData::Element(_)))
+                } else {
+                    it.next()
+                };
+                return self.opt_node(pick);
+            }
+            "nextSibling" | "previousSibling" | "nextElementSibling" | "previousElementSibling" => {
+                let sibs: Vec<NodeId> = {
+                    let dom = self.dom_ref()?;
+                    match dom.parent(id) {
+                        Some(p) => dom.children(p).to_vec(),
+                        None => Vec::new(),
+                    }
+                };
+                let pos = sibs.iter().position(|&c| c == id);
+                let elem_only = key.contains("Element");
+                let mut seq: Box<dyn Iterator<Item = NodeId>> = if key.starts_with("next") {
+                    match pos {
+                        Some(i) => Box::new(sibs.into_iter().skip(i + 1)),
+                        None => Box::new(Vec::new().into_iter()),
+                    }
+                } else {
+                    match pos {
+                        Some(i) => Box::new(sibs.into_iter().take(i).rev()),
+                        None => Box::new(Vec::new().into_iter()),
+                    }
+                };
+                let pick = if elem_only {
+                    let dom = self.dom_ref()?;
+                    seq.find(|&c| matches!(dom.node(c).data, NodeData::Element(_)))
+                } else {
+                    seq.next()
+                };
+                return self.opt_node(pick);
+            }
             _ => {}
         }
         match self.dom_ref()?.node(id).data {
             NodeData::Document => match key {
                 "documentElement" => {
-                    let n = doc_element(self.dom_ref()?);
+                    let n = {
+                        let d = self.dom_ref()?;
+                        if id == d.root() {
+                            doc_element(d)
+                        } else {
+                            first_desc_tag(d, id, "html").or_else(|| {
+                                d.children(id).iter().copied().find(|&c| {
+                                    matches!(d.node(c).data, NodeData::Element(_))
+                                })
+                            })
+                        }
+                    };
                     self.opt_node(n)
                 }
                 "body" => {
                     let n = {
                         let d = self.dom_ref()?;
-                        first_tag(d, "body").or_else(|| doc_element(d))
+                        if id == d.root() {
+                            first_tag(d, "body").or_else(|| doc_element(d))
+                        } else {
+                            first_desc_tag(d, id, "body")
+                        }
+                    };
+                    self.opt_node(n)
+                }
+                "head" => {
+                    let n = {
+                        let d = self.dom_ref()?;
+                        if id == d.root() {
+                            first_tag(d, "head").or_else(|| doc_element(d))
+                        } else {
+                            first_desc_tag(d, id, "head")
+                        }
                     };
                     self.opt_node(n)
                 }
                 "title" => {
                     let t = {
                         let d = self.dom_ref()?;
-                        first_tag(d, "title")
-                            .map(|n| vigia_actions::text_content(d, n))
+                        let te = if id == d.root() {
+                            first_tag(d, "title")
+                        } else {
+                            first_desc_tag(d, id, "title")
+                        };
+                        te.map(|n| vigia_actions::text_content(d, n))
                             .unwrap_or_default()
                     };
                     self.str_val(t)
                 }
                 "textContent" => Ok(Value::Null),
+                "implementation" => self.impl_obj(),
                 // Snapshot, not live: forms present at access time.
                 "forms" => {
                     let ids: Vec<NodeId> = {
@@ -847,6 +1084,24 @@ impl Interp {
                     };
                     self.str_val(t)
                 }
+                _ => Ok(Value::Undef),
+            },
+            NodeData::Fragment => match key {
+                "textContent" => {
+                    let t = vigia_actions::text_content(self.dom_ref()?, id);
+                    self.str_val(t)
+                }
+                "innerHTML" => {
+                    let mut s = String::new();
+                    serialize_into(self.dom_ref()?, id, &mut s);
+                    self.str_val(s)
+                }
+                "outerHTML" => {
+                    let mut s = String::new();
+                    serialize_node(self.dom_ref()?, id, &mut s);
+                    self.str_val(s)
+                }
+                "nodeName" => self.str_val("#document-fragment".into()),
                 _ => Ok(Value::Undef),
             },
             NodeData::Element(_) => match key {
@@ -1012,6 +1267,32 @@ impl Interp {
     }
 
     /// Method call on a DOM node handle (the `o.m()` call-site dispatch).
+    /// Fallback for DOM method calls the direct dispatch doesn't know:
+    /// resolve `name` on the wrapper's prototype chain (constructor,
+    /// hasOwnProperty, inherited bag methods) and call it with the
+    /// wrapper as receiver. None when absent (the caller errors).
+    fn dom_proto_call(
+        &mut self,
+        id: NodeId,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Option<Value>, JsError> {
+        use crate::eval::walk_props;
+        let Some(&w) = self.dom_objs.get(&id) else {
+            return Ok(None);
+        };
+        let p = match self.heap.obj(w) {
+            Obj::Dom { proto, .. } => *proto,
+            _ => None,
+        };
+        let Some(p) = p else { return Ok(None) };
+        let f = walk_props(&self.heap, &self.protos, Some(p), name)?;
+        match f {
+            Value::Undef => Ok(None),
+            _ => Ok(Some(self.call_value(f, Value::Obj(w), args, Some(name))?)),
+        }
+    }
+
     pub(crate) fn call_dom(
         &mut self,
         id: NodeId,
@@ -1072,6 +1353,11 @@ impl Interp {
                     let n = self.dom_mut()?.text_node(&t);
                     self.dom_wrap(n)
                 }
+                "createDocumentFragment" => {
+                    let n = self.dom_mut()?.fragment_node();
+                    self.dom_wrap(n)
+                }
+                "implementation" => self.impl_obj(),
                 "createComment" => {
                     let t = to_str(&self.heap, arg(0));
                     let n = self.dom_mut()?.comment_node(&t);
@@ -1085,7 +1371,10 @@ impl Interp {
                     let hits = self.select(id, arg(0))?;
                     self.node_arr(hits)
                 }
-                _ => Err(err(format!("{name} is not a function"))),
+                _ => match self.dom_proto_call(id, name, &args)? {
+                    Some(v) => Ok(v),
+                    None => Err(err(format!("{name} is not a function"))),
+                },
             };
         }
         match name {
@@ -1116,6 +1405,17 @@ impl Interp {
                 let Some(n) = self.as_node(a) else {
                     return Err(err("appendChild needs a node"));
                 };
+                // Fragments splice their children in (V8); the fragment
+                // itself stays detached and is returned.
+                if matches!(self.dom_ref()?.node(n).data, NodeData::Fragment) {
+                    let kids: Vec<NodeId> = self.dom_ref()?.children(n).to_vec();
+                    let dom = self.dom_mut()?;
+                    for k in kids {
+                        dom.detach(k);
+                        dom.append_child_node(id, k);
+                    }
+                    return Ok(a);
+                }
                 self.check_cycle(id, n, "appendChild")?;
                 let dom = self.dom_mut()?;
                 dom.detach(n);
@@ -1127,7 +1427,6 @@ impl Interp {
                 let Some(n) = self.as_node(a) else {
                     return Err(err("insertBefore needs a node"));
                 };
-                self.check_cycle(id, n, "insertBefore")?;
                 let before = match arg(1) {
                     Value::Null | Value::Undef => None,
                     b => {
@@ -1140,6 +1439,16 @@ impl Interp {
                         Some(m)
                     }
                 };
+                if matches!(self.dom_ref()?.node(n).data, NodeData::Fragment) {
+                    let kids: Vec<NodeId> = self.dom_ref()?.children(n).to_vec();
+                    let dom = self.dom_mut()?;
+                    for k in kids {
+                        dom.detach(k);
+                        dom.insert_before_node(id, k, before);
+                    }
+                    return Ok(a);
+                }
+                self.check_cycle(id, n, "insertBefore")?;
                 let dom = self.dom_mut()?;
                 dom.detach(n);
                 dom.insert_before_node(id, n, before);
@@ -1160,6 +1469,11 @@ impl Interp {
                 self.dom_mut()?.detach(id);
                 Ok(Value::Undef)
             }
+            "cloneNode" => {
+                let deep = truthy(&self.heap, arg(0));
+                let n = self.dom_mut()?.clone_node(id, deep);
+                self.dom_wrap(n)
+            }
             "submit" => {
                 // Only <form> submits; anything else falls to "not a
                 // function" below, like browsers (only forms have it).
@@ -1177,12 +1491,35 @@ impl Interp {
                 let hits = self.select(id, arg(0))?;
                 self.node_arr(hits)
             }
-            _ => Err(err(format!("{name} is not a function"))),
+            _ => match self.dom_proto_call(id, name, &args)? {
+                Some(v) => Ok(v),
+                None => Err(err(format!("{name} is not a function"))),
+            },
         }
     }
 }
 
 // ---- event natives ------------------------------------------------------
+
+/// document.implementation.createHTMLDocument(title?): detached html >
+/// head (+title) + body in the page arena; subtree reads work on it while
+/// root-scoped page queries skip it (detached).
+fn n_create_html_doc(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let title = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    let n = {
+        let dom = it.dom_mut()?;
+        let doc = dom.document_node();
+        let html = dom.element(doc, "html", vec![]);
+        let head = dom.element(html, "head", vec![]);
+        if !title.is_empty() {
+            let te = dom.element(head, "title", vec![]);
+            dom.text(te, &title);
+        }
+        dom.element(html, "body", vec![]);
+        doc
+    };
+    it.dom_wrap(n)
+}
 
 fn n_event_prevent_default(
     it: &mut Interp,
@@ -1199,6 +1536,37 @@ fn n_event_stop_propagation(
 ) -> Result<Value, JsError> {
     // internal flag the dispatch loop checks between nodes
     set_prop(&mut it.heap, this, "__stopped", Value::Bool(true)).map(|()| Value::Undef)
+}
+
+/// Bare addEventListener/removeEventListener/dispatchEvent resolve to
+/// the window target in browsers; same here (sentinel registry).
+pub(crate) fn n_win_add_event_listener(
+    it: &mut Interp,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    match it.event_method(WIN_EVENTS, "addEventListener", args)? {
+        Some(v) => Ok(v),
+        None => Ok(Value::Undef),
+    }
+}
+
+pub(crate) fn n_win_remove_event_listener(
+    it: &mut Interp,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    match it.event_method(WIN_EVENTS, "removeEventListener", args)? {
+        Some(v) => Ok(v),
+        None => Ok(Value::Undef),
+    }
+}
+
+pub(crate) fn n_win_dispatch_event(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    match it.event_method(WIN_EVENTS, "dispatchEvent", args)? {
+        Some(v) => Ok(v),
+        None => Ok(Value::Undef),
+    }
 }
 
 /// WebForms `__doPostBack(eventTarget, eventArgument)`: stash both into
@@ -1282,6 +1650,11 @@ mod tests {
         assert_eq!(ev(&mut it, "window.Uint8Array === Uint8Array"), "true");
         assert_eq!(ev(&mut it, "window.window === window"), "true");
         assert_eq!(ev(&mut it, "globalThis.atob('aGk=')"), "hi");
+        // Writes through window land as real globals (and vice versa).
+        assert_eq!(ev(&mut it, "window.FullCalendarVDom={x:1};FullCalendarVDom.x"), "1");
+        assert_eq!(ev(&mut it, "var wv=41;window.wv"), "41");
+        assert_eq!(ev(&mut it, "'atob' in window"), "true");
+        assert_eq!(ev(&mut it, "window.newglobal=7;delete window.newglobal;'newglobal' in window"), "false");
         assert_eq!(ev(&mut it, "document.nodeType"), "9");
         assert_eq!(ev(&mut it, "navigator.userAgent"), "vigia/0.1");
         assert_eq!(ev(&mut it, "typeof location.href"), "string");
@@ -1465,6 +1838,103 @@ mod tests {
     }
 
     #[test]
+    fn implementation_doc() {
+        // jQuery support shape: detached doc with working body.
+        let mut it = interp(PAGE);
+        assert_eq!(
+            ev(
+                &mut it,
+                "var d=document.implementation.createHTMLDocument('');\
+                 d.body.innerHTML='<form></form><form></form>';d.body.childNodes.length"
+            ),
+            "2"
+        );
+        assert_eq!(
+            ev(
+                &mut it,
+                "var d=document.implementation.createHTMLDocument('t');d.title"
+            ),
+            "t"
+        );
+        // The fake doc stays out of page queries.
+        assert_eq!(ev(&mut it, "document.getElementsByTagName('body').length"), "1");
+        assert_eq!(ev(&mut it, "document.head.tagName"), "HEAD");
+        assert_eq!(ev(&mut it, "document.getElementById('a').ownerDocument === document"), "true");
+        assert_eq!(ev(&mut it, "document.ownerDocument"), "null");
+        assert_eq!(
+            ev(&mut it, "var d=document.implementation.createHTMLDocument('');d.body.ownerDocument===d"),
+            "true"
+        );
+        assert_eq!(ev(&mut it, "navigator.appVersion.indexOf('MSIE')"), "-1");
+    }
+
+    #[test]
+    fn dom_hierarchy() {
+        let mut it = interp(PAGE);
+        assert_eq!(ev(&mut it, "document.body instanceof HTMLElement"), "true");
+        assert_eq!(ev(&mut it, "document.body instanceof Element"), "true");
+        assert_eq!(ev(&mut it, "document.body instanceof Node"), "true");
+        assert_eq!(ev(&mut it, "document instanceof Document"), "true");
+        assert_eq!(ev(&mut it, "document.body.constructor === HTMLElement"), "true");
+        assert_eq!(
+            ev(&mut it, "Object.getPrototypeOf(document.body) === HTMLElement.prototype"),
+            "true"
+        );
+        assert_eq!(ev(&mut it, "document.body instanceof Document"), "false");
+        assert_eq!(ev(&mut it, "typeof Element"), "function");
+        assert!(errmsg(&mut interp(PAGE), "new Element()").contains("Illegal constructor"));
+        assert_eq!(ev(&mut it, "document.getElementById('i').constructor === HTMLInputElement"), "true");
+        assert_eq!(ev(&mut it, "document.getElementById('i') instanceof HTMLElement"), "true");
+        assert_eq!(ev(&mut it, "document.getElementById('l') instanceof HTMLAnchorElement"), "true");
+        assert_eq!(ev(&mut it, "document.createDocumentFragment() instanceof DocumentFragment"), "true");
+        assert_eq!(ev(&mut it, "document.createElement('iframe') instanceof HTMLIFrameElement"), "true");
+    }
+
+    #[test]
+    fn window_events() {
+        let mut it = interp(PAGE);
+        // Registration on window (method + bare global), then dispatch.
+        it.run("var hits=[];window.addEventListener('x',function(e){hits.push(e.type)})")
+            .unwrap();
+        it.run("addEventListener('y',function(){hits.push('y')})").unwrap();
+        assert_eq!(ev(&mut it, "hits.length"), "0");
+        it.run("window.dispatchEvent({type:'x'})").unwrap();
+        it.run("dispatchEvent({type:'y'})").unwrap();
+        assert_eq!(ev(&mut it, "hits.join()"), "x,y");
+        // removeEventListener detaches.
+        it.run("var f=function(){hits.push('z')};window.addEventListener('z',f);window.removeEventListener('z',f);window.dispatchEvent({type:'z'})").unwrap();
+        assert_eq!(ev(&mut it, "hits.join()"), "x,y");
+    }
+
+    #[test]
+    fn sibling_navigation() {        let mut it = interp("<body><div id=a><b id=b>x</b>tail<i id=c>y</i></div></body>");
+        assert_eq!(ev(&mut it, "document.getElementById('a').firstChild.tagName"), "B");
+        assert_eq!(ev(&mut it, "document.getElementById('a').lastChild.tagName"), "I");
+        assert_eq!(ev(&mut it, "document.getElementById('b').nextSibling.textContent"), "tail");
+        assert_eq!(
+            ev(&mut it, "document.getElementById('c').previousSibling.textContent"),
+            "tail"
+        );
+        assert_eq!(ev(&mut it, "document.getElementById('b').nextElementSibling.tagName"), "I");
+        assert_eq!(
+            ev(&mut it, "document.getElementById('c').previousElementSibling.tagName"),
+            "B"
+        );
+        assert_eq!(ev(&mut it, "document.getElementById('b').previousSibling"), "null");
+        assert_eq!(ev(&mut it, "document.getElementById('c').nextSibling"), "null");
+        assert_eq!(ev(&mut it, "document.body.firstElementChild.tagName"), "DIV");
+        // jQuery support shape: clone().clone().lastChild.checked.
+        assert_eq!(
+            ev(
+                &mut it,
+                "var d=document.createElement('div');d.innerHTML=\"<input type='checkbox' checked='checked'/ mother's brother\";\
+                 d.cloneNode(true).cloneNode(true).lastChild.checked"
+            ),
+            "true"
+        );
+    }
+
+    #[test]
     fn mutation() {
         let mut it = interp(PAGE);
         it.run(
@@ -1476,6 +1946,17 @@ mod tests {
             .unwrap();
         it.run("var c=document.createComment('note');document.body.appendChild(c)")
             .unwrap();
+        // Fragments splice children on append (V8); nodeType 11.
+        it.run(
+            "var f=document.createDocumentFragment();var b=document.createElement('b');\
+             b.textContent='bf';f.appendChild(b);document.body.appendChild(f)",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "document.createDocumentFragment().nodeType"), "11");
+        // cloneNode: shallow copies bare, deep copies the subtree.
+        it.run("var dc=document.getElementById('a').cloneNode(true);dc.id='ac';document.body.appendChild(dc)")
+            .unwrap();
+        assert_eq!(ev(&mut it, "document.getElementById('ac').textContent"), "one two bold");
         it.run("document.getElementById('a').appendChild(document.getElementById('l'))")
             .unwrap();
         it.run("document.getElementById('i').remove()").unwrap();
@@ -1484,6 +1965,7 @@ mod tests {
         assert_eq!(vigia_actions::text_content(&dom, h1[0]), "INJ");
         assert!(vigia_actions::text_content(&dom, vigia_css::query(&dom, "body").unwrap()[0])
             .contains("hi"));
+        assert_eq!(vigia_css::query(&dom, "body > b").unwrap().len(), 1);
         // moved, not copied: link is now inside #a
         assert_eq!(vigia_css::query(&dom, "#a > a").unwrap().len(), 1);
         // detached: orphan stays in the arena but query() skips unreachable

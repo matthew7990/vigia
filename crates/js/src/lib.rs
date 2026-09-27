@@ -211,7 +211,13 @@ pub enum Obj {
         pairs: Vec<(String, Value)>,
     },
     /// JS handle over a DOM node; valid only while Interp.dom is installed.
-    Dom(NodeId),
+    /// `proto` is the virtual prototype by node kind (Element nodes answer
+    /// HTMLElement.prototype, the document answers Document.prototype),
+    /// so instanceof/getPrototypeOf work without a proto slot in the DOM.
+    Dom {
+        node: NodeId,
+        proto: Option<u32>,
+    },
     /// Live CSS declaration block for an element: reads/writes go to the
     /// element's `style` attribute on every access (no cached copy).
     Style { node: NodeId },
@@ -253,7 +259,12 @@ pub enum Obj {
         proto: Option<u32>,
     },
     /// Promise cell; Promise.prototype is a virtual proto (proto_of).
-    Promise(PromiseState),
+    /// `pairs` holds expandos (deferred resolve/reject helpers) - V8
+    /// promises are extensible.
+    Promise {
+        st: PromiseState,
+        pairs: Vec<(String, Value)>,
+    },
     /// Uint8Array bytes (+ expando pairs); no shared memory - views over
     /// buffers and subarray()/slice() copy (documented gap).
     Bytes {
@@ -371,6 +382,21 @@ pub struct Protos {
     pub float64array: u32,
     pub textencoder: u32,
     pub textdecoder: u32,
+    pub dom_node: u32,
+    pub dom_element: u32,
+    pub dom_htmlelement: u32,
+    pub dom_document: u32,
+    pub dom_shadowroot: u32,
+    pub dom_documentfragment: u32,
+    pub dom_input: u32,
+    pub dom_form: u32,
+    pub dom_select: u32,
+    pub dom_textarea: u32,
+    pub dom_button: u32,
+    pub dom_anchor: u32,
+    pub dom_image: u32,
+    pub dom_iframe: u32,
+    pub dom_svg: u32,
 }
 
 impl Protos {
@@ -403,6 +429,21 @@ impl Protos {
             float64array: u32::MAX,
             textencoder: u32::MAX,
             textdecoder: u32::MAX,
+            dom_node: u32::MAX,
+            dom_element: u32::MAX,
+            dom_htmlelement: u32::MAX,
+            dom_document: u32::MAX,
+            dom_shadowroot: u32::MAX,
+            dom_documentfragment: u32::MAX,
+            dom_input: u32::MAX,
+            dom_form: u32::MAX,
+            dom_select: u32::MAX,
+            dom_textarea: u32::MAX,
+            dom_button: u32::MAX,
+            dom_anchor: u32::MAX,
+            dom_image: u32::MAX,
+            dom_iframe: u32::MAX,
+            dom_svg: u32::MAX,
         }
     }
 }
@@ -620,8 +661,19 @@ pub struct Interp {
     /// duration (and natives keep their arg slice alive through nested
     /// calls, e.g. arr.map's callback).
     pub(crate) call_vals: Vec<Value>,
+    /// FnDefs already materialized by a hoist pass (exec_block_run's
+    /// block entry or hoist_vars' function entry), as raw identities -
+    /// never dereferenced, only compared. Stmt::FnDecl skips those so a
+    /// declaration creates exactly one object per entry (V8 parity: the
+    /// old re-declare-on-execution broke prototype identity, e.g.
+    /// Babel _inherits' `n.prototype`). Stack discipline with truncate.
+    pub(crate) hoisted: Vec<*const FnDef>,
     /// GC collections so far (metrics).
     pub gc_runs: u64,
+    /// The `window`/`self`/`globalThis` object id (one object, three
+    /// names): reads/writes go live to env 0, so `window.x = 1` and bare
+    /// `x` are the same binding like real browsers.
+    pub(crate) wind: Option<u32>,
     /// runaway guards, all user-tunable
     pub max_steps: u64,
     pub max_call_depth: u32,
@@ -677,7 +729,9 @@ impl Interp {
             symbol_registry: HashMap::new(),
             env_stack: Vec::new(),
             call_vals: Vec::new(),
+            hoisted: Vec::new(),
             gc_runs: 0,
+            wind: None,
             max_steps: 5_000_000,
             max_call_depth: 1_000,
             max_envs: 200_000,
@@ -703,8 +757,10 @@ impl Interp {
         // Top-level `var`s hoist to the global scope (func_env is 0).
         self.func_env = 0;
         self.throw_chain = None;
+        let hbase = self.hoisted.len();
         self.hoist_vars(&stmts, 0)?;
         let r = self.exec_block(&stmts, 0);
+        self.hoisted.truncate(hbase);
         let mut errs = Vec::new();
         self.drain(&mut errs);
         match r {

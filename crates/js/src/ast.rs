@@ -34,6 +34,15 @@ pub enum Expr {
     },
     /// Template: (cooked, expr) pairs plus the cooked tail.
     Tpl(Vec<(String, Expr)>, String),
+    /// Tagged template: tag plus (cooked?, raw, expr) parts and the
+    /// cooked?/raw tail. Cooked is None where an invalid escape poisoned
+    /// it (ES2018: the tag still runs, that site reads undefined).
+    TaggedTpl {
+        tag: Box<Expr>,
+        parts: Vec<(Option<String>, String, Expr)>,
+        cooked_tail: Option<String>,
+        raw_tail: String,
+    },
     /// `class Name extends Sup { ... }` (name None for expressions).
     Class {
         name: Option<String>,

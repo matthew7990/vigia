@@ -15,11 +15,14 @@ pub enum Tok {
         pat: String,
         flags: String,
     },
-    /// Template chunk: cooked text; `expr` means it ended in `${`,
-    /// `head` means it opened with a backtick (a Tpl after an expression
-    /// with head set is a tagged template; continuations never are).
+    /// Template chunk: cooked text (None when an invalid escape poisons
+    /// it - only legal on tagged templates per ES2018) plus the raw
+    /// source text; `expr` means it ended in `${`, `head` means it opened
+    /// with a backtick (a Tpl after an expression with head set is a
+    /// tagged template; continuations never are).
     Tpl {
-        cooked: String,
+        cooked: Option<String>,
+        raw: String,
         expr: bool,
         head: bool,
     },
@@ -342,47 +345,187 @@ fn tpl_utf8(b: &[u8], a: usize, e: usize) -> Result<&str, JsError> {
     std::str::from_utf8(&b[a..e]).map_err(|_| err("bad utf-8 in template"))
 }
 
+/// One `\` escape inside a template: cooks into `s` (None-poison on
+/// invalid escapes, which ES2018 allows on tagged templates) and advances
+/// past the sequence. Returns whether the cooked value is now poisoned.
+/// Unlike strings, templates accept `\u{...}` here.
+fn tpl_escape(b: &[u8], i: &mut usize, s: &mut Option<String>) -> Result<bool, JsError> {
+    let e = b
+        .get(*i)
+        .copied()
+        .ok_or_else(|| err("unterminated template"))?;
+    *i += 1;
+    let mut bad = false;
+    let mut push = |c: char| {
+        if let Some(cooked) = s {
+            cooked.push(c);
+        }
+    };
+    match e {
+        b'n' => push('\n'),
+        b't' => push('\t'),
+        b'r' => push('\r'),
+        b'b' => push('\u{8}'),
+        b'f' => push('\u{c}'),
+        b'v' => push('\u{b}'),
+        b'0' => push('\0'),
+        b'\\' => push('\\'),
+        b'\'' => push('\''),
+        b'"' => push('"'),
+        b'/' => push('/'),
+        b'\n' => {} // line continuation cooks away
+        b'\r' => {
+            if b.get(*i) == Some(&b'\n') {
+                *i += 1;
+            }
+        }
+        b'x' => match hex2(b, *i) {
+            Some(h) => {
+                *i += 2;
+                push(char::from_u32(h).unwrap_or('\u{FFFD}'));
+            }
+            None => bad = true, // raw keeps `\x`; rest lexes as literal text
+        },
+        b'u' => {
+            if b.get(*i) == Some(&b'{') {
+                match brace_hex(b, i) {
+                    // well-formed but out of range poisons; consume it whole
+                    Some(cp) if char::from_u32(cp).is_none() => bad = true,
+                    Some(cp) => push(char::from_u32(cp).unwrap()),
+                    // malformed: raw keeps text, rest lexes literally
+                    None => bad = true,
+                }
+            } else if let Some(hi) = hexn(b, *i, 4) {
+                *i += 4;
+                if (0xD800..0xDC00).contains(&hi)
+                    && b.get(*i) == Some(&b'\\')
+                    && b.get(*i + 1) == Some(&b'u')
+                    && hexn(b, *i + 2, 4)
+                        .is_some_and(|lo| (0xDC00..0xE000).contains(&lo))
+                {
+                    *i += 2;
+                    let lo = hexn(b, *i, 4).unwrap_or(0xDC00);
+                    *i += 4;
+                    let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
+                    push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                } else {
+                    push(char::from_u32(hi).unwrap_or('\u{FFFD}'));
+                }
+            } else {
+                bad = true;
+            }
+        }
+        // unknown escape = the char itself (JS sloppy rule)
+        other => push(other as char),
+    }
+    if bad {
+        *s = None;
+    }
+    Ok(bad)
+}
+
+/// Two hex digits at `o`, or None when absent/invalid (no error: the
+/// caller poisons cooked instead of failing the lex).
+fn hex2(b: &[u8], o: usize) -> Option<u32> {
+    hexn(b, o, 2)
+}
+
+fn hexn(b: &[u8], o: usize, n: usize) -> Option<u32> {
+    let w = std::str::from_utf8(b.get(o..o + n)?).ok()?;
+    if !w.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(w, 16).ok()
+}
+
+/// `\u{...}` body after the backslash-u was consumed and `{` peeked:
+/// consumes through `}` on success, leaves `i` past `u` on failure.
+fn brace_hex(b: &[u8], i: &mut usize) -> Option<u32> {
+    let mut j = *i + 1;
+    let h0 = j;
+    while b.get(j).is_some_and(|c| c.is_ascii_hexdigit()) {
+        j += 1;
+    }
+    if j == h0 || b.get(j) != Some(&b'}') {
+        return None;
+    }
+    let cp = u32::from_str_radix(std::str::from_utf8(b.get(h0..j)?).ok()?, 16).ok()?;
+    *i = j + 1;
+    Some(cp)
+}
+
 /// Template body from after the backtick (or `}` closing `${`): cooked
 /// text until the closing backtick (`expr: false`) or `${` (`expr: true`,
-/// pushing a substitution context). Newlines normalize to `\n`.
+/// pushing a substitution context). Newlines normalize to `\n` in both
+/// cooked and raw. Invalid escapes poison cooked (None) while raw keeps
+/// the source text verbatim, per ES2018 tagged-template rules.
 fn tpl_chunk(b: &[u8], i: &mut usize, braces: &mut Vec<bool>, head: bool) -> Result<Tok, JsError> {
-    let mut s = String::new();
+    let mut cooked: Option<String> = Some(String::new());
+    let mut raw = String::new();
     let mut chunk = *i;
+    // Literal spans hold no backslash/CR (handled below), so the same
+    // slice feeds both cooked and raw verbatim.
+    let flush = |cooked: &mut Option<String>,
+                     raw: &mut String,
+                     from: usize,
+                     e: usize|
+     -> Result<(), JsError> {
+        let lit = tpl_utf8(b, from, e)?;
+        if let Some(c) = cooked {
+            c.push_str(lit);
+        }
+        raw.push_str(lit);
+        Ok(())
+    };
     loop {
         match b.get(*i).copied() {
             None => return Err(err("unterminated template")),
             Some(b'`') => {
-                s.push_str(tpl_utf8(b, chunk, *i)?);
+                flush(&mut cooked, &mut raw, chunk, *i)?;
                 *i += 1;
                 return Ok(Tok::Tpl {
-                    cooked: s,
+                    cooked,
+                    raw,
                     expr: false,
                     head,
                 });
             }
             Some(b'$') if b.get(*i + 1) == Some(&b'{') => {
-                s.push_str(tpl_utf8(b, chunk, *i)?);
+                flush(&mut cooked, &mut raw, chunk, *i)?;
                 *i += 2;
                 braces.push(true);
                 return Ok(Tok::Tpl {
-                    cooked: s,
+                    cooked,
+                    raw,
                     expr: true,
                     head,
                 });
             }
             Some(b'\\') => {
-                s.push_str(tpl_utf8(b, chunk, *i)?);
+                flush(&mut cooked, &mut raw, chunk, *i)?;
+                let es = *i;
                 *i += 1;
-                push_escape(b, &mut *i, &mut s)?;
+                tpl_escape(b, &mut *i, &mut cooked)?;
+                // raw keeps the escape verbatim (line continuations
+                // normalize CRLF/CR to LF like other line endings)
+                let text = tpl_utf8(b, es, *i)?;
+                if text.contains('\r') {
+                    raw.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+                } else {
+                    raw.push_str(text);
+                }
                 chunk = *i;
             }
             Some(b'\n') | Some(b'\r') => {
-                s.push_str(tpl_utf8(b, chunk, *i)?);
+                flush(&mut cooked, &mut raw, chunk, *i)?;
                 if b[*i] == b'\r' && b.get(*i + 1) == Some(&b'\n') {
                     *i += 1;
                 }
                 *i += 1;
-                s.push('\n');
+                if let Some(c) = cooked.as_mut() {
+                    c.push('\n');
+                }
+                raw.push('\n');
                 chunk = *i;
             }
             Some(_) => *i += 1,
@@ -602,14 +745,17 @@ mod tests {
         match tt("`a${b}c`").as_slice() {
             [Tok::Tpl {
                 cooked: h,
+                raw: hr,
                 expr: true,
                 head: true,
             }, Tok::Ident(b), Tok::Tpl {
                 cooked: t,
+                raw: tr,
                 expr: false,
                 head: false,
             }] => {
-                assert_eq!((h.as_str(), b.as_str(), t.as_str()), ("a", "b", "c"));
+                assert_eq!((h.as_deref(), b.as_str(), t.as_deref()), (Some("a"), "b", Some("c")));
+                assert_eq!((hr.as_str(), tr.as_str()), ("a", "c"));
             }
             t => panic!("{t:?}"),
         }

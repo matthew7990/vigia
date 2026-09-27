@@ -198,7 +198,8 @@ Working:
   `MouseEvent`/`KeyboardEvent` and `document.createEvent`,
   `document.cookie` read/write on the session jar, external `src=`
   scripts (static and dynamically injected, with `load`/`error`),
-  Promise + microtasks + virtual-clock timers + `async`/`await`,
+  Promise + microtasks + virtual-clock timers (per-timer fairness
+  quota) + `async`/`await`, eager `function*` generators,
   Promise-returning `fetch`, `navigator.sendBeacon`, mark-sweep GC
 - Browser persona (no layout engine behind it): `navigator` constants
   plus `userAgentData`, `plugins`/`mimeTypes`, `connection`,

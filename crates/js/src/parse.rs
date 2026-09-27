@@ -1590,7 +1590,13 @@ impl P {
         let mut ops: Vec<OptOp> = Vec::new();
         loop {
             if matches!(self.peek(), Tok::Tpl { head: true, .. }) {
-                return Err(err("tagged templates unsupported"));
+                // Tagged template: binds the callee built so far; the
+                // result chains on (member/call tails keep looping).
+                if base.is_some() {
+                    return Err(err("tagged template in optional chain"));
+                }
+                e = self.tagged(e)?;
+                continue;
             }
             if self.at_p("?.") {
                 if base.is_none() {
@@ -1640,6 +1646,49 @@ impl P {
         }
     }
 
+    /// Template after a tag expression (`tag`lit${x}lit``). Substitutions
+    /// recurse through expr(), so tagged/untagged templates nest both
+    /// ways; cooked stays None where an escape poisoned it (ES2018).
+    fn tagged(&mut self, tag: Expr) -> R<Expr> {
+        let (mut cooked_head, mut raw_head, mut more) = match self.bump() {
+            Tok::Tpl {
+                cooked,
+                raw,
+                expr,
+                head: true,
+                ..
+            } => (cooked, raw, expr),
+            t => return Err(err(format!("expected template, got {t:?}"))),
+        };
+        let mut parts = Vec::new();
+        loop {
+            if !more {
+                return Ok(Expr::TaggedTpl {
+                    tag: Box::new(tag),
+                    parts,
+                    cooked_tail: cooked_head,
+                    raw_tail: raw_head,
+                });
+            }
+            let e = self.expr()?;
+            match self.bump() {
+                Tok::Tpl {
+                    cooked: c2,
+                    raw: r2,
+                    expr: e2,
+                    head: false,
+                    ..
+                } => {
+                    let head = std::mem::replace(&mut cooked_head, c2);
+                    let rhead = std::mem::replace(&mut raw_head, r2);
+                    parts.push((head, rhead, e));
+                    more = e2;
+                }
+                t => return Err(err(format!("expected template continuation, got {t:?}"))),
+            }
+        }
+    }
+
     fn args(&mut self) -> R<Vec<Expr>> {
         self.exp_p("(")?;
         let mut v = Vec::new();
@@ -1674,20 +1723,34 @@ impl P {
                     .map_err(|m| err(format!("invalid regex: {m}")))?;
                 Ok(Expr::Regex { pat, flags })
             }
-            Tok::Tpl { cooked, expr, .. } => {
+            Tok::Tpl {
+                cooked,
+                raw: _,
+                expr, ..
+            } => {
+                // Untagged: an invalid escape is a SyntaxError (tagged
+                // templates keep going with cooked None - see tagged()).
                 if !expr {
-                    return Ok(Expr::Str(cooked));
+                    return match cooked {
+                        Some(c) => Ok(Expr::Str(c)),
+                        None => Err(err("invalid escape in template")),
+                    };
                 }
+                let mut head = cooked.ok_or_else(|| err("invalid escape in template"))?;
                 let mut parts = Vec::new();
-                let mut head = cooked;
                 loop {
                     let e = self.expr()?;
                     match self.bump() {
                         Tok::Tpl {
                             cooked: c2,
                             expr: e2,
+                            head: h2,
                             ..
                         } => {
+                            if h2 {
+                                return Err(err("expected template continuation"));
+                            }
+                            let c2 = c2.ok_or_else(|| err("invalid escape in template"))?;
                             parts.push((std::mem::take(&mut head), e));
                             if !e2 {
                                 return Ok(Expr::Tpl(parts, c2));

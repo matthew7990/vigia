@@ -1775,6 +1775,7 @@ impl Interp {
             &[
                 ("fromCharCode", n_str_from_char_code),
                 ("fromCodePoint", n_str_from_code_point),
+                ("raw", n_str_raw),
             ],
         );
         self.ctor("Number", n_number_cast, pr.number, &[]);
@@ -3044,6 +3045,12 @@ impl Interp {
                 s.push_str(tail);
                 Ok(Value::Str(self.heap.intern_str(&s)?))
             }
+            Expr::TaggedTpl {
+                tag,
+                parts,
+                cooked_tail,
+                raw_tail,
+            } => self.tagged_tpl(env, tag, parts, cooked_tail, raw_tail),
             Expr::OptChain(b, ops) => self.opt_chain(env, b, ops),
             Expr::Index(o, ix) => {
                 let v = self.expr(env, o)?;
@@ -3685,6 +3692,52 @@ impl Interp {
                 Ok(())
             }
         }
+    }
+
+    /// Tagged template call: build the strings array (cooked items plus
+    /// a `raw` array prop) and call the tag with (strings, ...values).
+    /// `this` is always undefined per spec, even for `obj.tag`x``.
+    /// Freeze is skipped: Object.freeze is a no-op engine-wide, so the
+    /// site stays writable like every other object here.
+    fn tagged_tpl(
+        &mut self,
+        env: u32,
+        tag: &Expr,
+        parts: &[(Option<String>, String, Expr)],
+        cooked_tail: &Option<String>,
+        raw_tail: &str,
+    ) -> Result<Value, JsError> {
+        let f = self.expr(env, tag)?;
+        let mut vals = Vec::with_capacity(parts.len());
+        for (_, _, e) in parts {
+            vals.push(self.expr(env, e)?);
+        }
+        let mut items = Vec::with_capacity(parts.len() + 1);
+        let mut raws = Vec::with_capacity(parts.len() + 1);
+        for (cooked, raw, _) in parts {
+            items.push(match cooked {
+                Some(c) => Value::Str(self.heap.intern_str(c)?),
+                None => Value::Undef,
+            });
+            raws.push(Value::Str(self.heap.intern_str(raw)?));
+        }
+        items.push(match cooked_tail {
+            Some(c) => Value::Str(self.heap.intern_str(c)?),
+            None => Value::Undef,
+        });
+        raws.push(Value::Str(self.heap.intern_str(raw_tail)?));
+        let site = self.arr_obj(items)?;
+        let raw_arr = self.arr_obj(raws)?;
+        set_prop(&mut self.heap, Value::Obj(site), "raw", Value::Obj(raw_arr))?;
+        let texpr: &Expr = tag;
+        let hint = match texpr {
+            Expr::Ident(n) | Expr::Member(_, n) => Some(n.as_str()),
+            _ => None,
+        };
+        let mut args = Vec::with_capacity(vals.len() + 1);
+        args.push(Value::Obj(site));
+        args.extend(vals);
+        self.call_value(f, Value::Undef, &args, hint)
     }
 
     pub(crate) fn eval_args(&mut self, env: u32, es: &[Expr]) -> Result<Vec<Value>, JsError> {
@@ -5486,6 +5539,25 @@ fn n_str_from_code_point(it: &mut Interp, _this: Value, args: &[Value]) -> Resul
             return Err(err(format!("invalid code point {}", to_str(&it.heap, *a))));
         }
         out.push(char::from_u32(cp).unwrap());
+    }
+    Ok(Value::Str(it.heap.alloc_str(out)?))
+}
+
+/// String.raw(site, ...subs): interleaves site.raw with the
+/// substitutions (raw text, not cooked, so escapes survive verbatim).
+fn n_str_raw(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let raw_v = get_prop(&it.heap, &it.protos, arg(args, 0), "raw")?;
+    let len = match get_prop(&it.heap, &it.protos, raw_v, "length") {
+        Ok(Value::Num(n)) if n > 0.0 => (n.floor() as usize).min(1 << 28),
+        _ => 0,
+    };
+    let mut out = String::new();
+    for i in 0..len {
+        let seg = get_prop(&it.heap, &it.protos, raw_v, &i.to_string())?;
+        out.push_str(&to_str(&it.heap, seg));
+        if let Some(sub) = args.get(i + 1) {
+            out.push_str(&to_str(&it.heap, *sub));
+        }
     }
     Ok(Value::Str(it.heap.alloc_str(out)?))
 }
@@ -11960,8 +12032,46 @@ mod tests {
         assert_eq!(disp("`esc \\` \\$`"), "esc ` $");
         assert_eq!(disp("`x=${{a: 1}.a}`"), "x=1");
         assert_eq!(out("console.log(`v=${7}`)"), "v=7\n");
-        assert!(errmsg("var t=`x`;f`t`").contains("tagged templates"));
+        assert_eq!(disp("`\\u{41}\\x42`"), "AB");
         assert!(errmsg("`abc").contains("unterminated template"));
+        assert!(errmsg("var t=`\\xg`;t").contains("invalid escape"));
+    }
+
+    #[test]
+    fn tagged_templates() {
+        // strings array shape: length, cooked items, values in order
+        assert_eq!(disp("function t(s){return s.length}t`a${1}b`"), "2");
+        assert_eq!(disp("function t(s,a,b){return a+'|'+b}t`x${1}y${2}z`"), "1|2");
+        assert_eq!(disp("function t(s){return s[0]+'|'+s[1]}t`a${1}b`"), "a|b");
+        assert_eq!(disp("function t(s){return s.length+':'+s[0]}t`hi`"), "1:hi");
+        // Array.isArray holds for the site and its raw
+        assert_eq!(
+            disp("function t(s){return Array.isArray(s)+'|'+Array.isArray(s.raw)+'|'+s.raw.length}t`a${1}b`"),
+            "true|true|2"
+        );
+        // cooked escapes resolve; raw keeps the backslash text
+        assert_eq!(disp("function t(s){return s[0]}t`\\n`"), "\n");
+        assert_eq!(disp("function t(s){return s.raw[0]}t`a\\nb`"), "a\\nb");
+        assert_eq!(disp("function t(s){return s[0]+'|'+s.raw[0]}t`\\x41`"), "A|\\x41");
+        // invalid escapes poison cooked to undefined, raw keeps text
+        assert_eq!(disp("function t(s){return s[0]===undefined}t`\\u{110000}`"), "true");
+        assert_eq!(disp("function t(s){return s.raw[0]}t`\\u{110000}`"), "\\u{110000}");
+        assert_eq!(disp("function t(s){return s[0]+'|'+s[1]}t`a${1}\\xg`"), "a|undefined");
+        // member-expression tags run with this=undefined per spec
+        assert_eq!(disp("var o={tag:function(s,v){return s[0]+v}};o.tag`hi${42}`"), "hi42");
+        assert_eq!(disp("var o={tag:function(s){return this===undefined}};o.tag`x`"), "true");
+        // nesting both directions
+        assert_eq!(disp("function t(s,v){return s[0]+v+s[1]};t`a${t`b${2}c`}d`"), "ab2cd");
+        assert_eq!(disp("function t(s,v){return v};t`a${`b${3}c`}d`"), "b3c");
+        // chains on the result like an ordinary call value
+        assert_eq!(disp("function t(s){return {v:s[0]}};t`k`.v"), "k");
+        // String.raw falls out of the shape (raw text, subs interleaved)
+        assert_eq!(disp("String.raw`h\\x`"), "h\\x");
+        assert_eq!(disp("String.raw`a${1}b${2}c`"), "a1b2c");
+        assert_eq!(disp("String.raw({raw:['a','b']},1)"), "a1b");
+        // non-function tags throw like ordinary calls
+        assert!(errmsg("5`x`").contains("not a function"));
+        assert!(errmsg("var t=`x`;t`t`").contains("not a function"));
     }
 
     #[test]

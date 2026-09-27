@@ -25,7 +25,8 @@
 //!   `new` callee is primary + member chain: `new a.b()` is New(Member a.b).
 //! - Supported beyond ES5: ?. ?? => arrow fns, for-of/in over
 //!   arrays/strings/keys, regex literals + RegExp
-//!   (test/exec/match/replace/split/search), template literals (untagged),
+//!   (test/exec/match/replace/split/search), template literals (tagged +
+//!   untagged, String.raw),
 //!   ... spread in calls/arrays/objects, rest params, comma operator,
 //!   default params, destructuring in var/let/const, switch, do-while,
 //!   void, method/get/set shorthand in literals, Symbol, Map/Set/WeakMap,

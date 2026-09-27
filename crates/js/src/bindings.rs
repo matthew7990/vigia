@@ -1163,6 +1163,31 @@ impl Interp {
                 }
                 "textContent" => Ok(Value::Null),
                 "implementation" => self.impl_obj(),
+                "cookie" => {
+                    // document.cookie: jar view minus HttpOnly. Page URL
+                    // prefers the net ctx base, else the live location.
+                    let url = self
+                        .net
+                        .as_ref()
+                        .map(|c| c.base.clone())
+                        .or_else(|| {
+                            self.env_get(0, "location").and_then(|loc| {
+                                match get_prop(&self.heap, &self.protos, loc, "href") {
+                                    Ok(Value::Str(id)) => {
+                                        vigia_url::Url::parse(self.heap.get_str(id)).ok()
+                                    }
+                                    _ => None,
+                                }
+                            })
+                        });
+                    match (url, self.net.as_ref()) {
+                        (Some(u), Some(ctx)) => {
+                            let s = ctx.jar.cookies_for_js(&u);
+                            self.str_val(s)
+                        }
+                        _ => self.str_val(String::new()),
+                    }
+                }
                 "styleSheets" => {
                     // One facade per <style> (+stylesheet <link>), arena
                     // order; link rules stay empty (no fetching).
@@ -1298,6 +1323,16 @@ impl Interp {
                         let te = dom.element(parent, "title", vec![]);
                         dom.text(te, &t);
                     }
+                }
+            }
+            if key == "cookie" {
+                // document.cookie = "k=v; expires=...; path=/...": store
+                // into the page jar (Set-Cookie shape). No jar without a
+                // net context (bare runs) - sloppy no-op there.
+                let s = to_str(&self.heap, v);
+                let base = self.net.as_ref().map(|c| c.base.clone());
+                if let (Some(u), Some(ctx)) = (base, self.net.as_mut()) {
+                    ctx.jar.store_header(&u, &s);
                 }
             }
             return Ok(());
@@ -2229,6 +2264,17 @@ mod tests {
     }
 
     #[test]
+    fn sloppy_this_window() {
+        // With a DOM installed, top-level and bare-call `this` is window.
+        let mut it = interp(PAGE);
+        assert_eq!(ev(&mut it, "this === window"), "true");
+        assert_eq!(ev(&mut it, "function f(){return this}f()===window"), "true");
+        assert_eq!(ev(&mut it, "this.dT_"), "undefined");
+        // Sloppy this-write creates a real global through window.
+        assert_eq!(ev(&mut it, "function f(){this.wx9=7} f();wx9"), "7");
+    }
+
+    #[test]
     fn window_events() {
         let mut it = interp(PAGE);
         // Registration on window (method + bare global), then dispatch.
@@ -2242,6 +2288,43 @@ mod tests {
         // removeEventListener detaches.
         it.run("var f=function(){hits.push('z')};window.addEventListener('z',f);window.removeEventListener('z',f);window.dispatchEvent({type:'z'})").unwrap();
         assert_eq!(ev(&mut it, "hits.join()"), "x,y");
+    }
+
+    #[test]
+    fn document_cookie() {
+        // Bot-manager shape: write via document.cookie, read back, jar
+        // keeps it for wire requests, HttpOnly stays hidden from JS.
+        let html = "<html><body><script>document.cookie='uzmx=v1; path=/';document.cookie='other=2; path=/';if(document.cookie.indexOf('uzmx=v1')<0)throw new Error('no readback')</script></body></html>";
+        let mut d = Dom::new();
+        vigia_html::parse(html, &mut d);
+        let mut it = Interp::new();
+        let out = it.run_scripts(
+            d,
+            Some(NetCtx {
+                base: vigia_url::Url::parse("http://a.com/dir/p").unwrap(),
+                jar: CookieJar::new(),
+                trace: None,
+            }),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        let jar = out.jar.unwrap();
+        assert_eq!(
+            jar.header_for(&vigia_url::Url::parse("http://a.com/x").unwrap()).as_deref(),
+            Some("uzmx=v1; other=2")
+        );
+        // HttpOnly set server-side never surfaces in document.cookie.
+        let mut jar2 = CookieJar::new();
+        jar2.store_header(
+            &vigia_url::Url::parse("http://a.com/").unwrap(),
+            "sess=s3cr3t; HttpOnly; path=/",
+        );
+        assert_eq!(
+            jar2.cookies_for_js(&vigia_url::Url::parse("http://a.com/").unwrap()),
+            ""
+        );
+        assert!(jar2
+            .header_for(&vigia_url::Url::parse("http://a.com/").unwrap())
+            .is_some());
     }
 
     #[test]

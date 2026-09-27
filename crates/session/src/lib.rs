@@ -106,6 +106,26 @@ impl CookieJar {
         (!pairs.is_empty()).then(|| pairs.join("; "))
     }
 
+    /// `document.cookie` view for `url`: like the wire header but without
+    /// HttpOnly cookies (invisible to JS).
+    pub fn cookies_for_js(&self, url: &Url) -> String {
+        self.cookies
+            .iter()
+            .filter(|c| {
+                !c.http_only
+                    && (if c.host_only {
+                        url.host == c.domain
+                    } else {
+                        domain_match(&url.host, &c.domain)
+                    })
+                    && path_match(&url.path, &c.path)
+                    && (!c.secure || url.is_https())
+            })
+            .map(|c| format!("{}={}", c.name, c.value))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
     pub fn len(&self) -> usize {
         self.cookies.len()
     }

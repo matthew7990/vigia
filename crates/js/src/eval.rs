@@ -103,8 +103,16 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
                 )
             }
             Obj::Native { name, .. } => format!("function {name}() {{ [native code] }}"),
+            Obj::Map { .. } => "[object Map]".into(),
+            Obj::Set { .. } => "[object Set]".into(),
+            Obj::WeakMap { .. } => "[object WeakMap]".into(),
+            Obj::Symbol { desc, .. } => match desc {
+                Some(s) => format!("Symbol({})", h.get_str(*s)),
+                None => "Symbol()".into(),
+            },
             Obj::Dom(_) => "[object Node]".into(),
             Obj::Promise(_) => "[object Promise]".into(),
+            Obj::Accessor { .. } => "[object Accessor]".into(),
             // No Dom access here: String(style) gives the tag, use cssText.
             Obj::Style { .. } => "[object CSSStyleDeclaration]".into(),
             Obj::RegExp { pat, flags, .. } => {
@@ -168,6 +176,7 @@ pub(crate) fn type_str(h: &Heap, v: Value) -> &'static str {
         Value::Str(_) => "string",
         Value::Obj(id) => match h.obj(id) {
             Obj::Func { .. } | Obj::Native { .. } => "function",
+            Obj::Symbol { .. } => "symbol",
             _ => "object",
         },
     }
@@ -219,7 +228,15 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
             "dotAll" => Some(Value::Bool(compiled.flags.dot_all)),
             _ => None,
         },
-        Obj::Dom(_) | Obj::Promise(_) | Obj::Style { .. } | Obj::Freed => None,
+        Obj::Dom(_)
+        | Obj::Promise(_)
+        | Obj::Style { .. }
+        | Obj::Accessor { .. }
+        | Obj::Symbol { .. }
+        | Obj::Map { .. }
+        | Obj::Set { .. }
+        | Obj::WeakMap { .. }
+        | Obj::Freed => None,
     }
 }
 
@@ -231,6 +248,11 @@ fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
         Obj::Native { .. } => po(protos.function_),
         Obj::Promise(_) => po(protos.promise),
         Obj::RegExp { proto, .. } => *proto,
+        Obj::Accessor { proto, .. } => *proto,
+        Obj::Symbol { proto, .. } => *proto,
+        Obj::Map { proto, .. } => *proto,
+        Obj::Set { proto, .. } => *proto,
+        Obj::WeakMap { proto, .. } => *proto,
         Obj::Style { .. } => po(protos.object),
         Obj::Dom(_) | Obj::Freed => None,
     }
@@ -276,7 +298,8 @@ impl Interp {
         if let Some(n) = self.as_style(v) {
             return self.style_get(n, key);
         }
-        get_prop(&self.heap, &self.protos, v, key)
+        let val = get_prop(&self.heap, &self.protos, v, key)?;
+        self.invoke_getter(val, v, key)
     }
 
     fn recv_get_idx(&mut self, v: Value, k: Value) -> Result<Value, JsError> {
@@ -288,7 +311,23 @@ impl Interp {
             let key = to_str(&self.heap, k);
             return self.style_get(n, &key);
         }
-        get_index(&mut self.heap, &self.protos, v, k)
+        let val = get_index(&mut self.heap, &self.protos, v, k)?;
+        let key = to_str(&self.heap, k);
+        self.invoke_getter(val, v, &key)
+    }
+
+    /// A getter value reads by calling it (this = receiver); getter-less
+    /// accessors read undefined. Plain values pass through.
+    fn invoke_getter(&mut self, val: Value, recv: Value, key: &str) -> Result<Value, JsError> {
+        let gid = match val {
+            Value::Obj(id) => match self.heap.obj(id) {
+                Obj::Accessor { get: Some(g), .. } => *g,
+                Obj::Accessor { .. } => return Ok(Value::Undef),
+                _ => return Ok(val),
+            },
+            _ => return Ok(val),
+        };
+        self.call_value(Value::Obj(gid), recv, &[], Some(key))
     }
 
     fn recv_set(&mut self, v: Value, key: &str, val: Value) -> Result<(), JsError> {
@@ -297,6 +336,10 @@ impl Interp {
         }
         if let Some(n) = self.as_style(v) {
             return self.style_set(n, key, val);
+        }
+        let cur = get_prop(&self.heap, &self.protos, v, key)?;
+        if self.invoke_setter(cur, v, val, key)? {
+            return Ok(());
         }
         set_prop(&mut self.heap, v, key, val)
     }
@@ -310,7 +353,33 @@ impl Interp {
             let key = to_str(&self.heap, k);
             return self.style_set(n, &key, val);
         }
+        let key = to_str(&self.heap, k);
+        let cur = get_index(&mut self.heap, &self.protos, v, k)?;
+        if self.invoke_setter(cur, v, val, &key)? {
+            return Ok(());
+        }
         set_index(&mut self.heap, v, k, val)
+    }
+
+    /// A setter value writes by calling it; setter-less accessors drop the
+    /// write (sloppy no-op). Returns whether it handled the write.
+    fn invoke_setter(
+        &mut self,
+        cur: Value,
+        recv: Value,
+        val: Value,
+        key: &str,
+    ) -> Result<bool, JsError> {
+        let sid = match cur {
+            Value::Obj(id) => match self.heap.obj(id) {
+                Obj::Accessor { set: Some(s), .. } => *s,
+                Obj::Accessor { .. } => return Ok(true),
+                _ => return Ok(false),
+            },
+            _ => return Ok(false),
+        };
+        self.call_value(Value::Obj(sid), recv, &[val], Some(key))?;
+        Ok(true)
     }
 }
 
@@ -517,6 +586,39 @@ impl Interp {
         id
     }
 
+    /// Collection prototype: methods plus a `size` accessor (absent for
+    /// WeakMap, like real JS). u32::MAX on heap-cap failure.
+    fn coll_bag(
+        &mut self,
+        methods: &[(&'static str, NativeFn)],
+        size_get: Option<NativeFn>,
+    ) -> u32 {
+        let proto = po(self.protos.object);
+        let Ok(id) = self.heap.alloc_obj(Obj::Ordinary {
+            pairs: vec![],
+            proto,
+        }) else {
+            return u32::MAX;
+        };
+        for (n, f) in methods {
+            self.put(id, n, *f);
+        }
+        if let Some(size_get) = size_get {
+            if let Ok(get) = self.heap.alloc_obj(nat("get size", size_get)) {
+                if let Ok(acc) = self.heap.alloc_obj(Obj::Accessor {
+                    get: Some(get),
+                    set: None,
+                    proto,
+                }) {
+                    if let Obj::Ordinary { pairs, .. } = self.heap.obj_mut(id) {
+                        pairs.push(("size".into(), Value::Obj(acc)));
+                    }
+                }
+            }
+        }
+        id
+    }
+
     /// Allocate the shared prototype objects once (called from with_cap).
     /// Cap edge: protos left as u32::MAX when there's no room - property
     /// lookup then degrades to own props only.
@@ -591,7 +693,73 @@ impl Interp {
             ("toISOString", n_date_iso),
             ("valueOf", n_date_get_time),
         ]);
+        // Map/Set/WeakMap prototypes; `size` is an accessor (no data slot).
+        // (One block per kind: sharing `self` mutably across a table would
+        // need unsafe, which this codebase forbids outside vigia-mem.)
+        self.protos.map = self.coll_bag(
+            &[
+                ("set", n_map_set as NativeFn),
+                ("get", n_map_get),
+                ("has", n_map_has),
+                ("delete", n_map_delete),
+                ("clear", n_map_clear),
+                ("keys", n_map_keys),
+                ("values", n_map_values),
+                ("entries", n_map_entries),
+                ("forEach", n_map_for_each),
+            ],
+            Some(n_map_size),
+        );
+        self.protos.set = self.coll_bag(
+            &[
+                ("add", n_set_add as NativeFn),
+                ("has", n_set_has),
+                ("delete", n_set_delete),
+                ("clear", n_set_clear),
+                ("values", n_set_values),
+                ("keys", n_set_values),
+                ("entries", n_set_entries),
+                ("forEach", n_set_for_each),
+            ],
+            Some(n_set_size),
+        );
+        self.protos.weakmap = self.coll_bag(
+            &[
+                ("set", n_weakmap_set as NativeFn),
+                ("get", n_weakmap_get),
+                ("has", n_weakmap_has),
+                ("delete", n_weakmap_delete),
+            ],
+            None,
+        );
         self.protos.regexp = self.proto_bag(&[("test", n_regexp_test), ("exec", n_regexp_exec)]);
+        // Symbol.prototype: toString/valueOf methods plus a `description`
+        // accessor (reuses the Accessor machinery).
+        {
+            let proto = po(self.protos.object);
+            if let Ok(id) = self.heap.alloc_obj(Obj::Ordinary {
+                pairs: vec![],
+                proto,
+            }) {
+                self.put(id, "toString", n_sym_to_string);
+                self.put(id, "valueOf", n_sym_value_of);
+                if let Ok(get) = self
+                    .heap
+                    .alloc_obj(nat("get description", n_sym_description))
+                {
+                    if let Ok(acc) = self.heap.alloc_obj(Obj::Accessor {
+                        get: Some(get),
+                        set: None,
+                        proto,
+                    }) {
+                        if let Obj::Ordinary { pairs, .. } = self.heap.obj_mut(id) {
+                            pairs.push(("description".into(), Value::Obj(acc)));
+                        }
+                        self.protos.symbol = id;
+                    }
+                }
+            }
+        }
         // Error.prototype: `name` as a data prop + a real toString method
         let mut eps: Vec<(String, Value)> = Vec::new();
         if let Ok(nm) = self.heap.intern_str("Error") {
@@ -621,6 +789,9 @@ impl Interp {
                 ("entries", n_obj_entries),
                 ("assign", n_obj_assign),
                 ("create", n_obj_create),
+                ("freeze", n_obj_freeze),
+                ("defineProperty", n_obj_define_property),
+                ("defineProperties", n_obj_define_properties),
             ],
         );
         self.ctor(
@@ -634,6 +805,15 @@ impl Interp {
         self.ctor("Boolean", n_boolean_cast, u32::MAX, &[]);
         self.ctor("Date", n_date, pr.date, &[("now", n_date_now)]);
         self.ctor("RegExp", n_regexp_ctor, pr.regexp, &[]);
+        self.ctor(
+            "Symbol",
+            n_symbol,
+            pr.symbol,
+            &[("for", n_symbol_for), ("keyFor", n_symbol_key_for)],
+        );
+        self.ctor("Map", n_map_ctor, pr.map, &[]);
+        self.ctor("Set", n_set_ctor, pr.set, &[]);
+        self.ctor("WeakMap", n_weakmap_ctor, pr.weakmap, &[]);
         self.ctor("Error", n_error, pr.error, &[]);
         self.ctor(
             "Promise",
@@ -863,6 +1043,22 @@ impl Interp {
                 }
                 Ok(Flow::Normal)
             }
+            Stmt::DoWhile(body, c) => {
+                loop {
+                    self.maybe_gc();
+                    match self.stmt(env, body)? {
+                        Flow::Normal | Flow::Continue => {}
+                        Flow::Break => break,
+                        f => return Ok(f),
+                    }
+                    self.tick()?;
+                    let c = self.expr(env, c)?;
+                    if !truthy(&self.heap, c) {
+                        break;
+                    }
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::For(init, test, upd, body) => self.stmt_for(env, init, test, upd, body),
             Stmt::ForOf {
                 name,
@@ -881,6 +1077,41 @@ impl Interp {
             } => {
                 let keys = self.for_in_keys(env, obj)?;
                 self.stmt_each(env, name, *is_decl, &keys, body)
+            }
+            Stmt::Switch { disc, cases } => {
+                let v = self.expr(env, disc)?;
+                // First strict match wins (tests eval in order); else the
+                // default; fallthrough runs every later clause body.
+                let mut start = None;
+                let mut default = None;
+                for (i, (t, _)) in cases.iter().enumerate() {
+                    match t {
+                        Some(e) => {
+                            if start.is_none() {
+                                let cv = self.expr(env, e)?;
+                                if strict_eq(&self.heap, v, cv) {
+                                    start = Some(i);
+                                    break;
+                                }
+                            }
+                        }
+                        None => {
+                            if default.is_none() {
+                                default = Some(i);
+                            }
+                        }
+                    }
+                }
+                if let Some(s) = start.or(default) {
+                    for (_, body) in &cases[s..] {
+                        match self.exec_block(body, env)? {
+                            Flow::Normal => {}
+                            Flow::Break => break,
+                            other => return Ok(other),
+                        }
+                    }
+                }
+                Ok(Flow::Normal)
             }
             Stmt::Block(ss) => self.exec_scoped(env, ss),
             Stmt::Break => Ok(Flow::Break),
@@ -1048,6 +1279,11 @@ impl Interp {
                 | Obj::Promise(_)
                 | Obj::Dom(_)
                 | Obj::Style { .. }
+                | Obj::Accessor { .. }
+                | Obj::Symbol { .. }
+                | Obj::Map { .. }
+                | Obj::Set { .. }
+                | Obj::WeakMap { .. }
                 | Obj::Freed => {}
             },
             Value::Str(id) => {
@@ -1144,6 +1380,9 @@ impl Interp {
                                 put(&mut pairs, k, v);
                             }
                         }
+                        ObjEntry::Accessor { key, get, set } => {
+                            self.obj_accessor(env, &mut pairs, key, get, set)?;
+                        }
                     }
                 }
                 Ok(Value::Obj(self.obj_pairs(pairs)?))
@@ -1221,6 +1460,10 @@ impl Interp {
                     _ => self.expr(env, e)?,
                 };
                 Ok(Value::Str(self.heap.intern_str(type_str(&self.heap, v))?))
+            }
+            "void" => {
+                self.expr(env, e)?;
+                Ok(Value::Undef)
             }
             "await" => {
                 if !self.fn_async {
@@ -1539,6 +1782,59 @@ impl Interp {
         }
     }
 
+    /// Merge one `get`/`set` side into the pairs: an existing Accessor
+    /// under the same key gains the side, anything else is replaced.
+    fn obj_accessor(
+        &mut self,
+        env: u32,
+        pairs: &mut Vec<(String, Value)>,
+        key: &str,
+        get: &Option<std::rc::Rc<FnDef>>,
+        set: &Option<std::rc::Rc<FnDef>>,
+    ) -> Result<(), JsError> {
+        let g = match get {
+            Some(d) => Some(self.func_obj(d.clone(), env)?),
+            None => None,
+        };
+        let s = match set {
+            Some(d) => Some(self.func_obj(d.clone(), env)?),
+            None => None,
+        };
+        if let Some((_, v)) = pairs.iter_mut().find(|(k, _)| k == key) {
+            if let Value::Obj(id) = *v {
+                if let Obj::Accessor {
+                    get: og, set: os, ..
+                } = self.heap.obj_mut(id)
+                {
+                    if g.is_some() {
+                        *og = g;
+                    }
+                    if s.is_some() {
+                        *os = s;
+                    }
+                    return Ok(());
+                }
+            }
+            let proto = po(self.protos.object);
+            *v = Value::Obj(self.heap.alloc_obj(Obj::Accessor {
+                get: g,
+                set: s,
+                proto,
+            })?);
+            return Ok(());
+        }
+        let proto = po(self.protos.object);
+        pairs.push((
+            key.to_string(),
+            Value::Obj(self.heap.alloc_obj(Obj::Accessor {
+                get: g,
+                set: s,
+                proto,
+            })?),
+        ));
+        Ok(())
+    }
+
     /// `{...x}` entries: own string-keyed props; null/undefined/numbers /
     /// booleans contribute nothing; strings and arrays spread by index.
     fn spread_pairs(&mut self, env: u32, e: &Expr) -> Result<Vec<(String, Value)>, JsError> {
@@ -1569,6 +1865,11 @@ impl Interp {
                 | Obj::Promise(_)
                 | Obj::Dom(_)
                 | Obj::Style { .. }
+                | Obj::Accessor { .. }
+                | Obj::Symbol { .. }
+                | Obj::Map { .. }
+                | Obj::Set { .. }
+                | Obj::WeakMap { .. }
                 | Obj::Freed => Ok(vec![]),
             },
         }
@@ -2107,6 +2408,11 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
                 Json::Null
             }
             Obj::RegExp { .. } => Json::Obj(vec![]),
+            Obj::Accessor { .. } => Json::Obj(vec![]),
+            Obj::Symbol { .. } => Json::Null,
+            Obj::Map { .. } => Json::Obj(vec![]),
+            Obj::Set { .. } => Json::Obj(vec![]),
+            Obj::WeakMap { .. } => Json::Obj(vec![]),
             Obj::Style { .. } => Json::Obj(vec![]),
         },
     })
@@ -2171,6 +2477,11 @@ fn n_obj_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
             Obj::Dom(_) => "[object Node]",
             Obj::Promise(_) => "[object Promise]",
             Obj::RegExp { .. } => "[object RegExp]",
+            Obj::Accessor { .. } => "[object Accessor]",
+            Obj::Symbol { .. } => "[object Symbol]",
+            Obj::Map { .. } => "[object Map]",
+            Obj::Set { .. } => "[object Set]",
+            Obj::WeakMap { .. } => "[object WeakMap]",
             Obj::Style { .. } => "[object CSSStyleDeclaration]",
             Obj::Ordinary { .. } | Obj::Freed => "[object Object]",
         },
@@ -2201,9 +2512,16 @@ fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
                 .enumerate()
                 .map(|(i, x)| (i.to_string(), *x))
                 .collect(),
-            Obj::Dom(_) | Obj::Promise(_) | Obj::RegExp { .. } | Obj::Style { .. } | Obj::Freed => {
-                Vec::new()
-            }
+            Obj::Dom(_)
+            | Obj::Promise(_)
+            | Obj::RegExp { .. }
+            | Obj::Style { .. }
+            | Obj::Accessor { .. }
+            | Obj::Symbol { .. }
+            | Obj::Map { .. }
+            | Obj::Set { .. }
+            | Obj::WeakMap { .. }
+            | Obj::Freed => Vec::new(),
         },
         _ => Vec::new(),
     }
@@ -2257,6 +2575,62 @@ fn n_obj_create(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, 
         pairs: vec![],
         proto,
     })?))
+}
+
+/// Object.freeze(o): no-op that returns the object (nothing enforces
+/// frozenness; scraping never depends on the throw-on-write).
+fn n_obj_freeze(_it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(arg(args, 0))
+}
+
+/// Shared by defineProperty/defineProperties: data (`value`) or accessor
+/// (`get`/`set`) descriptor; flags ignored (all props stay mutable).
+fn define_one(it: &mut Interp, target: Value, key: &str, desc: Value) -> Result<(), JsError> {
+    if !matches!(target, Value::Obj(_)) {
+        return Err(err("defineProperty: target must be an object"));
+    }
+    let g = get_prop(&it.heap, &it.protos, desc, "get")?;
+    let s = get_prop(&it.heap, &it.protos, desc, "set")?;
+    let has_acc = !matches!(g, Value::Undef) || !matches!(s, Value::Undef);
+    if has_acc {
+        let go = match g {
+            Value::Obj(id) => Some(id),
+            _ => None,
+        };
+        let so = match s {
+            Value::Obj(id) => Some(id),
+            _ => None,
+        };
+        let proto = po(it.protos.object);
+        let acc = Value::Obj(it.heap.alloc_obj(Obj::Accessor {
+            get: go,
+            set: so,
+            proto,
+        })?);
+        set_prop(&mut it.heap, target, key, acc)?;
+        return Ok(());
+    }
+    let v = get_prop(&it.heap, &it.protos, desc, "value")?;
+    set_prop(&mut it.heap, target, key, v)
+}
+
+fn n_obj_define_property(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let target = arg(args, 0);
+    let key = to_str(&it.heap, arg(args, 1));
+    define_one(it, target, &key, arg(args, 2))?;
+    Ok(target)
+}
+
+fn n_obj_define_properties(
+    it: &mut Interp,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let target = arg(args, 0);
+    for (k, d) in own_pairs(&it.heap, arg(args, 1)) {
+        define_one(it, target, &k, d)?;
+    }
+    Ok(target)
 }
 
 // -- Array ctor + statics --------------------------------------------------------
@@ -3255,6 +3629,485 @@ fn n_regexp_test(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, 
     }
     let text = to_str(&it.heap, arg(args, 0));
     Ok(Value::Bool(regexp_exec_inner(it, id, &text)?.is_some()))
+}
+
+// -- Symbol --------------------------------------------------------------------------
+
+fn make_symbol(it: &mut Interp, desc: Option<u32>) -> Result<Value, JsError> {
+    let proto = po(it.protos.symbol);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Symbol { desc, proto })?))
+}
+
+/// Symbol(desc?): never a constructor.
+fn n_symbol(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    if let Value::Obj(id) = this {
+        if matches!(it.heap.obj(id), Obj::Ordinary { .. }) {
+            return Err(err("Symbol is not a constructor"));
+        }
+    }
+    let desc = match arg(args, 0) {
+        Value::Undef => None,
+        v => Some(it.heap.alloc_str(to_str(&it.heap, v))?),
+    };
+    make_symbol(it, desc)
+}
+
+fn n_symbol_for(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let key = to_str(&it.heap, arg(args, 0));
+    if let Some(&id) = it.symbol_registry.get(&key) {
+        return Ok(Value::Obj(id));
+    }
+    let desc = it.heap.alloc_str(key.clone())?;
+    let Value::Obj(id) = make_symbol(it, Some(desc))? else {
+        unreachable!()
+    };
+    it.symbol_registry.insert(key, id);
+    Ok(Value::Obj(id))
+}
+
+fn n_symbol_key_for(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Value::Obj(id) = arg(args, 0) else {
+        return Err(err("keyFor on a non-Symbol"));
+    };
+    if !matches!(it.heap.obj(id), Obj::Symbol { .. }) {
+        return Err(err("keyFor on a non-Symbol"));
+    }
+    for (k, &v) in &it.symbol_registry {
+        if v == id {
+            return Ok(Value::Str(it.heap.alloc_str(k.clone())?));
+        }
+    }
+    Ok(Value::Undef)
+}
+
+fn sym_this(it: &Interp, this: Value, op: &str) -> Result<u32, JsError> {
+    match this {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Symbol { .. }) => Ok(id),
+        _ => Err(err(format!("{op} on a non-Symbol"))),
+    }
+}
+
+fn n_sym_description(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    // Called as an accessor with this = the symbol.
+    let id = sym_this(it, this, "description")?;
+    match it.heap.obj(id) {
+        Obj::Symbol { desc: Some(s), .. } => Ok(Value::Str(*s)),
+        _ => Ok(Value::Undef),
+    }
+}
+
+fn n_sym_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = sym_this(it, this, "toString")?;
+    let s = match it.heap.obj(id) {
+        Obj::Symbol { desc: Some(s), .. } => format!("Symbol({})", it.heap.get_str(*s)),
+        _ => "Symbol()".to_string(),
+    };
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+fn n_sym_value_of(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = sym_this(it, this, "valueOf")?;
+    Ok(Value::Obj(id))
+}
+
+// -- Map / Set / WeakMap -------------------------------------------------------------
+
+/// SameValueZero for map keys: strict plus NaN-equals-NaN.
+fn same_key(h: &Heap, a: Value, b: Value) -> bool {
+    if strict_eq(h, a, b) {
+        return true;
+    }
+    matches!((a, b), (Value::Num(x), Value::Num(y)) if x.is_nan() && y.is_nan())
+}
+
+fn map_this(it: &Interp, this: Value, op: &str) -> Result<u32, JsError> {
+    match this {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Map { .. }) => Ok(id),
+        _ => Err(err(format!("{op} on a non-Map"))),
+    }
+}
+
+fn set_this(it: &Interp, this: Value, op: &str) -> Result<u32, JsError> {
+    match this {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Set { .. }) => Ok(id),
+        _ => Err(err(format!("{op} on a non-Set"))),
+    }
+}
+
+fn wmap_this(it: &Interp, this: Value, op: &str) -> Result<u32, JsError> {
+    match this {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::WeakMap { .. }) => Ok(id),
+        _ => Err(err(format!("{op} on a non-WeakMap"))),
+    }
+}
+
+fn map_find(h: &Heap, entries: &[(Value, Value)], key: Value) -> Option<usize> {
+    entries.iter().position(|(k, _)| same_key(h, *k, key))
+}
+
+fn set_find(h: &Heap, items: &[Value], key: Value) -> Option<usize> {
+    items.iter().position(|v| same_key(h, *v, key))
+}
+
+fn n_map_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let proto = po(it.protos.map);
+    let id = it.heap.alloc_obj(Obj::Map {
+        entries: vec![],
+        proto,
+    })?;
+    // `new Map([[k,v], ...])`: strict arrays of pairs.
+    if let Some(pairs) = args.first() {
+        if !matches!(pairs, Value::Undef) {
+            let Value::Obj(pid) = pairs else {
+                return Err(err("Map constructor takes pairs"));
+            };
+            let items = match it.heap.obj(*pid) {
+                Obj::Arr { items, .. } => items.clone(),
+                _ => return Err(err("Map constructor takes pairs")),
+            };
+            for p in items {
+                let Value::Obj(eid) = p else {
+                    return Err(err("Map constructor takes pairs"));
+                };
+                let (k, v) = match it.heap.obj(eid) {
+                    Obj::Arr { items, .. } => (
+                        items.first().copied().unwrap_or(Value::Undef),
+                        items.get(1).copied().unwrap_or(Value::Undef),
+                    ),
+                    _ => return Err(err("Map constructor takes pairs")),
+                };
+                let found = match it.heap.obj(id) {
+                    Obj::Map { entries, .. } => map_find(&it.heap, entries, k),
+                    _ => unreachable!(),
+                };
+                match it.heap.obj_mut(id) {
+                    Obj::Map { entries, .. } => match found {
+                        Some(i) => entries[i].1 = v,
+                        None => entries.push((k, v)),
+                    },
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+    Ok(Value::Obj(id))
+}
+
+fn n_map_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = map_this(it, this, "set")?;
+    let (k, v) = (arg(args, 0), arg(args, 1));
+    let found = match it.heap.obj(id) {
+        Obj::Map { entries, .. } => map_find(&it.heap, entries, k),
+        _ => unreachable!(),
+    };
+    match it.heap.obj_mut(id) {
+        Obj::Map { entries, .. } => match found {
+            Some(i) => entries[i].1 = v,
+            None => entries.push((k, v)),
+        },
+        _ => unreachable!(),
+    }
+    Ok(this)
+}
+
+fn n_map_get(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = map_this(it, this, "get")?;
+    Ok(match it.heap.obj(id) {
+        Obj::Map { entries, .. } => map_find(&it.heap, entries, arg(args, 0))
+            .map(|i| entries[i].1)
+            .unwrap_or(Value::Undef),
+        _ => unreachable!(),
+    })
+}
+
+fn n_map_has(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = map_this(it, this, "has")?;
+    Ok(match it.heap.obj(id) {
+        Obj::Map { entries, .. } => {
+            Value::Bool(map_find(&it.heap, entries, arg(args, 0)).is_some())
+        }
+        _ => unreachable!(),
+    })
+}
+
+fn n_map_delete(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = map_this(it, this, "delete")?;
+    let found = match it.heap.obj(id) {
+        Obj::Map { entries, .. } => map_find(&it.heap, entries, arg(args, 0)),
+        _ => unreachable!(),
+    };
+    Ok(match it.heap.obj_mut(id) {
+        Obj::Map { entries, .. } => match found {
+            Some(i) => {
+                entries.remove(i);
+                Value::Bool(true)
+            }
+            None => Value::Bool(false),
+        },
+        _ => unreachable!(),
+    })
+}
+
+fn n_map_clear(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = map_this(it, this, "clear")?;
+    if let Obj::Map { entries, .. } = it.heap.obj_mut(id) {
+        entries.clear();
+    }
+    Ok(Value::Undef)
+}
+
+fn map_vec(
+    it: &mut Interp,
+    this: Value,
+    op: &str,
+    pick: fn(Value, Value) -> Value,
+) -> Result<Value, JsError> {
+    let id = map_this(it, this, op)?;
+    let vals = match it.heap.obj(id) {
+        Obj::Map { entries, .. } => entries.iter().map(|&(k, v)| pick(k, v)).collect(),
+        _ => unreachable!(),
+    };
+    Ok(Value::Obj(it.arr_obj(vals)?))
+}
+
+fn n_map_keys(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    map_vec(it, this, "keys", |k, _| k)
+}
+
+fn n_map_values(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    map_vec(it, this, "values", |_, v| v)
+}
+
+fn n_map_entries(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = map_this(it, this, "entries")?;
+    let pairs = match it.heap.obj(id) {
+        Obj::Map { entries, .. } => entries.clone(),
+        _ => unreachable!(),
+    };
+    let mut vals = Vec::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        vals.push(Value::Obj(it.arr_obj(vec![k, v])?));
+    }
+    Ok(Value::Obj(it.arr_obj(vals)?))
+}
+
+fn n_map_for_each(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = map_this(it, this, "forEach")?;
+    let pairs = match it.heap.obj(id) {
+        Obj::Map { entries, .. } => entries.clone(),
+        _ => unreachable!(),
+    };
+    let (f, that) = (arg(args, 0), arg(args, 1));
+    for (k, v) in pairs {
+        it.call_value(f, that, &[v, k, this], None)?;
+    }
+    Ok(Value::Undef)
+}
+
+fn n_map_size(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = map_this(it, this, "size")?;
+    Ok(match it.heap.obj(id) {
+        Obj::Map { entries, .. } => Value::Num(entries.len() as f64),
+        _ => unreachable!(),
+    })
+}
+
+fn n_set_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let proto = po(it.protos.set);
+    let id = it.heap.alloc_obj(Obj::Set {
+        items: vec![],
+        proto,
+    })?;
+    if let Some(Value::Obj(pid)) = args.first() {
+        let items = match it.heap.obj(*pid) {
+            Obj::Arr { items, .. } => items.clone(),
+            _ => return Err(err("Set constructor takes an array")),
+        };
+        for v in items {
+            let fresh = match it.heap.obj(id) {
+                Obj::Set { items, .. } => set_find(&it.heap, items, v).is_none(),
+                _ => unreachable!(),
+            };
+            if fresh {
+                if let Obj::Set { items, .. } = it.heap.obj_mut(id) {
+                    items.push(v);
+                }
+            }
+        }
+    }
+    Ok(Value::Obj(id))
+}
+
+fn n_set_add(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = set_this(it, this, "add")?;
+    let v = arg(args, 0);
+    let fresh = match it.heap.obj(id) {
+        Obj::Set { items, .. } => set_find(&it.heap, items, v).is_none(),
+        _ => unreachable!(),
+    };
+    if fresh {
+        if let Obj::Set { items, .. } = it.heap.obj_mut(id) {
+            items.push(v);
+        }
+    }
+    Ok(this)
+}
+
+fn n_set_has(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = set_this(it, this, "has")?;
+    Ok(match it.heap.obj(id) {
+        Obj::Set { items, .. } => Value::Bool(set_find(&it.heap, items, arg(args, 0)).is_some()),
+        _ => unreachable!(),
+    })
+}
+
+fn n_set_delete(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = set_this(it, this, "delete")?;
+    let found = match it.heap.obj(id) {
+        Obj::Set { items, .. } => set_find(&it.heap, items, arg(args, 0)),
+        _ => unreachable!(),
+    };
+    Ok(match it.heap.obj_mut(id) {
+        Obj::Set { items, .. } => match found {
+            Some(i) => {
+                items.remove(i);
+                Value::Bool(true)
+            }
+            None => Value::Bool(false),
+        },
+        _ => unreachable!(),
+    })
+}
+
+fn n_set_clear(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = set_this(it, this, "clear")?;
+    if let Obj::Set { items, .. } = it.heap.obj_mut(id) {
+        items.clear();
+    }
+    Ok(Value::Undef)
+}
+
+fn set_vec(
+    it: &mut Interp,
+    this: Value,
+    op: &str,
+    pick: fn(Value) -> Value,
+) -> Result<Value, JsError> {
+    let id = set_this(it, this, op)?;
+    let vals = match it.heap.obj(id) {
+        Obj::Set { items, .. } => items.iter().map(|&v| pick(v)).collect(),
+        _ => unreachable!(),
+    };
+    Ok(Value::Obj(it.arr_obj(vals)?))
+}
+
+fn n_set_values(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    set_vec(it, this, "values", |v| v)
+}
+
+fn n_set_entries(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = set_this(it, this, "entries")?;
+    let items = match it.heap.obj(id) {
+        Obj::Set { items, .. } => items.clone(),
+        _ => unreachable!(),
+    };
+    let mut vals = Vec::with_capacity(items.len());
+    for v in items {
+        vals.push(Value::Obj(it.arr_obj(vec![v, v])?));
+    }
+    Ok(Value::Obj(it.arr_obj(vals)?))
+}
+
+fn n_set_for_each(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = set_this(it, this, "forEach")?;
+    let items = match it.heap.obj(id) {
+        Obj::Set { items, .. } => items.clone(),
+        _ => unreachable!(),
+    };
+    let (f, that) = (arg(args, 0), arg(args, 1));
+    for v in items {
+        it.call_value(f, that, &[v, v, this], None)?;
+    }
+    Ok(Value::Undef)
+}
+
+fn n_set_size(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = set_this(it, this, "size")?;
+    Ok(match it.heap.obj(id) {
+        Obj::Set { items, .. } => Value::Num(items.len() as f64),
+        _ => unreachable!(),
+    })
+}
+
+fn n_weakmap_ctor(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let proto = po(it.protos.weakmap);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::WeakMap {
+        entries: vec![],
+        proto,
+    })?))
+}
+
+fn weak_key(v: Value) -> Result<(), JsError> {
+    match v {
+        Value::Obj(_) => Ok(()),
+        _ => Err(err("WeakMap key must be an object")),
+    }
+}
+
+fn n_weakmap_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = wmap_this(it, this, "set")?;
+    let (k, v) = (arg(args, 0), arg(args, 1));
+    weak_key(k)?;
+    let found = match it.heap.obj(id) {
+        Obj::WeakMap { entries, .. } => map_find(&it.heap, entries, k),
+        _ => unreachable!(),
+    };
+    match it.heap.obj_mut(id) {
+        Obj::WeakMap { entries, .. } => match found {
+            Some(i) => entries[i].1 = v,
+            None => entries.push((k, v)),
+        },
+        _ => unreachable!(),
+    }
+    Ok(this)
+}
+
+fn n_weakmap_get(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = wmap_this(it, this, "get")?;
+    Ok(match it.heap.obj(id) {
+        Obj::WeakMap { entries, .. } => map_find(&it.heap, entries, arg(args, 0))
+            .map(|i| entries[i].1)
+            .unwrap_or(Value::Undef),
+        _ => unreachable!(),
+    })
+}
+
+fn n_weakmap_has(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = wmap_this(it, this, "has")?;
+    Ok(match it.heap.obj(id) {
+        Obj::WeakMap { entries, .. } => {
+            Value::Bool(map_find(&it.heap, entries, arg(args, 0)).is_some())
+        }
+        _ => unreachable!(),
+    })
+}
+
+fn n_weakmap_delete(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = wmap_this(it, this, "delete")?;
+    let found = match it.heap.obj(id) {
+        Obj::WeakMap { entries, .. } => map_find(&it.heap, entries, arg(args, 0)),
+        _ => unreachable!(),
+    };
+    Ok(match it.heap.obj_mut(id) {
+        Obj::WeakMap { entries, .. } => match found {
+            Some(i) => {
+                entries.remove(i);
+                Value::Bool(true)
+            }
+            None => Value::Bool(false),
+        },
+        _ => unreachable!(),
+    })
 }
 
 fn is_regexp(it: &Interp, v: Value) -> bool {
@@ -4505,6 +5358,87 @@ mod tests {
         assert_eq!(num("var t=0;for(var x of [1,2,3])t+=x;t"), 6.0);
         assert_eq!(disp("var s='';for(let c of 'ab')s+=c;s"), "ab");
         assert!(errmsg("for(var x of {})x").contains("only over arrays"));
+    }
+
+    #[test]
+    fn do_while_runs_once() {
+        assert_eq!(num("var t=0;do{t+=1}while(t<3);t"), 3.0);
+        assert_eq!(num("var t=0;do{t+=1}while(false);t"), 1.0);
+        assert_eq!(num("var t=0;do{if(t>5)break;t+=2}while(t<10);t"), 6.0);
+    }
+
+    #[test]
+    fn switch_dispatch() {
+        assert_eq!(
+            disp("var o='';switch(2){case 1:o+='a';break;case 2:o+='b';default:o+='z'};o"),
+            "bz"
+        );
+        assert_eq!(
+            disp("var o='';switch(9){case 1:o+='a';break;default:o+='d'};o"),
+            "d"
+        );
+        assert_eq!(disp("var o='';switch(9){case 1:o+='a'};o"), "");
+        assert_eq!(
+            disp("var o='';switch(1){case 1:o+='a';case 2:o+='b'};o"),
+            "ab"
+        );
+        assert_eq!(
+            disp("var o='';switch('1'){case 1:o+='n';break;default:o+='s'};o"),
+            "s"
+        );
+        // `break` in a case exits the switch, not the enclosing loop.
+        assert_eq!(
+            num("var t=0;for(var i=0;i<3;i++){switch(i){case 1:break}t+=1}t"),
+            3.0
+        );
+        assert!(errmsg("break").contains("outside loop"));
+        assert!(errmsg("switch(1){default:break;default:}").contains("duplicate default"));
+    }
+
+    #[test]
+    fn void_operator() {
+        assert_eq!(disp("void 0"), "undefined");
+        assert_eq!(disp("void(1+1)"), "undefined");
+        assert_eq!(disp("var x=1;void x;x"), "1");
+    }
+
+    #[test]
+    fn methods_and_accessors() {
+        assert_eq!(disp("var o={m(){return 7}};o.m()"), "7");
+        assert_eq!(disp("var o={n:1,m(){return this.n+1}};o.m()"), "2");
+        assert_eq!(disp("var o={get x(){return 42}};o.x"), "42");
+        assert_eq!(disp("var o={n:1,get g(){return this.n*2}};o.g"), "2");
+        assert_eq!(disp("var o={n:0,set s(v){this.n=v}};o.s=10;o.n"), "10");
+        assert_eq!(
+            disp("var b={get x(){return 1},set x(v){this.y=v}};b.x=5;b.x+b.y"),
+            "6"
+        );
+        assert_eq!(disp("var o={get(){return 1}};o.get()"), "1");
+    }
+
+    #[test]
+    fn symbols() {
+        assert_eq!(disp("typeof Symbol('d')"), "symbol");
+        assert_eq!(disp("Symbol('d').description"), "d");
+        assert_eq!(disp("Symbol().toString()"), "Symbol()");
+        assert_eq!(disp("Symbol.for('k')===Symbol.for('k')"), "true");
+        assert_eq!(disp("Symbol.keyFor(Symbol.for('k'))"), "k");
+        assert_eq!(disp("var o={};o[Symbol.for('rk')]=7;o['Symbol(rk)']"), "7");
+        assert!(errmsg("new Symbol()").contains("not a constructor"));
+    }
+
+    #[test]
+    fn maps_and_sets() {
+        assert_eq!(disp("var m=new Map();m.set('a',1);m.get('a')"), "1");
+        assert_eq!(disp("var m=new Map();m.set('a',1);m.size"), "1");
+        assert_eq!(disp("var m=new Map([['a',1],['b',2]]);m.get('b')"), "2");
+        assert_eq!(disp("var s=new Set([1,2,2]);s.size"), "2");
+        assert_eq!(disp("var s=new Set();s.add(1);s.has(1)"), "true");
+        assert_eq!(
+            disp("var w=new WeakMap();var o={};w.set(o,5);w.get(o)"),
+            "5"
+        );
+        assert!(errmsg("var w=new WeakMap();w.set(1,2)").contains("must be an object"));
     }
 
     #[test]

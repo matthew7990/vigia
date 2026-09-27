@@ -39,11 +39,17 @@ pub enum Expr {
     New(Box<Expr>, Vec<Expr>),
 }
 
-/// One object-literal entry: `k: v`, `k` shorthand, or `...x` spread.
+/// One object-literal entry: `k: v`, `k` shorthand, `...x` spread,
+/// `m() {}` method, or `get x()` / `set x(v)` accessor side.
 #[derive(Debug)]
 pub enum ObjEntry {
     Pair(String, Expr),
     Spread(Expr),
+    Accessor {
+        key: String,
+        get: Option<std::rc::Rc<FnDef>>,
+        set: Option<std::rc::Rc<FnDef>>,
+    },
 }
 
 /// One `var` declarator: `name = init` or a pattern (`[a,b] = e`).
@@ -100,6 +106,8 @@ pub enum Stmt {
     Return(Option<Expr>),
     If(Expr, Box<Stmt>, Option<Box<Stmt>>),
     While(Expr, Box<Stmt>),
+    /// do body while (test): runs at least once.
+    DoWhile(Box<Stmt>, Expr),
     /// for(init; test; update) body
     For(Option<Box<Stmt>>, Option<Expr>, Option<Expr>, Box<Stmt>),
     /// Strict `for-of` over arrays and strings only:
@@ -117,6 +125,12 @@ pub enum Stmt {
         is_decl: bool,
         obj: Expr,
         body: Box<Stmt>,
+    },
+    /// `switch (d) { case e: ...; default: ... }`: strict match, fallthrough.
+    /// cases holds (test, body); test None is `default` (at most one).
+    Switch {
+        disc: Expr,
+        cases: Vec<(Option<Expr>, Vec<Stmt>)>,
     },
     Block(Vec<Stmt>),
     Break,

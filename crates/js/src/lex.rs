@@ -61,6 +61,11 @@ const KWS: &[&str] = &[
     "try",
     "catch",
     "finally",
+    "switch",
+    "case",
+    "default",
+    "do",
+    "void",
 ];
 
 /// Longest first: prefix order decides `>>>=` vs `>>>` vs `>>` vs `>`.

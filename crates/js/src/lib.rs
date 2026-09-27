@@ -193,6 +193,34 @@ pub enum Obj {
     /// Live CSS declaration block for an element: reads/writes go to the
     /// element's `style` attribute on every access (no cached copy).
     Style { node: NodeId },
+    /// Accessor property value (`get x()`/`set x(v)` in literals, and
+    /// later class prototypes): invoked on read/write, never exposed.
+    Accessor {
+        get: Option<u32>,
+        set: Option<u32>,
+        proto: Option<u32>,
+    },
+    /// Symbol primitive (boxed): `desc` is an optional Str id. Identity
+    /// is the obj id; `Symbol.for` keeps a registry for stability.
+    Symbol {
+        desc: Option<u32>,
+        proto: Option<u32>,
+    },
+    /// Map entries in insertion order (SameValueZero keys).
+    Map {
+        entries: Vec<(Value, Value)>,
+        proto: Option<u32>,
+    },
+    /// Set items in insertion order.
+    Set {
+        items: Vec<Value>,
+        proto: Option<u32>,
+    },
+    /// WeakMap without weakness: entries live forever, no iteration.
+    WeakMap {
+        entries: Vec<(Value, Value)>,
+        proto: Option<u32>,
+    },
     /// Compiled regex: `pat`/`flags` are Str ids (GC roots), `last_index`
     /// counts chars (not bytes). The compiled AST is immutable Rust data.
     RegExp {
@@ -271,6 +299,10 @@ pub struct Protos {
     pub promise: u32,
     pub error: u32,
     pub regexp: u32,
+    pub symbol: u32,
+    pub map: u32,
+    pub set: u32,
+    pub weakmap: u32,
 }
 
 impl Protos {
@@ -285,6 +317,10 @@ impl Protos {
             promise: u32::MAX,
             error: u32::MAX,
             regexp: u32::MAX,
+            symbol: u32::MAX,
+            map: u32::MAX,
+            set: u32::MAX,
+            weakmap: u32::MAX,
         }
     }
 }
@@ -454,6 +490,8 @@ pub struct Interp {
     pub(crate) fn_async: bool,
     /// GC freelist for the env arena (envs never shrink either).
     pub(crate) free_envs: Vec<u32>,
+    /// `Symbol.for` registry: key -> symbol obj id (roots, live forever).
+    pub(crate) symbol_registry: HashMap<String, u32>,
     /// Every env currently open on the eval stack (innermost last):
     /// exec_block pushes its env, `for` pushes its decl env. GC roots -
     /// together with parent links they cover every live frame.
@@ -510,6 +548,7 @@ impl Interp {
             cur_native: Value::Undef,
             fn_async: false,
             free_envs: Vec::new(),
+            symbol_registry: HashMap::new(),
             env_stack: Vec::new(),
             call_vals: Vec::new(),
             gc_runs: 0,

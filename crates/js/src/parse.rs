@@ -23,6 +23,7 @@ pub fn parse_program(src: &str) -> Result<Vec<Stmt>, JsError> {
         depth: 0,
         in_fn: 0,
         in_loop: 0,
+        in_switch: 0,
     };
     let mut stmts = Vec::new();
     while !p.at_eof() {
@@ -37,6 +38,7 @@ struct P {
     depth: u32,
     in_fn: u32,
     in_loop: u32,
+    in_switch: u32,
 }
 
 type R<T> = Result<T, JsError>;
@@ -83,6 +85,10 @@ impl P {
 
     fn at_p(&self, p: &str) -> bool {
         matches!(self.peek(), Tok::P(x) if *x == p)
+    }
+
+    fn at_kw(&self, k: &str) -> bool {
+        matches!(self.peek(), Tok::Kw(x) if *x == k)
     }
 
     fn at_eof(&self) -> bool {
@@ -151,6 +157,30 @@ impl P {
                 Ok(k.to_string())
             }
             _ => Err(self.unexp("expected property name")),
+        }
+    }
+
+    /// Accessor/method name in literals: like prop_name plus strings and
+    /// numbers (`get "x"()`, `{0() {}}`). No computed keys.
+    fn acc_name(&mut self) -> R<String> {
+        match self.peek().clone() {
+            Tok::Ident(s) => {
+                self.i += 1;
+                Ok(s)
+            }
+            Tok::Kw(k) => {
+                self.i += 1;
+                Ok(k.to_string())
+            }
+            Tok::Str(s) => {
+                self.i += 1;
+                Ok(s)
+            }
+            Tok::Num(n) => {
+                self.i += 1;
+                Ok(fmt_num(n))
+            }
+            _ => Err(self.unexp("expected accessor name")),
         }
     }
 
@@ -242,7 +272,23 @@ impl P {
                 self.in_loop -= 1;
                 Ok(Stmt::While(c, Box::new(b?)))
             }
+            Tok::Kw("do") => {
+                self.i += 1;
+                self.in_loop += 1;
+                let b = self.stmt();
+                self.in_loop -= 1;
+                let b = b?;
+                if !self.eat_kw("while") {
+                    return Err(err("expected 'while' after 'do' body"));
+                }
+                self.exp_p("(")?;
+                let c = self.expr()?;
+                self.exp_p(")")?;
+                self.semi()?;
+                Ok(Stmt::DoWhile(Box::new(b), c))
+            }
             Tok::Kw("for") => self.for_stmt(),
+            Tok::Kw("switch") => self.switch_stmt(),
             Tok::Kw("throw") => {
                 self.i += 1;
                 // real ASI: a newline between throw and its expr is an error
@@ -258,10 +304,11 @@ impl P {
             }
             Tok::Kw("try") => self.try_stmt(),
             Tok::Kw("break") | Tok::Kw("continue") => {
-                if self.in_loop == 0 {
+                let is_break = matches!(self.peek(), Tok::Kw("break"));
+                // `break` also escapes a switch; `continue` never does.
+                if self.in_loop == 0 && !(is_break && self.in_switch > 0) {
                     return Err(err("break/continue outside loop"));
                 }
-                let is_break = matches!(self.peek(), Tok::Kw("break"));
                 self.i += 1;
                 self.semi()?;
                 Ok(if is_break {
@@ -583,9 +630,46 @@ impl P {
         }))))
     }
 
-    /// Strict for-of / for-in: `for (var|let|const x of/in e)` or
-    /// `for (x of/in e)`. Only plain identifiers. Restores position when
-    /// the head is classic.
+    /// `switch (d) { case e: stmts...; default: stmts... }`. One default
+    /// max; clauses run to `}` (the next `case`/`default` starts another).
+    fn switch_stmt(&mut self) -> R<Stmt> {
+        self.i += 1; // 'switch'
+        self.exp_p("(")?;
+        let disc = self.expr()?;
+        self.exp_p(")")?;
+        self.exp_p("{")?;
+        let mut cases: Vec<(Option<Expr>, Vec<Stmt>)> = Vec::new();
+        let mut defaulted = false;
+        self.in_switch += 1;
+        loop {
+            if self.eat_p("}") {
+                break;
+            }
+            if self.at_eof() {
+                return Err(err("unterminated switch"));
+            }
+            let test = if self.eat_kw("case") {
+                Some(self.expr()?)
+            } else if self.eat_kw("default") {
+                if defaulted {
+                    return Err(err("duplicate default in switch"));
+                }
+                defaulted = true;
+                None
+            } else {
+                return Err(self.unexp("expected 'case' or 'default'"));
+            };
+            self.exp_p(":")?;
+            let mut body = Vec::new();
+            while !self.at_p("}") && !self.at_kw("case") && !self.at_kw("default") && !self.at_eof()
+            {
+                body.push(self.stmt()?);
+            }
+            cases.push((test, body));
+        }
+        self.in_switch -= 1;
+        Ok(Stmt::Switch { disc, cases })
+    }
     fn try_for_of(&mut self) -> R<Option<Stmt>> {
         let save = self.i;
         let is_decl = matches!(
@@ -794,6 +878,7 @@ impl P {
             Tok::Kw("typeof") => "typeof",
             // `await` parses everywhere; eval rejects it outside async fns.
             Tok::Kw("await") => "await",
+            Tok::Kw("void") => "void",
             Tok::Kw("new") => "new",
             _ => "",
         };
@@ -810,7 +895,7 @@ impl P {
                 }
                 Ok(Expr::Unary(op, Box::new(e)))
             }
-            "typeof" | "await" => {
+            "typeof" | "await" | "void" => {
                 self.i += 1;
                 Ok(Expr::Unary(op, Box::new(self.unary()?)))
             }
@@ -1054,6 +1139,83 @@ impl P {
                                 )))
                             }
                         };
+                        // `get x() {}` / `set x(v) {}` (not `get: v`, and not
+                        // a method literally named `get`/`set`).
+                        if (key == "get" || key == "set") && !self.at_p(":") && !self.at_p("(") {
+                            let prop = self.acc_name()?;
+                            self.exp_p("(")?;
+                            let (params, rest) = self.param_list()?;
+                            if rest.is_some() {
+                                return Err(err("rest in accessor params"));
+                            }
+                            self.exp_p(")")?;
+                            self.exp_p("{")?;
+                            self.in_fn += 1;
+                            let body = self.block_body();
+                            self.in_fn -= 1;
+                            let def = Rc::new(FnDef {
+                                name: Some(prop.clone()),
+                                params,
+                                body: body?,
+                                is_async: false,
+                                is_arrow: false,
+                                rest: None,
+                            });
+                            if key == "get" {
+                                if !def.params.is_empty() {
+                                    return Err(err("getter takes no params"));
+                                }
+                                v.push(ObjEntry::Accessor {
+                                    key: prop,
+                                    get: Some(def),
+                                    set: None,
+                                });
+                            } else {
+                                if def.params.len() != 1 || def.params[0].1.is_some() {
+                                    return Err(err("setter takes one plain param"));
+                                }
+                                v.push(ObjEntry::Accessor {
+                                    key: prop,
+                                    get: None,
+                                    set: Some(def),
+                                });
+                            }
+                            if self.eat_p("}") {
+                                break;
+                            }
+                            self.exp_p(",")?;
+                            if self.eat_p("}") {
+                                break; // trailing comma
+                            }
+                            continue;
+                        }
+                        // `m() {}` method shorthand.
+                        if self.at_p("(") {
+                            self.exp_p("(")?;
+                            let (params, rest) = self.param_list()?;
+                            self.exp_p(")")?;
+                            self.exp_p("{")?;
+                            self.in_fn += 1;
+                            let body = self.block_body();
+                            self.in_fn -= 1;
+                            let def = Rc::new(FnDef {
+                                name: Some(key.clone()),
+                                params,
+                                body: body?,
+                                is_async: false,
+                                is_arrow: false,
+                                rest,
+                            });
+                            v.push(ObjEntry::Pair(key, Expr::Func(def)));
+                            if self.eat_p("}") {
+                                break;
+                            }
+                            self.exp_p(",")?;
+                            if self.eat_p("}") {
+                                break; // trailing comma
+                            }
+                            continue;
+                        }
                         // `{x}` shorthand = `{x: x}`
                         let val = if self.eat_p(":") {
                             self.assign()?

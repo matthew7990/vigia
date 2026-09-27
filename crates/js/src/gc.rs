@@ -116,6 +116,42 @@ impl Marker {
                         }
                     }
                     Obj::Dom(_) | Obj::Style { .. } | Obj::Freed => {}
+                    Obj::Accessor { get, set, proto } => {
+                        if let Some(g) = get {
+                            self.ow.push(*g);
+                        }
+                        if let Some(s) = set {
+                            self.ow.push(*s);
+                        }
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
+                    Obj::Symbol { desc, proto } => {
+                        if let Some(d) = desc {
+                            self.sw.push(*d);
+                        }
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
+                    Obj::Map { entries, proto } | Obj::WeakMap { entries, proto } => {
+                        for (k, v) in entries {
+                            self.val(*k);
+                            self.val(*v);
+                        }
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
+                    Obj::Set { items, proto } => {
+                        for v in items {
+                            self.val(*v);
+                        }
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
                 }
             }
             while let Some(id) = self.sw.pop() {
@@ -237,10 +273,18 @@ impl Interp {
             self.protos.promise,
             self.protos.error,
             self.protos.regexp,
+            self.protos.symbol,
+            self.protos.map,
+            self.protos.set,
+            self.protos.weakmap,
         ] {
             if p != u32::MAX {
                 m.ow.push(p);
             }
+        }
+        // `Symbol.for` entries live forever.
+        for &id in self.symbol_registry.values() {
+            m.ow.push(id);
         }
         for mt in &self.microtasks {
             if let Some(cb) = mt.cb {

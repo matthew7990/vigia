@@ -214,8 +214,13 @@ impl Interp {
         ]) {
             if let Obj::Ordinary { pairs, .. } = self.heap.obj_mut(w) {
                 pairs.push(("window".into(), Value::Obj(w)));
+                // `self` (workers/global alias) and `globalThis` match window.
+                pairs.push(("self".into(), Value::Obj(w)));
+                pairs.push(("globalThis".into(), Value::Obj(w)));
             }
             self.env_declare(0, "window", Value::Obj(w));
+            self.env_declare(0, "self", Value::Obj(w));
+            self.env_declare(0, "globalThis", Value::Obj(w));
         }
     }
 

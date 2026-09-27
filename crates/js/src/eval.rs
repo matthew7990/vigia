@@ -1135,6 +1135,7 @@ impl Interp {
             params,
             body,
             is_async: false,
+            is_gen: false,
             is_arrow: false,
             rest,
             cls: Some(ClassCtor { fields }),
@@ -2600,13 +2601,29 @@ impl Interp {
                         self.hoist_vars(std::slice::from_ref(e), fenv)?;
                     }
                 }
-                Stmt::While(_, b)
-                | Stmt::DoWhile(b, _)
-                | Stmt::Label(_, b)
-                | Stmt::For(_, _, _, b) => {
+                Stmt::While(_, b) | Stmt::DoWhile(b, _) | Stmt::Label(_, b) => {
                     self.hoist_vars(std::slice::from_ref(b), fenv)?;
                 }
-                Stmt::ForOf { body, .. } | Stmt::ForIn { body, .. } => {
+                Stmt::For(init, _, _, b) => {
+                    // `for (var x = ...;;)` declares x function-wide even
+                    // when the loop never runs: hoist the init too (the
+                    // VarDecl arm only takes `var`; `let`/`const` inits
+                    // stay loop-scoped, other inits declare nothing).
+                    if let Some(init) = init {
+                        self.hoist_vars(std::slice::from_ref(init), fenv)?;
+                    }
+                    self.hoist_vars(std::slice::from_ref(b), fenv)?;
+                }
+                Stmt::ForOf {
+                    pat, decl, body, ..
+                }
+                | Stmt::ForIn {
+                    pat, decl, body, ..
+                } => {
+                    // `for (var x in/of ...)` likewise binds function scope.
+                    if *decl == Some(VarKind::Var) {
+                        self.hoist_pat(fenv, pat);
+                    }
                     self.hoist_vars(std::slice::from_ref(body), fenv)?;
                 }
                 Stmt::Switch { cases, .. } => {
@@ -3119,6 +3136,9 @@ impl Interp {
                     if def.is_arrow {
                         return Err(err("arrow is not a constructor"));
                     }
+                    if def.is_gen {
+                        return Err(err("generator is not a constructor"));
+                    }
                     break;
                 }
                 Obj::Native { .. } => break, // natives take `this` as given
@@ -3155,8 +3175,8 @@ impl Interp {
                 self.expr(env, e)?;
                 Ok(Value::Undef)
             }
-            // No lazy suspension in this engine: generators run as
-            // plain functions, `yield v` evaluates v and reads undefined.
+            // Eager generators (no coroutines): the body runs whole at first
+            // next(), so `yield v` evaluates v and reads undefined.
             "yield" => {
                 self.expr(env, e)?;
                 Ok(Value::Undef)
@@ -3969,10 +3989,22 @@ impl Interp {
                 }
                 // proto chains resolve string/array/etc methods to Natives;
                 // `this` = the receiver. Getters apply like a plain read.
+                // `window` reads the global scope live (env 0 first, own
+                // snapshot pairs after) - mirroring recv_get, which reads
+                // already honor; calls used to skip env 0 and miss globals.
                 (
                     {
-                        let val = get_prop(&self.heap, &self.protos, recv, name)
-                            .map_err(|e| self.chain_msg(e))?;
+                        let live = match recv {
+                            Value::Obj(id) if Some(id) == self.wind => {
+                                self.env_get(0, name)
+                            }
+                            _ => None,
+                        };
+                        let val = match live {
+                            Some(v) => v,
+                            None => get_prop(&self.heap, &self.protos, recv, name)
+                                .map_err(|e| self.chain_msg(e))?,
+                        };
                         self.invoke_getter(val, recv, name)?
                     },
                     recv,
@@ -3990,9 +4022,20 @@ impl Interp {
                 }
                 (
                     {
-                        let val = get_index(&mut self.heap, &self.protos, recv, k)
-                            .map_err(|e| self.chain_msg(e))?;
+                        // Same live-global rule as the member arm (and
+                        // recv_get_idx): `window[k]()` finds page globals.
                         let key = to_str(&self.heap, k);
+                        let live = match recv {
+                            Value::Obj(id) if Some(id) == self.wind => {
+                                self.env_get(0, &key)
+                            }
+                            _ => None,
+                        };
+                        let val = match live {
+                            Some(v) => v,
+                            None => get_index(&mut self.heap, &self.protos, recv, k)
+                                .map_err(|e| self.chain_msg(e))?,
+                        };
                         self.invoke_getter(val, recv, &key)?
                     },
                     recv,
@@ -4205,6 +4248,14 @@ impl Interp {
         self.call_vals.extend_from_slice(args);
         let (is_async, r) = match c {
             C::Fn(def, fenv) => {
+                // Generator call: fresh generator object per call; the body
+                // runs eagerly at first next(), never here.
+                if def.is_gen {
+                    let r = gen_obj(self, id, fenv, this, args);
+                    self.call_vals.truncate(vbase);
+                    self.call_depth -= 1;
+                    return r;
+                }
                 let cenv = match self.new_env(fenv) {
                     Ok(cenv) => cenv,
                     Err(e) => {
@@ -5600,6 +5651,129 @@ fn n_bound_call(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, 
     };
     full.extend_from_slice(args);
     it.call_value(t, bt, &full, None)
+}
+
+// -- Eager generators ---------------------------------------------------------
+// No lazy stepwise execution: calling a `function*` returns an Ordinary with
+// next/return/throw natives plus hidden `__gen_*` state (plain expandos,
+// visible to enumeration like the bound-function `__t` pattern). First next()
+// runs the whole body at once via a plain (is_gen-off) clone, so it cannot
+// recurse into this path. `yield v` never delivers v (reads undefined);
+// `yield*` parses as `yield` and stays equally eager. for-of stays strict
+// (arrays/strings/sets/maps), so generators are not for-of-able here.
+
+/// Fresh generator object per call: methods link back via `__g`; the body
+/// (func, captured env, args, receiver) waits in `__gen_*` for first next().
+fn gen_obj(it: &mut Interp, fid: u32, fenv: u32, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let arr = it.arr_obj(args.to_vec())?;
+    let gid = it.obj_plain()?;
+    for (name, f) in [
+        ("next", n_gen_next as NativeFn),
+        ("return", n_gen_return as NativeFn),
+        ("throw", n_gen_throw as NativeFn),
+    ] {
+        let nid = it.heap.alloc_obj(Obj::Native {
+            name,
+            f,
+            pairs: vec![("__g".into(), Value::Obj(gid))],
+        })?;
+        set_prop(&mut it.heap, Value::Obj(gid), name, Value::Obj(nid))?;
+    }
+    set_prop(&mut it.heap, Value::Obj(gid), "__gen_f", Value::Obj(fid))?;
+    set_prop(
+        &mut it.heap,
+        Value::Obj(gid),
+        "__gen_env",
+        Value::Num(fenv as f64),
+    )?;
+    set_prop(
+        &mut it.heap,
+        Value::Obj(gid),
+        "__gen_args",
+        Value::Obj(arr),
+    )?;
+    set_prop(&mut it.heap, Value::Obj(gid), "__gen_this", this)?;
+    set_prop(
+        &mut it.heap,
+        Value::Obj(gid),
+        "__gen_started",
+        Value::Bool(false),
+    )?;
+    set_prop(&mut it.heap, Value::Obj(gid), "__gen_done", Value::Bool(false))?;
+    Ok(Value::Obj(gid))
+}
+
+/// The generator object behind a next/return/throw native (via its `__g`).
+fn gen_self(it: &Interp) -> Result<u32, JsError> {
+    match bound_prop(it, "__g")? {
+        Value::Obj(g) => Ok(g),
+        _ => Err(err("generator method detached")),
+    }
+}
+
+fn gen_flag(it: &Interp, g: u32, key: &str) -> bool {
+    matches!(
+        get_prop(&it.heap, &it.protos, Value::Obj(g), key),
+        Ok(Value::Bool(true))
+    )
+}
+
+fn gen_result(it: &mut Interp, value: Value, done: bool) -> Result<Value, JsError> {
+    Ok(Value::Obj(it.obj_pairs(vec![
+        ("value".into(), value),
+        ("done".into(), Value::Bool(done)),
+    ])?))
+}
+
+fn n_gen_next(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let g = gen_self(it)?;
+    if gen_flag(it, g, "__gen_done") {
+        return gen_result(it, Value::Undef, true);
+    }
+    // Sent values are meaningless without suspension; dropped.
+    let _ = arg(args, 0);
+    let gv = Value::Obj(g);
+    let fid = match get_prop(&it.heap, &it.protos, gv, "__gen_f")? {
+        Value::Obj(f) => f,
+        _ => return Err(err("generator detached")),
+    };
+    let fenv = match get_prop(&it.heap, &it.protos, gv, "__gen_env")? {
+        Value::Num(n) => n as u32,
+        _ => return Err(err("generator detached")),
+    };
+    let thisv = get_prop(&it.heap, &it.protos, gv, "__gen_this")?;
+    let argv = match get_prop(&it.heap, &it.protos, gv, "__gen_args")? {
+        Value::Obj(a) => arr_items(it, a),
+        _ => Vec::new(),
+    };
+    let def = match it.heap.obj(fid) {
+        Obj::Func { def, .. } => def.clone(),
+        _ => return Err(err("generator detached")),
+    };
+    set_prop(&mut it.heap, gv, "__gen_started", Value::Bool(true))?;
+    let plain = Rc::new(FnDef {
+        is_gen: false,
+        ..(*def).clone()
+    });
+    let tf = it.func_obj(plain, fenv)?;
+    let r = it.call_value(Value::Obj(tf), thisv, &argv, None);
+    set_prop(&mut it.heap, gv, "__gen_done", Value::Bool(true))?;
+    match r {
+        Ok(v) => gen_result(it, v, true),
+        Err(e) => Err(e),
+    }
+}
+
+fn n_gen_return(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let g = gen_self(it)?;
+    set_prop(&mut it.heap, Value::Obj(g), "__gen_done", Value::Bool(true))?;
+    gen_result(it, arg(args, 0), true)
+}
+
+fn n_gen_throw(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let g = gen_self(it)?;
+    set_prop(&mut it.heap, Value::Obj(g), "__gen_done", Value::Bool(true))?;
+    Err(JsError::Throw(arg(args, 0)))
 }
 
 // -- Array.prototype -------------------------------------------------------------
@@ -9989,6 +10163,11 @@ fn callable(it: &Interp, v: Value) -> Option<Value> {
 /// abort the loop (a failing callback doesn't cancel its siblings), except
 /// the runaway guards which stop the drain.
 const MAX_TIMER_FIRES: u32 = 4096;
+// Per-timer fires per drain: one re-arming timer (polling heartbeat,
+// scheduler pump) must not starve the rest of the queue. 32 keeps
+// heartbeats progressing and leaves distinct-timer bursts untouched
+// (each timer gets its own 32); MAX_TIMER_FIRES stays the total backstop.
+const MAX_TIMER_QUOTA: u32 = 32;
 
 impl Interp {
     /// Settle a pending promise and queue one microtask per registered
@@ -10162,6 +10341,7 @@ impl Interp {
     /// Ends with the unhandled-rejection sweep (reported once each).
     pub(crate) fn drain(&mut self, errs: &mut Vec<JsError>) {
         let mut fires = 0u32;
+        let mut quota: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         'outer: loop {
             while let Some(m) = self.microtasks.pop_front() {
                 if self.tick().is_err() {
@@ -10176,9 +10356,12 @@ impl Interp {
                 .iter()
                 .enumerate()
                 .filter(|(_, t)| !t.cancelled && !t.parked)
-                .min_by_key(|(_, t)| t.deadline_ms)
+                .filter(|(_, t)| quota.get(&t.seq).copied().unwrap_or(0) < MAX_TIMER_QUOTA)
+                .min_by_key(|(_, t)| (t.deadline_ms, t.seq))
                 .map(|(i, _)| i);
-            let Some(i) = pick else { break };
+            // No eligible timer: queue dry, or only over-quota re-armers
+            // left. Either way park silently like the cap path below.
+            let Some(i) = pick else { break 'outer };
             fires += 1;
             if fires > MAX_TIMER_FIRES {
                 // Snapshot model: live pages re-arm timers forever
@@ -10188,10 +10371,10 @@ impl Interp {
                 break 'outer;
             }
             self.now_ms = self.now_ms.max(self.timers[i].deadline_ms);
-            let (cb, args) = {
+            let (cb, args, seq) = {
                 let t = &mut self.timers[i];
                 t.parked = true; // a nested drain (event dispatch) can't re-fire it
-                (t.cb, t.args.clone())
+                (t.cb, t.args.clone(), t.seq)
             };
             if let Err(e) = self.call_value(cb, Value::Undef, &args, None) {
                 let e = self.bound_err(e);
@@ -10206,6 +10389,7 @@ impl Interp {
             } else {
                 t.cancelled = true;
             }
+            *quota.entry(seq).or_insert(0) += 1;
             // keep the vec from growing on churny pages
             if self.timers.len() > 64 {
                 self.timers.retain(|t| !t.cancelled);
@@ -10625,8 +10809,11 @@ fn timer_add(it: &mut Interp, args: &[Value], interval: bool) -> Result<Value, J
     };
     let id = it.next_timer_id;
     it.next_timer_id = it.next_timer_id.wrapping_add(1).max(1);
+    let seq = it.timer_seq;
+    it.timer_seq = it.timer_seq.wrapping_add(1);
     it.timers.push(Timer {
         id,
+        seq,
         deadline_ms: it.now_ms + ms,
         cb,
         args: args[2.min(args.len())..].to_vec(),
@@ -10805,14 +10992,67 @@ mod tests {
 
     #[test]
     fn generators_stubbed() {
-        // Parses and runs; yield reads undefined (no suspension).
-        assert_eq!(disp("function*g(){yield 1;yield 2;return 9}g()"), "9");
-        assert_eq!(disp("var o={*m(){yield 7;return 8}};o.m()"), "8");
-        assert_eq!(disp("class C{*m(){yield}}new C().m()"), "undefined");
+        // Eager subset: call returns an object; first next() runs the body.
+        assert_eq!(disp("function*g(){yield 1;yield 2;return 9}var i=g();i.next().value"), "9");
+        assert_eq!(disp("var o={*m(){yield 7;return 8}};o.m().next().value"), "8");
+        assert_eq!(disp("class C{*m(){yield}}new C().m().next().value"), "undefined");
         // `yield` stays an identifier outside generators.
         assert_eq!(disp("var yield=5;yield+1"), "6");
         assert!(errmsg("class C{*constructor(){}}").contains("may not be a generator"));
         assert!(errmsg("var o={*get x(){return 1}}").contains("accessor"));
+    }
+
+    #[test]
+    fn generators_eager() {
+        // Call returns an object, not the function result.
+        assert_eq!(disp("function*g(){return 5}typeof g()"), "object");
+        assert_eq!(disp("function*g(){return 5}var i=g();typeof i.next"), "function");
+        // No-yield body: value/done plus eagerness ordering (side effects
+        // happen at first next(), never at call time).
+        assert_eq!(disp("function*g(){return 42}var i=g();var s=i.next();s.value"), "42");
+        assert_eq!(disp("function*g(){return 42}var i=g();i.next().done"), "true");
+        assert_eq!(
+            disp("var n=0;function*g(){n++;return 1}var i=g();var a=n;var s=i.next();a+'|'+n+'|'+s.value"),
+            "0|1|1"
+        );
+        // `yield` still reads undefined; the whole body ran at first next().
+        assert_eq!(disp("function*g(){var y=yield 5;return y===undefined}var i=g();i.next().value"), "true");
+        assert_eq!(
+            disp("var log=[];function*g(){log.push(1);yield 2;log.push(3);return 4}var i=g();var a=log.length;var s=i.next();a+'|'+s.value+'|'+s.done+'|'+log.length"),
+            "0|4|true|2"
+        );
+        // Later next()s are done; return()/throw() settle immediately.
+        assert_eq!(disp("function*g(){return 1}var i=g();i.next();var s=i.next();s.value+'|'+s.done"), "undefined|true");
+        assert_eq!(disp("function*g(){return 1}var i=g();var s=i.return(9);s.value+'|'+s.done"), "9|true");
+        assert_eq!(disp("var n=0;function*g(){n++;return 1}var i=g();i.return(5);n"), "0");
+        assert_eq!(disp("function*g(){return 1}var i=g();try{i.throw(new Error('x'))}catch(e){e.message}"), "x");
+        assert_eq!(disp("function*g(){return 1}var i=g();try{i.throw(7)}catch(e){e}i.next().done"), "true");
+        // A body throw marks done and rethrows with the value verbatim.
+        assert_eq!(disp("function*g(){throw new Error('b')}var i=g();try{i.next()}catch(e){e.message}"), "b");
+        assert_eq!(disp("function*g(){throw 3}var i=g();try{i.next()}catch(e){e}i.next().done"), "true");
+        // Args and receiver survive until first next().
+        assert_eq!(disp("function*g(a,b){return a+b}var i=g(2,3);i.next().value"), "5");
+        assert_eq!(disp("var o={x:9,*m(){return this.x}};o.m().next().value"), "9");
+        // `new` on a generator function throws (V8 parity).
+        assert!(errmsg("new (function*(){})").contains("not a constructor"));
+        assert!(errmsg("function*g(){}new g()").contains("not a constructor"));
+    }
+
+    #[test]
+    fn generator_runner_pattern() {
+        // Maps-loader shape: a runner calling .next() immediately and
+        // adopting the returned promise must resolve to 42.
+        assert_eq!(
+            out("function runner(gf){return new Promise(function(res,rej){var i=gf();function step(){var s;try{s=i.next();}catch(e){rej(e);return;}if(s.done){res(s.value);}else{Promise.resolve(s.value).then(function(v){step();},rej);}}step();});}\
+                 runner(function*(){return Promise.resolve(42)}).then(function(v){console.log(v)})"),
+            "42\n"
+        );
+        // Rejections through the same runner reject the outer promise.
+        assert_eq!(
+            out("function runner(gf){return new Promise(function(res,rej){var i=gf();function step(){var s;try{s=i.next();}catch(e){rej(e);return;}if(s.done){res(s.value);}else{Promise.resolve(s.value).then(function(v){step();},rej);}}step();});}\
+                 runner(function*(){throw new Error('nope')}).then(function(){console.log('bad')},function(e){console.log(e.message)})"),
+            "nope\n"
+        );
     }
 
     #[test]
@@ -10969,6 +11209,39 @@ mod tests {
         assert!(errmsg("{let y=1}y").contains("not defined"));
         // `var` never overwrites a hoisted function.
         assert_eq!(disp("function f(){};var f;typeof f"), "function");
+    }
+
+    #[test]
+    fn for_var_hoisting() {
+        // `var` in a for-init or for-in/of target hoists function-wide:
+        // a path that runs before the loop must see the (undefined)
+        // local, never the same-named global. React 18 prod's
+        // bubbleProperties has exactly this shape
+        // (`if(b)for(var e=...)...else for(e=...)...`) and used to
+        // clobber the page's `var e = React.createElement` global,
+        // so every update render threw "e is not a function".
+        assert_eq!(
+            disp("var e='global';function W(a){var b=a>0;if(b){for(var e=0;e<1;e++){}}else{for(e=0;e<1;e++){}}return e}W(0);e"),
+            "global"
+        );
+        assert_eq!(
+            disp("var k='G';function F(a){if(a){for(var k in {x:1}){}}else{k='L'}return k}F(0);k"),
+            "G"
+        );
+        assert_eq!(
+            disp("var v='G';function G(a){if(a){for(var v of [1]){}}else{v='L'}return v}G(0);v"),
+            "G"
+        );
+        // The hoisted local reads undefined before the loop runs...
+        assert_eq!(
+            disp("function f(a){if(a){for(var e=0;e<1;e++){}}return typeof e}f(0)"),
+            "undefined"
+        );
+        // ...and `let`/`const` loop targets still stay loop-scoped.
+        assert_eq!(
+            disp("function f(a){if(a){for(let q=0;q<1;q++){}}return typeof q}f(0)"),
+            "undefined"
+        );
     }
 
     #[test]
@@ -12818,13 +13091,32 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("step"));
-        // an uncleared interval parks silently at the timer cap (live
-        // pages re-arm forever; failing the snapshot over it helps no
-        // one) - and its callbacks did run. Callbacks must not leak into
+        // an uncleared interval parks silently at the per-timer quota
+        // (live pages re-arm forever; failing the snapshot over it helps
+        // no one) - and its callbacks did run. Callbacks must not leak into
         // the top-level completion value either (last save/restore).
+        // (The read lands before this run's own drain, so `n` is exactly
+        // the first drain's quota-capped count.)
         let mut it = Interp::new();
         it.run("var n=0;setInterval(function(){n++},1)").unwrap();
-        assert!(it.run("n>100").unwrap() == Value::Bool(true));
+        assert_eq!(it.run("n").unwrap(), Value::Num(MAX_TIMER_QUOTA as f64));
+    }
+
+    #[test]
+    fn drain_timer_fairness() {
+        // A re-arming interval must not starve later timers: once the hog
+        // exhausts its per-drain quota the one-shot still fires in the same
+        // drain. Pre-quota this failed - the one-shot never ran (4097 fires
+        // on 1 distinct timer). The read lands before this run's own drain,
+        // so `hog` is exactly the first drain's count.
+        let mut it = Interp::new();
+        it.run("var hog=0,fired=false;setInterval(function(){hog++},0);\
+                setTimeout(function(){fired=true},5)")
+            .unwrap();
+        assert_eq!(
+            it.run("fired?hog:-1").unwrap(),
+            Value::Num(MAX_TIMER_QUOTA as f64)
+        );
     }
 
     // ---- throw / try / catch / finally --------------------------------

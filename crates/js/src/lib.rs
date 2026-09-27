@@ -342,6 +342,9 @@ pub(crate) struct Microtask {
 #[derive(Debug)]
 pub(crate) struct Timer {
     pub id: u32,
+    // Stable identity for the drain quota: the vec index shifts under
+    // retain() and `id` wraps, so neither keys a per-drain count map.
+    pub seq: u64,
     pub deadline_ms: u64,
     pub cb: Value,
     pub args: Vec<Value>,
@@ -661,6 +664,8 @@ pub struct Interp {
     /// Virtual clock in ms; only advances (to the fired timer's deadline).
     pub(crate) now_ms: u64,
     pub(crate) next_timer_id: u32,
+    /// Monotonic source for Timer.seq (stable per-timer identity).
+    pub(crate) timer_seq: u64,
     /// Promise obj ids that were then'd or adopted - the unhandled-
     /// rejection sweep at drain end skips these (and remembers reports).
     pub(crate) handled_promises: HashSet<u32>,
@@ -770,6 +775,7 @@ impl Interp {
             timers: Vec::new(),
             now_ms: 0,
             next_timer_id: 1,
+            timer_seq: 0,
             handled_promises: HashSet::new(),
             cur_native: Value::Undef,
             fn_async: false,

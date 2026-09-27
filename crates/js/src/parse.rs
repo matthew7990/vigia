@@ -53,8 +53,8 @@ struct P {
     /// field inits inherit it; plain functions reset it, arrows keep it).
     super_ok: bool,
     /// `yield` parses as an operator only inside a `function*` body
-    /// (plain functions reset it, arrows keep it). Generators run as
-    /// plain functions; yield evaluates to undefined.
+    /// (plain functions reset it, arrows keep it). Calls return eager
+    /// generator objects; yield evaluates to undefined.
     gen_ok: bool,
 }
 
@@ -568,8 +568,9 @@ impl P {
 
     /// `(params) { body }` shared by fn declarations and fn expressions.
     /// `is_async` marks `async function` bodies (enables `await`, wraps the
-    /// return value in a promise at call time). `is_gen` (`function*`) is
-    /// a plain function here; `yield` reads undefined inside it.
+    /// return value in a promise at call time). `is_gen` (`function*`) marks
+    /// eager generators: calling returns a generator object whose first
+    /// next() runs the whole body (`yield` reads undefined inside it).
     fn fn_tail(&mut self, name: Option<String>, is_async: bool, is_gen: bool) -> R<Rc<FnDef>> {
         self.exp_p("(")?;
         let (params, rest) = self.param_list()?;
@@ -590,6 +591,7 @@ impl P {
             params,
             body: body?,
             is_async,
+            is_gen,
             is_arrow: false,
             rest,
             cls: None,
@@ -701,6 +703,7 @@ impl P {
                 params,
                 body: vec![Stmt::Return(Some(e))],
                 is_async,
+                is_gen: false,
                 is_arrow: true,
                 rest,
                 cls: None,
@@ -711,6 +714,7 @@ impl P {
             params,
             body,
             is_async,
+            is_gen: false,
             is_arrow: true,
             rest,
             cls: None,
@@ -811,6 +815,7 @@ impl P {
                                 params,
                                 body,
                                 is_async: false,
+                                is_gen: false,
                                 is_arrow: false,
                                 rest,
                                 cls: None,
@@ -870,6 +875,7 @@ impl P {
                         params,
                         body,
                         is_async: false,
+                        is_gen: false,
                         is_arrow: false,
                         rest,
                         cls: None,
@@ -937,6 +943,7 @@ impl P {
                                 params,
                                 body,
                                 is_async: false,
+                                is_gen: false,
                                 is_arrow: false,
                                 rest,
                                 cls: None,
@@ -956,6 +963,7 @@ impl P {
                                 params,
                                 body,
                                 is_async: false,
+                                is_gen: false,
                                 is_arrow: false,
                                 rest,
                                 cls: None,
@@ -985,6 +993,7 @@ impl P {
                                 params,
                                 body,
                                 is_async,
+                                is_gen,
                                 is_arrow: false,
                                 rest,
                                 cls: None,
@@ -1043,6 +1052,7 @@ impl P {
                             params,
                             body,
                             is_async,
+                            is_gen,
                             is_arrow: false,
                             rest,
                             cls: None,
@@ -1075,7 +1085,7 @@ impl P {
     }
 
     /// `{ stmts }` of a class method or constructor. Generator
-    /// methods run plain; `yield` reads undefined inside them.
+    /// methods are eager (first next() runs the whole body).
     fn method_body(&mut self, is_gen: bool) -> R<Vec<Stmt>> {
         self.exp_p("{")?;
         self.in_fn += 1;
@@ -1852,6 +1862,7 @@ impl P {
                                 params,
                                 body: body?,
                                 is_async: false,
+                                is_gen: false,
                                 is_arrow: false,
                                 rest: None,
                                 cls: None,
@@ -1884,8 +1895,8 @@ impl P {
                             }
                             continue;
                         }
-                        // `m() {}` method shorthand (`*m()` runs plain;
-                        // `yield` reads undefined inside).
+                        // `m() {}` method shorthand (`*m()` is an eager
+                        // generator; `yield` reads undefined inside).
                         if self.at_p("(") {
                             self.exp_p("(")?;
                             let (params, rest) = self.param_list()?;
@@ -1902,6 +1913,7 @@ impl P {
                                 params,
                                 body: body?,
                                 is_async,
+                                is_gen,
                                 is_arrow: false,
                                 rest,
                                 cls: None,

@@ -160,6 +160,9 @@ pub struct FnDef {
     pub body: Vec<Stmt>,
     /// `async function`: call wraps the result in a Promise; enables `await`.
     pub is_async: bool,
+    /// `function*`: call returns an eager generator object; first next()
+    /// runs the whole body at once (no suspension; `yield` reads undefined).
+    pub is_gen: bool,
     /// Arrow: lexical `this`, no `new`, no own `prototype` (prototype kept
     /// as harmless stub for now).
     pub is_arrow: bool,

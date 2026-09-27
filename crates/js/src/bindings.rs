@@ -3677,6 +3677,30 @@ mod tests {
     }
 
     #[test]
+    fn window_global_calls() {
+        // Calls through window see live globals, exactly like reads do.
+        // (Reads consult env 0 first; calls used to read only the
+        // install-time snapshot pairs, so every `window.fn()` where fn
+        // was a page `var` or `window.fn=` assignment threw
+        // "fn is not a function" while `window.fn` read fine.)
+        let mut it = interp(PAGE);
+        assert_eq!(ev(&mut it, "var wfn=function(){return 5};window.wfn()"), "5");
+        assert_eq!(
+            ev(&mut it, "window.wasg=function(){return 6};window.wasg()"),
+            "6"
+        );
+        assert_eq!(
+            ev(&mut it, "var wfx=function(){return 7};window['wfx']()"),
+            "7"
+        );
+        // `this` inside the call is still the window object.
+        assert_eq!(
+            ev(&mut it, "var who=function(){return this===window};window.who()"),
+            "true"
+        );
+    }
+
+    #[test]
     fn lookup() {
         let mut it = interp(PAGE);
         assert_eq!(ev(&mut it, "document.getElementById('a').id"), "a");

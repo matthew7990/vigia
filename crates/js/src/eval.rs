@@ -1327,6 +1327,18 @@ impl Interp {
             ("sort", n_arr_sort),
             ("splice", n_arr_splice),
             ("flat", n_arr_flat),
+            ("fill", n_arr_fill),
+            ("findLast", n_arr_find_last),
+            ("flatMap", n_arr_flat_map),
+            ("at", n_arr_at),
+            ("copyWithin", n_arr_copy_within),
+            ("entries", n_arr_entries),
+            ("keys", n_arr_keys),
+            ("values", n_arr_values),
+            ("toReversed", n_arr_to_reversed),
+            ("toSorted", n_arr_to_sorted),
+            ("toSpliced", n_arr_to_spliced),
+            ("with", n_arr_with),
         ]);
         self.protos.string = self.proto_bag(&[
             ("split", n_str_split),
@@ -1844,6 +1856,7 @@ impl Interp {
         self.ctor("DataView", n_dv_ctor, pr.dataview, &[]);
         self.ctor("TextEncoder", n_te_ctor, pr.textencoder, &[]);
         self.ctor("TextDecoder", n_td_ctor, pr.textdecoder, &[]);
+        self.ctor("MessageChannel", n_msg_channel, pr.object, &[]);
         self.ctor("ResizeObserver", n_resize_observer_ctor, pr.resizeobserver, &[]);
         self.ctor(
             "IntersectionObserver",
@@ -5855,9 +5868,13 @@ fn n_arr_reverse(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value,
     Ok(this)
 }
 
-fn n_arr_sort(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
-    let id = this_arr(it, this)?;
-    let mut items = arr_items(it, id);
+/// Shared sort core (sort + toSorted): comparator insertion sort, else
+/// ascending ToString order. Runs on a clone; the caller writes back.
+fn sort_items(
+    it: &mut Interp,
+    mut items: Vec<Value>,
+    args: &[Value],
+) -> Result<Vec<Value>, JsError> {
     match args.first() {
         Some(f @ Value::Obj(_)) => {
             // insertion sort: the comparator can fail mid-way
@@ -5885,8 +5902,15 @@ fn n_arr_sort(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsE
             items = keyed.into_iter().map(|(_, i)| items[i]).collect();
         }
     }
+    Ok(items)
+}
+
+fn n_arr_sort(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let items = arr_items(it, id);
+    let sorted = sort_items(it, items, args)?;
     if let Obj::Arr { items: dst, .. } = it.heap.obj_mut(id) {
-        *dst = items;
+        *dst = sorted;
     }
     Ok(this)
 }
@@ -5934,6 +5958,166 @@ fn n_arr_flat(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsE
     let mut out = Vec::new();
     flat_into(&it.heap, &mut out, &items, depth);
     Ok(Value::Obj(it.arr_obj(out)?))
+}
+
+/// fill(value, start?, end?): relative-index range overwrite, NaN start
+/// reads as 0 via from_idx. No hole concept here, so the whole range
+/// fills like V8's hole-filling path. Returns the array.
+fn n_arr_fill(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let v = arg(args, 0);
+    let len = arr_items(it, id).len();
+    let lo = match args.get(1) {
+        Some(s) => from_idx(to_num(&it.heap, *s), len),
+        None => 0,
+    };
+    let hi = match args.get(2) {
+        Some(e) => from_idx(to_num(&it.heap, *e), len),
+        None => len,
+    };
+    if hi > lo {
+        if let Obj::Arr { items, .. } = it.heap.obj_mut(id) {
+            for x in items[lo..hi].iter_mut() {
+                *x = v;
+            }
+        }
+    }
+    Ok(this)
+}
+
+fn n_arr_find_last(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let f = arg(args, 0);
+    let t = arg(args, 1);
+    let items = arr_items(it, id);
+    for (i, x) in items.iter().enumerate().rev() {
+        let r = it.call_value(f, t, &cb_args(*x, i, this), None)?;
+        if truthy(&it.heap, r) {
+            return Ok(*x);
+        }
+    }
+    Ok(Value::Undef)
+}
+
+fn n_arr_flat_map(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let f = arg(args, 0);
+    let t = arg(args, 1);
+    let items = arr_items(it, id);
+    let mut mapped = Vec::with_capacity(items.len());
+    for (i, x) in items.iter().enumerate() {
+        mapped.push(it.call_value(f, t, &cb_args(*x, i, this), None)?);
+    }
+    let mut out = Vec::with_capacity(mapped.len());
+    flat_into(&it.heap, &mut out, &mapped, 1);
+    Ok(Value::Obj(it.arr_obj(out)?))
+}
+
+fn n_arr_at(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let items = arr_items(it, id);
+    let len = items.len() as i64;
+    let mut i = to_num(&it.heap, arg(args, 0)) as i64;
+    if i < 0 {
+        i += len;
+    }
+    if i < 0 || i >= len {
+        return Ok(Value::Undef);
+    }
+    Ok(items[i as usize])
+}
+
+fn n_arr_copy_within(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let items = arr_items(it, id);
+    let len = items.len();
+    let to = from_idx(to_num(&it.heap, arg(args, 0)), len);
+    let from = match args.get(1) {
+        Some(s) => from_idx(to_num(&it.heap, *s), len),
+        None => 0,
+    };
+    let end = match args.get(2) {
+        Some(e) => from_idx(to_num(&it.heap, *e), len),
+        None => len,
+    };
+    let count = end.saturating_sub(from).min(len.saturating_sub(to));
+    if let Obj::Arr { items: dst, .. } = it.heap.obj_mut(id) {
+        let src = items[from..from + count].to_vec();
+        dst[to..to + count].copy_from_slice(&src);
+    }
+    Ok(this)
+}
+
+/// keys/values/entries return arrays, not iterators: the engine has no
+/// iterator protocol (Set does the same), so for-of/spread over them
+/// throw like any other non-iterable.
+fn n_arr_keys(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let n = arr_items(it, id).len();
+    Ok(Value::Obj(
+        it.arr_obj((0..n).map(|i| Value::Num(i as f64)).collect())?,
+    ))
+}
+
+fn n_arr_values(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    Ok(Value::Obj(it.arr_obj(arr_items(it, id))?))
+}
+
+fn n_arr_entries(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let items = arr_items(it, id);
+    let mut vals = Vec::with_capacity(items.len());
+    for (i, v) in items.into_iter().enumerate() {
+        vals.push(Value::Obj(it.arr_obj(vec![Value::Num(i as f64), v])?));
+    }
+    Ok(Value::Obj(it.arr_obj(vals)?))
+}
+
+fn n_arr_to_reversed(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let mut items = arr_items(it, id);
+    items.reverse();
+    Ok(Value::Obj(it.arr_obj(items)?))
+}
+
+fn n_arr_to_sorted(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let items = arr_items(it, id);
+    let sorted = sort_items(it, items, args)?;
+    Ok(Value::Obj(it.arr_obj(sorted)?))
+}
+
+fn n_arr_to_spliced(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let mut items = arr_items(it, id);
+    let len = items.len() as i64;
+    let start = {
+        let a = to_num(&it.heap, arg(args, 0)) as i64;
+        (if a < 0 { len + a } else { a.min(len) }).clamp(0, len) as usize
+    };
+    let del = match args.get(1) {
+        Some(v) => (to_num(&it.heap, *v) as i64).clamp(0, len - start as i64) as usize,
+        None => len as usize - start,
+    };
+    let ins: Vec<Value> = args[2.min(args.len())..].to_vec();
+    items.splice(start..start + del, ins);
+    Ok(Value::Obj(it.arr_obj(items)?))
+}
+
+fn n_arr_with(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = this_arr(it, this)?;
+    let mut items = arr_items(it, id);
+    let len = items.len() as i64;
+    let mut i = to_num(&it.heap, arg(args, 0)) as i64;
+    if i < 0 {
+        i += len;
+    }
+    if i < 0 || i >= len {
+        return Err(err("Array.prototype.with index out of range"));
+    }
+    items[i as usize] = arg(args, 1);
+    Ok(Value::Obj(it.arr_obj(items)?))
 }
 
 // -- String.prototype -------------------------------------------------------------
@@ -9349,6 +9533,198 @@ fn n_idb_fire_deny(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Val
     Ok(Value::Undef)
 }
 
+// -- MessageChannel/MessagePort ----------------------------------------------
+// React 18's scheduler prefers MessageChannel over setTimeout. Ports are
+// ordinary objects with own function props (matchMedia shape); delivery
+// is a zero timer like the IDB-denial path. The value passes by
+// reference, NOT structuredClone. Listener surface is minimal:
+// `onmessage` plus add/removeEventListener for 'message' only (no other
+// types, no capture/once/passive options).
+fn msg_port_obj(it: &mut Interp) -> Result<u32, JsError> {
+    let mut pairs: Vec<(String, Value)> = Vec::new();
+    for (n, f) in [
+        ("postMessage", n_msg_post as NativeFn),
+        ("start", n_msg_start),
+        ("close", n_msg_close),
+        ("addEventListener", n_msg_add_listener),
+        ("removeEventListener", n_msg_remove_listener),
+    ] {
+        pairs.push((n.into(), Value::Obj(it.heap.alloc_obj(nat(n, f))?)));
+    }
+    pairs.push(("onmessage".into(), Value::Null));
+    pairs.push(("__closed".into(), Value::Bool(false)));
+    let cbs = Value::Obj(it.arr_obj(Vec::new())?);
+    pairs.push(("__msg_cbs".into(), cbs));
+    let proto = po(it.protos.object);
+    it.heap.alloc_obj(Obj::Ordinary { pairs, proto })
+}
+
+fn n_msg_channel(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let a = msg_port_obj(it)?;
+    let b = msg_port_obj(it)?;
+    let _ = set_prop(&mut it.heap, Value::Obj(a), "__peer", Value::Obj(b));
+    let _ = set_prop(&mut it.heap, Value::Obj(b), "__peer", Value::Obj(a));
+    // instanceof MessageChannel: proto rides the ctor's prototype pair.
+    let proto = match get_prop(&it.heap, &it.protos, it.cur_native, "prototype") {
+        Ok(Value::Obj(p)) => Some(p),
+        _ => po(it.protos.object),
+    };
+    let ch = it.heap.alloc_obj(Obj::Ordinary {
+        pairs: vec![
+            ("port1".into(), Value::Obj(a)),
+            ("port2".into(), Value::Obj(b)),
+        ],
+        proto,
+    })?;
+    Ok(Value::Obj(ch))
+}
+
+/// Entangled peer for a postMessage, or None when either end closed
+/// (close disentangles; late posts drop silently like a dead port).
+fn msg_target(it: &Interp, this: Value) -> Option<Value> {
+    let Value::Obj(_) = this else { return None };
+    if truthy(
+        &it.heap,
+        get_prop(&it.heap, &it.protos, this, "__closed").unwrap_or(Value::Undef),
+    ) {
+        return None;
+    }
+    let peer = get_prop(&it.heap, &it.protos, this, "__peer").ok()?;
+    let Value::Obj(_) = peer else { return None };
+    if truthy(
+        &it.heap,
+        get_prop(&it.heap, &it.protos, peer, "__closed").unwrap_or(Value::Undef),
+    ) {
+        return None;
+    }
+    Some(peer)
+}
+
+fn n_msg_post(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Value::Obj(_) = this else {
+        return Err(err("MessagePort.postMessage needs a port"));
+    };
+    let Some(peer) = msg_target(it, this) else {
+        return Ok(Value::Undef);
+    };
+    let fire = Value::Obj(it.heap.alloc_obj(nat("fireMsg", n_msg_fire))?);
+    let st = Value::Obj(it.heap.alloc_obj(nat("setTimeout", n_set_timeout))?);
+    let _ = it.call_value(st, Value::Undef, &[fire, Value::Num(0.0)], None);
+    let _ = set_prop(&mut it.heap, fire, "__target", peer);
+    let _ = set_prop(&mut it.heap, fire, "__msg", arg(args, 0));
+    Ok(Value::Undef)
+}
+
+fn n_msg_fire(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let me = it.cur_native;
+    let target = get_prop(&it.heap, &it.protos, me, "__target")?;
+    let msg = get_prop(&it.heap, &it.protos, me, "__msg")?;
+    // close() drops queued messages: a closed target swallows the fire.
+    if truthy(
+        &it.heap,
+        get_prop(&it.heap, &it.protos, target, "__closed").unwrap_or(Value::Undef),
+    ) {
+        return Ok(Value::Undef);
+    }
+    let ev = Value::Obj(it.obj_pairs(vec![("data".into(), msg)])?);
+    // onmessage is a plain expando like the IDB request's onerror: a
+    // non-function value is ignored, never thrown.
+    if let Ok(Value::Obj(cb)) = get_prop(&it.heap, &it.protos, target, "onmessage") {
+        if matches!(it.heap.obj(cb), Obj::Func { .. } | Obj::Native { .. }) {
+            let _ = it.call_value(Value::Obj(cb), target, &[ev], None);
+        }
+    }
+    // addEventListener('message') callbacks, in registration order.
+    let cbs = match get_prop(&it.heap, &it.protos, target, "__msg_cbs") {
+        Ok(Value::Obj(a)) => match it.heap.obj(a) {
+            Obj::Arr { items, .. } => items.clone(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    for cb in cbs {
+        if callable(it, cb).is_some() {
+            let _ = it.call_value(cb, target, &[ev], None);
+        }
+    }
+    Ok(Value::Undef)
+}
+
+fn n_msg_start(_it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    match this {
+        Value::Obj(_) => Ok(Value::Undef),
+        _ => Err(err("MessagePort.start needs a port")),
+    }
+}
+
+fn n_msg_close(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let Value::Obj(_) = this else {
+        return Err(err("MessagePort.close needs a port"));
+    };
+    let _ = set_prop(&mut it.heap, this, "__closed", Value::Bool(true));
+    Ok(Value::Undef)
+}
+
+fn n_msg_add_listener(
+    it: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let Value::Obj(_) = this else {
+        return Err(err("MessagePort.addEventListener needs a port"));
+    };
+    if to_str(&it.heap, arg(args, 0)) != "message" {
+        return Ok(Value::Undef);
+    }
+    let Some(cb) = callable(it, arg(args, 1)) else {
+        return Ok(Value::Undef);
+    };
+    let aid = match get_prop(&it.heap, &it.protos, this, "__msg_cbs") {
+        Ok(Value::Obj(a)) if matches!(it.heap.obj(a), Obj::Arr { .. }) => a,
+        _ => {
+            let a = it.arr_obj(Vec::new())?;
+            let _ = set_prop(&mut it.heap, this, "__msg_cbs", Value::Obj(a));
+            a
+        }
+    };
+    if let Obj::Arr { items, .. } = it.heap.obj_mut(aid) {
+        items.push(cb);
+    }
+    Ok(Value::Undef)
+}
+
+fn n_msg_remove_listener(
+    it: &mut Interp,
+    this: Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let Value::Obj(_) = this else {
+        return Err(err("MessagePort.removeEventListener needs a port"));
+    };
+    if to_str(&it.heap, arg(args, 0)) != "message" {
+        return Ok(Value::Undef);
+    }
+    let cb = arg(args, 1);
+    // clone-filter-writeback: the strict_eq probe borrows the heap.
+    let cur = match get_prop(&it.heap, &it.protos, this, "__msg_cbs") {
+        Ok(Value::Obj(a)) => match it.heap.obj(a) {
+            Obj::Arr { items, .. } => items.clone(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    let kept: Vec<Value> = cur
+        .into_iter()
+        .filter(|c| !strict_eq(&it.heap, *c, cb))
+        .collect();
+    if let Ok(Value::Obj(a)) = get_prop(&it.heap, &it.protos, this, "__msg_cbs") {
+        if let Obj::Arr { items, .. } = it.heap.obj_mut(a) {
+            *items = kept;
+        }
+    }
+    Ok(Value::Undef)
+}
+
 /// navigator.plugins / mimeTypes: Chrome PDF viewer persona. Real
 /// plugin objects (indexed + named access, length) so presence and
 /// enumeration read desktop-Chrome-like. No actual viewers behind them.
@@ -11795,6 +12171,119 @@ mod tests {
         assert_eq!(disp("Array.of(1,2,3)"), "[1,2,3]");
         assert_eq!(num("new Array(3).length"), 3.0);
         assert_eq!(disp("Array(1,2)"), "[1,2]");
+    }
+
+    #[test]
+    fn array_fill_modern() {
+        // fill: full, ranged, negative, clamped, NaN-start, identity.
+        assert_eq!(disp("[1,2,3].fill(9)"), "[9,9,9]");
+        assert_eq!(disp("[1,2,3,4].fill(0,1,3)"), "[1,0,0,4]");
+        assert_eq!(disp("[1,2,3,4].fill(0,-2)"), "[1,2,0,0]");
+        assert_eq!(disp("[1,2,3,4].fill(0,-3,-1)"), "[1,0,0,4]");
+        assert_eq!(disp("[1,2].fill(9,0,99)"), "[9,9]");
+        assert_eq!(disp("[1,2].fill(9,5)"), "[1,2]");
+        assert_eq!(disp("[1,2].fill(9,NaN)"), "[9,9]");
+        assert_eq!(disp("[1,2,3].fill(0,3,1)"), "[1,2,3]");
+        assert!(boolean("var fa=[1,2];fa.fill(5)===fa"));
+        assert_eq!(num("new Array(128).fill(undefined).length"), 128.0);
+        // the rest of the missing pure/local ES2019+ set, one assert each.
+        assert_eq!(num("[3,7,9].findLast(function(x){return x>4})"), 9.0);
+        assert_eq!(
+            disp("[1,2].flatMap(function(x){return [x,x*10]})"),
+            "[1,10,2,20]"
+        );
+        assert_eq!(disp("[1,2].flatMap(function(x){return x*2})"), "[2,4]");
+        assert_eq!(num("[10,20,30].at(-1)"), 30.0);
+        assert_eq!(num("[10,20,30].at(0)"), 10.0);
+        assert_eq!(disp("[1].at(5)"), "undefined");
+        assert_eq!(disp("[1,2,3,4].copyWithin(0,2)"), "[3,4,3,4]");
+        assert!(boolean("var ca=[1,2,3,4];ca.copyWithin(0,2)===ca"));
+        assert_eq!(disp("[7,8].keys()"), "[0,1]");
+        assert_eq!(disp("[5,6].values()"), "[5,6]");
+        assert_eq!(
+            disp("[7,8].entries().map(function(p){return p[0]+':'+p[1]}).join(',')"),
+            "0:7,1:8"
+        );
+        assert_eq!(disp("[3,1,2].toReversed()"), "[2,1,3]");
+        assert_eq!(disp("var tr=[3,1];var rr=tr.toReversed();tr"), "[3,1]");
+        assert_eq!(
+            disp("[10,9,1].toSorted(function(a,b){return a-b})"),
+            "[1,9,10]"
+        );
+        assert_eq!(disp("var ts=[3,1];var sr=ts.toSorted();ts"), "[3,1]");
+        assert_eq!(disp("[1,2,3,4].toSpliced(1,2,'x')"), "[1,\"x\",4]");
+        assert_eq!(disp("[1,2,3].with(1,9)"), "[1,9,3]");
+        assert_eq!(disp("[1,2,3].with(-1,9)"), "[1,2,9]");
+        assert!(errmsg("[1].with(5,9)").contains("out of range"));
+    }
+
+    #[test]
+    fn message_channel() {
+        assert_eq!(disp("typeof MessageChannel"), "function");
+        assert!(boolean("var mc0=new MessageChannel();mc0.port1!==mc0.port2"));
+        assert!(boolean("var mc1=new MessageChannel();mc1 instanceof MessageChannel"));
+        assert_eq!(disp("var mc2=new MessageChannel();mc2.port1.start()"), "undefined");
+        // Zero-timer delivery drains after the completion value, so each
+        // setup posts in one run and asserts in the next (IO-test pattern).
+        let mut it = Interp::new();
+        it.run(
+            "var got=null;var mc=new MessageChannel();\
+             mc.port2.onmessage=function(e){got=e.data};\
+             mc.port1.postMessage(42)",
+        )
+        .unwrap();
+        let v = it.run("got").unwrap();
+        assert_eq!(it.inspect(v), "42");
+        // reverse direction on the same channel.
+        it.run(
+            "var back=null;\
+             mc.port1.onmessage=function(e){back=e.data};\
+             mc.port2.postMessage('hi')",
+        )
+        .unwrap();
+        let v = it.run("back").unwrap();
+        assert_eq!(it.inspect(v), "hi");
+        // addEventListener('message') fires alongside onmessage.
+        it.run(
+            "var seen=[];var mc3=new MessageChannel();\
+             mc3.port2.addEventListener('message',function(e){seen.push(e.data)});\
+             mc3.port1.postMessage(7)",
+        )
+        .unwrap();
+        let v = it.run("seen").unwrap();
+        assert_eq!(it.inspect(v), "[7]");
+        // removeEventListener detaches; a non-function onmessage is
+        // ignored (never thrown), matching the on* expando style.
+        it.run(
+            "var n=0;var mc4=new MessageChannel();\
+             function cb(e){n++};\
+             mc4.port2.addEventListener('message',cb);\
+             mc4.port2.removeEventListener('message',cb);\
+             mc4.port2.onmessage=5;\
+             mc4.port1.postMessage(1)",
+        )
+        .unwrap();
+        let v = it.run("n").unwrap();
+        assert_eq!(it.inspect(v), "0");
+        // close() before the drain drops the queued message.
+        it.run(
+            "var gone=null;var mc5=new MessageChannel();\
+             mc5.port2.onmessage=function(e){gone=e.data};\
+             mc5.port1.postMessage(1);mc5.port2.close()",
+        )
+        .unwrap();
+        let v = it.run("gone").unwrap();
+        assert_eq!(it.inspect(v), "null");
+        // pass-by-reference (structuredClone gap): a pre-drain mutation
+        // is visible to the handler.
+        it.run(
+            "var rc=null;var mc6=new MessageChannel();\
+             mc6.port2.onmessage=function(e){rc=e.data.x};\
+             var o={x:1};mc6.port1.postMessage(o);o.x=2",
+        )
+        .unwrap();
+        let v = it.run("rc").unwrap();
+        assert_eq!(it.inspect(v), "2");
     }
 
     #[test]

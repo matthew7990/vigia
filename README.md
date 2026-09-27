@@ -3,10 +3,10 @@
 </p>
 <h1 align="center">vigia</h1>
 <p align="center">
-<strong>The agent-native browser, written from scratch in Rust.</strong><br>
-No Chromium. No WebKit. No borrowed engine. No render pipeline.<br>
-Fetches, parses, runs the page's own JavaScript, and hands agents a
-semantic snapshot they can act on by <code>#ref</code>.
+<strong>A browser for agents, written from scratch in Rust.</strong><br>
+No Chromium. No WebKit. No borrowed engine. No pixels.<br>
+It fetches a page, parses it, runs its JavaScript, and hands back a
+semantic snapshot the agent can act on by <code>#ref</code>.
 </p>
 
 <div align="center">
@@ -21,42 +21,46 @@ semantic snapshot they can act on by <code>#ref</code>.
   <img width="640" src="docs/assets/demo.svg" alt="vigia snap output">
 </div>
 
-Two numbers the whole design answers to: **tokens per observed page**
-and **bytes of RAM per session**. vigia is ~40-90x faster and ~2.3x
-lighter than [lightpanda](https://github.com/lightpanda-io/browser) on
-our benchmark corpus, while emitting action refs and link targets a
-text dump doesn't carry. Details below.
+Everything here serves two numbers: **tokens per observed page** and
+**bytes of RAM per session**. On our benchmark corpus vigia runs
+~40-90x faster and ~2.3x lighter than
+[lightpanda](https://github.com/lightpanda-io/browser), while emitting
+action refs and link targets a plain text dump doesn't carry. Details
+below.
 
-## Why from scratch
+## Why build a browser from scratch
 
-Every "browser for AI" embeds Chromium: roughly 300 MB before the first
-request, a render pipeline scraping never uses, and a resource ceiling
-you do not control. vigia's premise:
+Every "browser for AI" embeds Chromium: around 300 MB before the first
+request, a whole render pipeline that scraping never uses, and a memory
+ceiling you don't control. vigia bets that agents don't need any of
+that:
 
 - **No layout, no paint, no compositor.** Agents read the DOM, not
-  pixels. Skipping render removes most of a browser's memory cost.
-- **Own HTTP/1.1, own URL parser, own inflate, own HTML parser, own
-  arena DOM, own CSS engine, own JavaScript interpreter.** The load is
-  measurable per crate. `vigia-mem` counts every allocation.
-- **Sessions without a browser.** An RFC 6265 cookie jar persists auth
-  across runs. `--tab` runs the same script in parallel sessions.
-- **JavaScript is a bounded module.** `vigia-js` is our own interpreter:
-  arena values behind a hard cap, mark-sweep GC, promises and timers on
-  a deterministic virtual clock. It never owns a render loop.
+  pixels. Dropping render removes most of a browser's memory cost.
+- **Every layer is ours.** HTTP/1.1, URL parsing, inflate, HTML parsing,
+  arena DOM, CSS engine, JavaScript interpreter. Each one is a crate
+  with a measurable cost, and `vigia-mem` counts every allocation.
+- **Sessions without a browser.** An RFC 6265 cookie jar keeps auth
+  across runs, persisted to disk per profile. `--tab` runs the same
+  script as parallel sessions.
+- **JavaScript on a leash.** `vigia-js` is our own interpreter: arena
+  values under a hard cap, mark-sweep GC, promises and timers on a
+  deterministic virtual clock. It never touches a render loop.
 
-Scope honesty: a full-spec web engine is a Servo-scale project. vigia's
-scope is what agents need: fetch, parse, DOM, extract, act, record.
+To be clear about scope: a full-spec web engine is a Servo-sized
+project. This one covers what agents actually do: fetch, parse, run
+page scripts, extract, act, record.
 
 ## Install
 
-Download a release binary:
+Grab a release binary:
 
 ```console
 curl -L -o vigia https://github.com/matthew7990/vigia/releases/latest/download/vigia-x86_64-linux
 chmod a+x ./vigia
 ```
 
-Or build from source (Rust stable, no other deps):
+Or build it (stable Rust, nothing else needed):
 
 ```console
 cargo build --release
@@ -86,8 +90,8 @@ vigia run login.vig --tab alice --tab bob \
 vigia serve [--bind 127.0.0.1:8080]  # HTTP + MCP session API for agents
 ```
 
-A `.vig` script is one op per line, executed in a single process with a
-shared session:
+A `.vig` script is one operation per line, run in a single process
+against a shared session:
 
 ```
 # login.vig
@@ -101,7 +105,7 @@ net    # every fetch() the page's JS fired (endpoint discovery)
 req https://api.example.com/data -H "Content-Type: application/json" -d "{\"a\":1}"
 ```
 
-Every command reports cost and latency on stderr:
+Every command prints what it cost on stderr:
 
 ```
 status 200 | 341 B wire -> 236 B body | connect 0ms tls 0ms ttfb 1ms total 1ms
@@ -111,7 +115,7 @@ status 200 | 341 B wire -> 236 B body | connect 0ms tls 0ms ttfb 1ms total 1ms
 ## Benchmark vs lightpanda
 
 The comparison target is [lightpanda](https://github.com/lightpanda-io/browser),
-the only other browser for agents built without a borrowed engine.
+the only other agent browser built without a borrowed engine.
 `bench/` generates a deterministic corpus and measures wall time, peak
 RSS (wait4), and the size of the agent-facing dump (`vigia snap` vs
 `lightpanda fetch --dump semantic_tree_text`).
@@ -125,16 +129,20 @@ RSS (wait4), and the size of the agent-facing dump (`vigia snap` vs
 | table | **vigia** | **10.5** | **9.6** | 142,537 | 35,634 |
 | table | lightpanda | 452.0 | 26.3 | **100,008** | **25,002** |
 
-- **Speed.** vigia is ~40-90x faster. Lightpanda boots a JS runtime per
-  page; vigia's is a flat arena that is already warm.
-- **Memory.** ~2.3x less RSS (9.6 MB vs ~22 MB).
-- **Tokens.** vigia wins on content-heavy pages (4x smaller on article).
-  On link/table-heavy pages lightpanda is smaller precisely because it
-  drops link targets, which then cost a second CDP call to navigate.
-  vigia emits `-> href` and `#n` refs inline so the agent can act
-  directly.
+What the numbers mean:
 
-Reproduce: `make bench` (expects the lightpanda binary at
+- **Speed.** vigia is ~40-90x faster here. Most of that gap is
+  lightpanda booting a JS runtime per page; vigia's arena is already
+  warm. Against a real site over TLS the gap shrinks — localhost
+  flatters us.
+- **Memory.** ~2.3x less RSS (9.6 MB vs ~22 MB).
+- **Tokens.** vigia wins big on content-heavy pages (4x smaller on
+  article). On link/table-heavy pages lightpanda's dump is smaller,
+  but only because it drops link targets — which then cost a second
+  call to resolve. vigia prints `-> href` and `#n` refs inline so the
+  agent can act without round-tripping.
+
+Reproduce it: `make bench` (needs the lightpanda binary at
 `bench/bin/lightpanda`), or `python3 -m http.server 8899 -d bench/corpus &`
 then `python3 bench/run.py`.
 
@@ -154,25 +162,26 @@ then `python3 bench/run.py`.
 | `vigia-actions` | Forms, submit, click, fill: actions resolved by snapshot ref |
 | `vigia-snapshot` | DOM -> semantic tree for agents: roles, inline names, `#n` refs |
 | `vigia-json` | JSON parser/serializer, order-preserving values, dotted-path lookup |
-| `vigia-js` | JS interpreter: lexer, parser, tree-walk eval, prototypes, async, mark-sweep GC. Beyond ES5: `?.` `??` arrows `for-of/in` regex+RegExp templates spread/rest defaults destructuring `switch` `do-while` `void` methods/getters/setters Symbol Map/Set/WeakMap. No classes yet |
+| `vigia-js` | JS interpreter: lexer, parser, tree-walk eval, prototypes, async, mark-sweep GC. Past ES5: `?.` `??` arrows `for-of/in` regex+RegExp templates spread/rest defaults destructuring `switch` `do-while` `void` methods/getters/setters Symbol Map/Set/WeakMap. No classes yet |
 | `vigia-run` | `.vig` script runner: sequential ops, shared session, parallel tabs, JSONL audit |
 | `vigia-mem` | Counting allocator and RSS peak: the total-load meter |
 | `vigia` (cli) | All commands above. Metrics on stderr, always |
 
 ## Dependency policy
 
-Everything is ours. The standard library and the OS (sockets, system
-DNS) are the floor. Third-party crates are the exception: declared,
-isolated, temporary.
+Almost everything is ours. The standard library plus the OS (sockets,
+system DNS) is the floor. Anything else is an exception: declared,
+isolated, and temporary.
 
-One exception today, behind `crates/tls`: rustls + ring + webpki-roots.
-Homegrown crypto holding real credentials is the classic way to leak
-them. Own TLS 1.3 (X25519, AES-GCM, SHA-256, cert validation) replaces
-it, differential-tested against rustls as reference.
+There is exactly one today, behind `crates/tls`: rustls + ring +
+webpki-roots. Rolling our own crypto around real credentials is the
+classic way to leak them, so TLS 1.3 stays borrowed until our own
+implementation (X25519, AES-GCM, SHA-256, cert validation) is ready,
+differential-tested against rustls.
 
 ## Status
 
-Done:
+Working:
 
 - Own HTTP/1.1, URL parser, inflate, TLS boundary
 - Semantic snapshot: roles, inlined names, `#n` interactive refs, collapsed wrappers
@@ -183,38 +192,38 @@ Done:
 - Embedded-JSON extraction (`__NEXT_DATA__`, `ld+json`)
 - `vigia-js`: own lexer/parser/eval, prototypes, builtin methods,
   `new`/`instanceof`/`in`, DOM bindings (`getElementById`,
-  `querySelector(All)`, `createElement/TextNode`, `appendChild`,
-  `insertBefore`, `remove`, live `style` block, `outerHTML`),
-  events with bubbling, external `src=` scripts, Promise + microtasks +
-  virtual-clock timers + `async`/`await`, Promise-returning `fetch`,
-  mark-sweep GC
-- `vigia-js` language coverage beyond ES5: `?.` `??` arrows `for-of/in`
-  regex literals + `RegExp` (`test`/`exec`/`match`/`replace`/`split`/
-  `search`) template literals (untagged) spread/rest params comma
-  operator default params destructuring `switch` `do-while` `void`
-  method/get/set shorthand `Symbol` `Map`/`Set`/`WeakMap`
-  `Object.freeze`/`defineProperty` `self`/`globalThis`
+  `querySelector(All)`, `createElement`, `appendChild`, `insertBefore`,
+  live `style` block), events with bubbling, external `src=` scripts,
+  Promise + microtasks + virtual-clock timers + `async`/`await`,
+  Promise-returning `fetch`, mark-sweep GC
+- WebForms basics: `form.submit()`, `__doPostBack` (injects
+  `__EVENTTARGET`/`__EVENTARGUMENT`), `javascript:` hrefs run as page
+  code — verified against a live postback round-trip
 - Replay: `.vig` scripts plus JSONL audit trail
 - `vigia serve`: HTTP session API + MCP `tools/call` surface (one
   worker thread per session, JSON in/out)
 
-Next:
+Still to do:
 
 - JS: classes (`extends`/`super`), logical assignment, `**`, `delete`
 - Own TLS 1.3 (replace the rustls exception)
 - HTML5 tree-construction hardening (adoption agency, foster parenting)
 - Keep-alive pooling; parallel fetch engine (thread pool, RSS budget)
-- WebForms postbacks (`__doPostBack`, `form.submit()`); no UpdatePanel/AJAX yet
+- WebForms beyond postbacks: no UpdatePanel/AJAX, no `document.cookie`
+  from JS yet
 
-Honest limits: pending `await` is unsupported (vigia settles eagerly);
-no capture phase on events; `Connection: close` per request today.
-No stealth / anti-bot evasion: a bot-manager CAPTCHA is a wall, not a
-puzzle — the strategy is valid sessions plus API replay (`net` + `req`),
-not fingerprint spoofing.
+Honest limits: a `pending await` is an error, not a suspension (vigia
+settles everything eagerly); events don't capture, only bubble; every
+request is `Connection: close` for now. And there is deliberately no
+stealth or anti-bot evasion — when a site puts up a bot-manager
+CAPTCHA, that's a wall, not a puzzle. The strategy is valid sessions
+plus API replay (`net` shows the endpoints, `req` replays them), not
+fingerprint spoofing.
 
 ## Docs and contributing
 
-- `docs/architecture.md`: the load thesis, what is deliberately missing, the risk register.
+- `docs/architecture.md`: the load thesis, what's deliberately missing, the risk register.
+- `docs/bitacora.md`: build log, milestone by milestone, with the live evidence.
 - `AGENTS.md`: build/test commands and contribution conventions.
 - `CONTRIBUTING.md`: how to propose changes.
 - `SECURITY.md`: reporting vulnerabilities.

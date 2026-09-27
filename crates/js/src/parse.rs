@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use crate::ast::{Expr, FnDef, ObjEntry, OptOp, Stmt};
+use crate::ast::{Expr, FnDef, ObjEntry, ObjField, OptOp, Pat, Stmt, VarDecl};
 use crate::eval::fmt_num;
 use crate::lex::{lex, Tok, Token};
 use crate::{err, JsError};
@@ -322,21 +322,127 @@ impl P {
         Ok(v)
     }
 
-    fn var_decls(&mut self) -> R<Vec<(String, Option<Expr>)>> {
+    fn var_decls(&mut self) -> R<Vec<VarDecl>> {
         let mut v = Vec::new();
         loop {
-            let name = self.ident()?;
-            let init = if self.eat_p("=") {
-                Some(self.expr()?)
+            if self.at_p("[") || self.at_p("{") {
+                let pat = self.pattern()?;
+                self.exp_p("=")?;
+                let init = self.expr()?;
+                v.push(VarDecl::Pat(pat, init));
             } else {
-                None
-            };
-            v.push((name, init));
+                let name = self.ident()?;
+                let init = if self.eat_p("=") {
+                    Some(self.expr()?)
+                } else {
+                    None
+                };
+                v.push(VarDecl::Plain(name, init));
+            }
             if !self.eat_p(",") {
                 break;
             }
         }
         Ok(v)
+    }
+
+    /// `[a, , b=1, ...r]` or `{x, y: [z], w=2, ...rest}`. Leaves are plain
+    /// identifiers (plus nested patterns); no computed keys, no member
+    /// targets.
+    fn pattern(&mut self) -> R<Pat> {
+        if self.eat_p("[") {
+            let mut els: Vec<Option<(Pat, Option<Expr>)>> = Vec::new();
+            let mut rest = None;
+            if !self.at_p("]") {
+                loop {
+                    if self.eat_p(",") {
+                        els.push(None);
+                        if self.eat_p("]") {
+                            break;
+                        }
+                        continue;
+                    }
+                    if self.eat_p("...") {
+                        rest = Some(self.ident()?);
+                        self.exp_p("]")?;
+                        break;
+                    }
+                    let p = self.pattern_leaf()?;
+                    let d = if self.eat_p("=") {
+                        Some(self.assign()?)
+                    } else {
+                        None
+                    };
+                    els.push(Some((p, d)));
+                    if self.eat_p("]") {
+                        break;
+                    }
+                    self.exp_p(",")?;
+                    if self.eat_p("]") {
+                        break; // trailing comma
+                    }
+                }
+            } else {
+                self.eat_p("]");
+            }
+            Ok(Pat::Arr(els, rest))
+        } else if self.eat_p("{") {
+            let mut fields = Vec::new();
+            let mut rest = None;
+            if !self.eat_p("}") {
+                loop {
+                    if self.eat_p("...") {
+                        rest = Some(self.ident()?);
+                        self.exp_p("}")?;
+                        break;
+                    }
+                    let key = match self.bump() {
+                        Tok::Ident(s) => s,
+                        Tok::Kw(k) => k.to_string(),
+                        Tok::Str(s) => s,
+                        Tok::Num(n) => fmt_num(n),
+                        t => return Err(err(format!("expected field name, got {t:?}"))),
+                    };
+                    let (pat, default) = if self.eat_p(":") {
+                        let p = self.pattern_leaf()?;
+                        let d = if self.eat_p("=") {
+                            Some(self.assign()?)
+                        } else {
+                            None
+                        };
+                        (p, d)
+                    } else {
+                        // Shorthand: `{x}` = `{x: x}`, plus `{x = d}`.
+                        let d = if self.eat_p("=") {
+                            Some(self.assign()?)
+                        } else {
+                            None
+                        };
+                        (Pat::Ident(key.clone()), d)
+                    };
+                    fields.push(ObjField { key, pat, default });
+                    if self.eat_p("}") {
+                        break;
+                    }
+                    self.exp_p(",")?;
+                    if self.eat_p("}") {
+                        break; // trailing comma
+                    }
+                }
+            }
+            Ok(Pat::Obj(fields, rest))
+        } else {
+            Err(err("expected pattern"))
+        }
+    }
+
+    /// One pattern position: nested pattern or a bare identifier.
+    fn pattern_leaf(&mut self) -> R<Pat> {
+        if self.at_p("[") || self.at_p("{") {
+            self.pattern()
+        } else {
+            Ok(Pat::Ident(self.ident()?))
+        }
     }
 
     /// `(params) { body }` shared by fn declarations and fn expressions.

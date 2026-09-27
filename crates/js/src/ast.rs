@@ -46,6 +46,29 @@ pub enum ObjEntry {
     Spread(Expr),
 }
 
+/// One `var` declarator: `name = init` or a pattern (`[a,b] = e`).
+#[derive(Debug)]
+pub enum VarDecl {
+    Plain(String, Option<Expr>),
+    Pat(Pat, Expr),
+}
+
+/// Destructuring pattern: identifier leaves (plus nested patterns),
+/// element/field defaults, holes (`[,,]`) and a trailing rest name.
+#[derive(Debug)]
+pub enum Pat {
+    Ident(String),
+    Arr(Vec<Option<(Pat, Option<Expr>)>>, Option<String>),
+    Obj(Vec<ObjField>, Option<String>),
+}
+
+#[derive(Debug)]
+pub struct ObjField {
+    pub key: String,
+    pub pat: Pat,
+    pub default: Option<Expr>,
+}
+
 /// One step of an optional chain. The bool marks a `?.` step.
 #[derive(Debug)]
 pub enum OptOp {
@@ -72,7 +95,7 @@ pub struct FnDef {
 pub enum Stmt {
     Expr(Expr),
     /// var/let/const are the same for now; Vec covers `var a=1, b=2`.
-    VarDecl(Vec<(String, Option<Expr>)>),
+    VarDecl(Vec<VarDecl>),
     FnDecl(Rc<FnDef>),
     Return(Option<Expr>),
     If(Expr, Box<Stmt>, Option<Box<Stmt>>),

@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use vigia_json::Json;
 
-use crate::ast::{Expr, FnDef, ObjEntry, OptOp, Stmt};
+use crate::ast::{Expr, FnDef, ObjEntry, OptOp, Pat, Stmt, VarDecl};
 use crate::{
     err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
     Protos, ThenHandler, Timer, Value,
@@ -751,12 +751,20 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::VarDecl(ds) => {
-                for (n, init) in ds {
-                    let v = match init {
-                        Some(e) => self.expr(env, e)?,
-                        None => Value::Undef,
-                    };
-                    self.env_declare(env, n, v);
+                for d in ds {
+                    match d {
+                        VarDecl::Plain(n, init) => {
+                            let v = match init {
+                                Some(e) => self.expr(env, e)?,
+                                None => Value::Undef,
+                            };
+                            self.env_declare(env, n, v);
+                        }
+                        VarDecl::Pat(pat, init) => {
+                            let v = self.expr(env, init)?;
+                            self.destructure(env, pat, v)?;
+                        }
+                    }
                 }
                 Ok(Flow::Normal)
             }
@@ -1333,6 +1341,92 @@ impl Interp {
                 }
             }
             _ => Err(err("bad assignment target")),
+        }
+    }
+
+    /// Pattern binding for `var [a,b] = e` / `var {x} = e`. Sequential:
+    /// later defaults see earlier names. Only declaration position.
+    fn destructure(&mut self, env: u32, pat: &Pat, v: Value) -> Result<(), JsError> {
+        match pat {
+            Pat::Ident(n) => {
+                self.env_declare(env, n, v);
+                Ok(())
+            }
+            Pat::Arr(els, rest) => {
+                let items: Vec<Value> = match v {
+                    Value::Obj(id) => match self.heap.obj(id) {
+                        Obj::Arr { items, .. } => items.clone(),
+                        _ => return Err(err("destructuring a non-iterable")),
+                    },
+                    Value::Str(id) => {
+                        let s = self.heap.get_str(id).to_string();
+                        let mut out = Vec::new();
+                        for c in s.chars() {
+                            out.push(Value::Str(self.heap.alloc_str(c.to_string())?));
+                        }
+                        out
+                    }
+                    _ => return Err(err("destructuring a non-iterable")),
+                };
+                for (i, el) in els.iter().enumerate() {
+                    let Some((p, d)) = el else { continue }; // hole
+                    let mut item = items.get(i).copied().unwrap_or(Value::Undef);
+                    if matches!(item, Value::Undef) {
+                        if let Some(d) = d {
+                            item = self.expr(env, d)?;
+                        }
+                    }
+                    self.destructure(env, p, item)?;
+                }
+                if let Some(r) = rest {
+                    let extra = items.get(els.len()..).unwrap_or(&[]).to_vec();
+                    let arr = self.arr_obj(extra)?;
+                    self.env_declare(env, r, Value::Obj(arr));
+                }
+                Ok(())
+            }
+            Pat::Obj(fields, rest) => {
+                let mut taken = Vec::with_capacity(fields.len());
+                for f in fields {
+                    let fv = match self.as_node(v) {
+                        Some(n) => {
+                            let key = f.key.clone();
+                            self.dom_get(n, &key)?
+                        }
+                        None => get_prop(&self.heap, &self.protos, v, &f.key)?,
+                    };
+                    taken.push(f.key.clone());
+                    let mut item = fv;
+                    if matches!(item, Value::Undef) {
+                        if let Some(d) = &f.default {
+                            item = self.expr(env, d)?;
+                        }
+                    }
+                    self.destructure(env, &f.pat, item)?;
+                }
+                if let Some(r) = rest {
+                    // Own props minus the consumed keys.
+                    let mut pairs = match v {
+                        Value::Obj(id) => match self.heap.obj(id) {
+                            Obj::Arr { items, .. } => items
+                                .clone()
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, x)| (i.to_string(), x))
+                                .collect(),
+                            Obj::Ordinary { pairs, .. }
+                            | Obj::Func { pairs, .. }
+                            | Obj::Native { pairs, .. } => pairs.clone(),
+                            _ => vec![],
+                        },
+                        _ => vec![],
+                    };
+                    pairs.retain(|(k, _)| !taken.contains(k));
+                    let obj = self.obj_pairs(pairs)?;
+                    self.env_declare(env, r, Value::Obj(obj));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -4224,6 +4318,21 @@ mod tests {
         assert_eq!(disp("({x: 1, ...null}).x"), "1");
         assert_eq!(disp("({...'hi'})[1]"), "i");
         assert!(errmsg("var x = [...5]").contains("non-array"));
+    }
+
+    #[test]
+    fn destructuring() {
+        assert_eq!(disp("var [a,b]=['x','y'];a+b"), "xy");
+        assert_eq!(disp("var {p,q}={p:1,q:2};p+q"), "3");
+        assert_eq!(disp("var [h,,t]=[1,2,3];h+t"), "4");
+        assert_eq!(disp("var [d=5,e=6]=[10];d+e"), "16");
+        assert_eq!(disp("var {m=7}={};m"), "7");
+        assert_eq!(disp("var [n,...r]=[1,2,3];r.length+n"), "3");
+        assert_eq!(disp("var {o,...rest}={o:1,x:2};rest.x+o"), "3");
+        assert_eq!(disp("var {a:{b}}={a:{b:42}};b"), "42");
+        assert_eq!(disp("const [x,y]='ab'.split('=');x+y"), "ab");
+        assert!(errmsg("var [a]=null").contains("non-iterable"));
+        assert!(errmsg("var [a]=1").contains("non-iterable"));
     }
 
     #[test]

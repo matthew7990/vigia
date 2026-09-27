@@ -858,7 +858,19 @@ impl Interp {
                 is_decl,
                 iter,
                 body,
-            } => self.stmt_for_of(env, name, *is_decl, iter, body),
+            } => {
+                let items = self.for_of_items(env, iter)?;
+                self.stmt_each(env, name, *is_decl, &items, body)
+            }
+            Stmt::ForIn {
+                name,
+                is_decl,
+                obj,
+                body,
+            } => {
+                let keys = self.for_in_keys(env, obj)?;
+                self.stmt_each(env, name, *is_decl, &keys, body)
+            }
             Stmt::Block(ss) => self.exec_scoped(env, ss),
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
@@ -987,19 +999,12 @@ impl Interp {
 
     /// Strict for-of over arrays and strings. Objects and other iterables
     /// report `not iterable` instead of silently producing nothing.
-    fn stmt_for_of(
-        &mut self,
-        env: u32,
-        name: &str,
-        is_decl: bool,
-        iter: &Expr,
-        body: &Stmt,
-    ) -> Result<Flow, JsError> {
+    fn for_of_items(&mut self, env: u32, iter: &Expr) -> Result<Vec<Value>, JsError> {
         let v = self.expr(env, iter)?;
-        let items: Vec<Value> = match v {
+        match v {
             Value::Obj(id) => match self.heap.obj(id) {
-                Obj::Arr { items, .. } => items.clone(),
-                _ => return Err(err("for-of only over arrays and strings")),
+                Obj::Arr { items, .. } => Ok(items.clone()),
+                _ => Err(err("for-of only over arrays and strings")),
             },
             Value::Str(id) => {
                 let s = self.heap.get_str(id).to_string();
@@ -1007,18 +1012,61 @@ impl Interp {
                 for ch in s.chars() {
                     out.push(Value::Str(self.heap.alloc_str(ch.to_string())?));
                 }
-                out
+                Ok(out)
             }
-            _ => return Err(err("for-of only over arrays and strings")),
-        };
+            _ => Err(err("for-of only over arrays and strings")),
+        }
+    }
+
+    /// Strict for-in: own enumerable keys. Arrays and strings yield
+    /// indices; anything else yields nothing.
+    fn for_in_keys(&mut self, env: u32, obj: &Expr) -> Result<Vec<Value>, JsError> {
+        let v = self.expr(env, obj)?;
+        let mut keys: Vec<String> = Vec::new();
+        match v {
+            Value::Obj(id) => match self.heap.obj(id) {
+                Obj::Ordinary { pairs, .. }
+                | Obj::Func { pairs, .. }
+                | Obj::Native { pairs, .. } => {
+                    keys.extend(pairs.iter().map(|(k, _)| k.clone()));
+                }
+                Obj::Arr { items, .. } => {
+                    keys.extend((0..items.len()).map(|i| i.to_string()));
+                }
+                Obj::RegExp { .. }
+                | Obj::Promise(_)
+                | Obj::Dom(_)
+                | Obj::Style { .. }
+                | Obj::Freed => {}
+            },
+            Value::Str(id) => {
+                keys.extend((0..self.heap.get_str(id).chars().count()).map(|i| i.to_string()));
+            }
+            _ => {}
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            out.push(Value::Str(self.heap.alloc_str(k)?));
+        }
+        Ok(out)
+    }
+
+    fn stmt_each(
+        &mut self,
+        env: u32,
+        name: &str,
+        is_decl: bool,
+        items: &[Value],
+        body: &Stmt,
+    ) -> Result<Flow, JsError> {
         let fenv = self.new_env(env)?;
         self.env_stack.push(fenv);
-        let r = self.stmt_for_of_loop(fenv, name, is_decl, &items, body);
+        let r = self.stmt_each_loop(fenv, name, is_decl, items, body);
         self.env_stack.pop();
         r
     }
 
-    fn stmt_for_of_loop(
+    fn stmt_each_loop(
         &mut self,
         fenv: u32,
         name: &str,
@@ -4405,7 +4453,16 @@ mod tests {
         assert_eq!(num("var t=0;for(var x of [1,2,3])t+=x;t"), 6.0);
         assert_eq!(disp("var s='';for(let c of 'ab')s+=c;s"), "ab");
         assert!(errmsg("for(var x of {})x").contains("only over arrays"));
-        assert!(errmsg("for(var x in {})x").contains("for-in"));
+    }
+
+    #[test]
+    fn for_in_keys() {
+        assert_eq!(disp("var o={a:1,b:2};var k='';for(var x in o)k+=x;k"), "ab");
+        assert_eq!(disp("var s='';for(var i in ['x','y'])s+=i;s"), "01");
+        assert_eq!(
+            num("var n=0;for(var k in null)n++;for(var k in 5)n++;n"),
+            0.0
+        );
     }
 
     #[test]

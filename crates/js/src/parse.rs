@@ -574,8 +574,9 @@ impl P {
         }))))
     }
 
-    /// Strict for-of: `for (var|let|const x of iter)` or `for (x of iter)`.
-    /// Only plain identifiers. Restores position when the head is classic.
+    /// Strict for-of / for-in: `for (var|let|const x of/in e)` or
+    /// `for (x of/in e)`. Only plain identifiers. Restores position when
+    /// the head is classic.
     fn try_for_of(&mut self) -> R<Option<Stmt>> {
         let save = self.i;
         let is_decl = matches!(
@@ -598,24 +599,30 @@ impl P {
         let is_of = matches!(self.peek(), Tok::Ident(s) if s == "of");
         let is_in = matches!(self.peek(), Tok::Kw("in"))
             || matches!(self.peek(), Tok::Ident(s) if s == "in");
-        if is_in {
-            return Err(err("for-in unsupported, use for-of over arrays"));
-        }
-        if !is_of {
+        if !is_of && !is_in {
             self.i = save;
             return Ok(None);
         }
-        self.i += 1; // 'of'
-        let iter = self.expr()?;
+        self.i += 1; // 'of' / 'in'
+        let target = self.expr()?;
         self.exp_p(")")?;
         self.in_loop += 1;
         let b = self.stmt();
         self.in_loop -= 1;
-        Ok(Some(Stmt::ForOf {
-            name,
-            is_decl,
-            iter,
-            body: Box::new(b?),
+        Ok(Some(if is_of {
+            Stmt::ForOf {
+                name,
+                is_decl,
+                iter: target,
+                body: Box::new(b?),
+            }
+        } else {
+            Stmt::ForIn {
+                name,
+                is_decl,
+                obj: target,
+                body: Box::new(b?),
+            }
         }))
     }
 

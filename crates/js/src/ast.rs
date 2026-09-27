@@ -110,6 +110,14 @@ pub enum Stmt {
         iter: Expr,
         body: Box<Stmt>,
     },
+    /// Strict `for-in` over own enumerable keys (objects, array/string
+    /// indices). Anything else iterates zero times.
+    ForIn {
+        name: String,
+        is_decl: bool,
+        obj: Expr,
+        body: Box<Stmt>,
+    },
     Block(Vec<Stmt>),
     Break,
     Continue,

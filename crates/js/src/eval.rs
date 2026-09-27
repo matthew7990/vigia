@@ -723,6 +723,17 @@ impl Interp {
             return Ok(id);
         }
         if self.envs.len() >= self.max_envs {
+            // On demand: loops inside a call (obfuscator decode loops)
+            // never reach a depth-0 safepoint, so recycle dead envs here.
+            // Safe at any depth (see gc_envs).
+            self.gc_envs();
+            if let Some(id) = self.free_envs.pop() {
+                let e = &mut self.envs[id as usize];
+                e.vars.clear();
+                e.parent = Some(parent);
+                e.free = false;
+                return Ok(id);
+            }
             return Err(fatal("env cap"));
         }
         self.envs.push(Env {
@@ -1282,6 +1293,10 @@ impl Interp {
                 }
                 Ok(lv)
             }
+            "," => {
+                self.expr(env, l)?;
+                self.expr(env, r)
+            }
             _ => {
                 let lv = self.expr(env, l)?;
                 let rv = self.expr(env, r)?;
@@ -1732,8 +1747,12 @@ impl Interp {
                         return Err(e);
                     }
                 };
-                for (i, p) in def.params.iter().enumerate() {
-                    self.env_declare(cenv, p, args.get(i).copied().unwrap_or(Value::Undef));
+                for (i, (p, d)) in def.params.iter().enumerate() {
+                    let v = match args.get(i).copied().unwrap_or(Value::Undef) {
+                        Value::Undef if d.is_some() => self.expr(cenv, d.as_ref().unwrap())?,
+                        v => v,
+                    };
+                    self.env_declare(cenv, p, v);
                 }
                 if let Some(r) = &def.rest {
                     let extra = args.get(def.params.len()..).unwrap_or(&[]).to_vec();
@@ -4388,6 +4407,39 @@ mod tests {
         assert_eq!(disp("({x: 1, ...null}).x"), "1");
         assert_eq!(disp("({...'hi'})[1]"), "i");
         assert!(errmsg("var x = [...5]").contains("non-array"));
+    }
+
+    #[test]
+    fn comma_operator() {
+        assert_eq!(num("var x = (1, 2);x"), 2.0);
+        assert_eq!(num("function f(a,b){return a-b}f(1,2)"), -1.0);
+        assert_eq!(num("function f(){return 1, 2}f()"), 2.0);
+        assert_eq!(num("var t=0;for(var i=0,j=10;i<3;i++,j--)t+=j;t"), 27.0);
+        assert_eq!(disp("var x = 1, y = 2;x+y"), "3");
+    }
+
+    #[test]
+    fn default_params() {
+        assert_eq!(num("function f(a,b=5){return a+b}f(1)"), 6.0);
+        assert_eq!(num("function f(a,b=5){return a+b}f(1,2)"), 3.0);
+        assert_eq!(num("function f(a,b=5){return a+b}f(1,undefined)"), 6.0);
+        assert_eq!(num("var g=(x=3)=>x*2;g()"), 6.0);
+        assert_eq!(num("var g=(x=3)=>x*2;g(4)"), 8.0);
+        assert_eq!(num("function f(a,b=a+1){return b}f(1)"), 2.0);
+    }
+
+    #[test]
+    fn env_gc_on_demand() {
+        // Block/call env churn past max_envs recycles instead of dying:
+        // the obfuscator-style loop below needs ~thousands of envs.
+        let mut it = Interp::new();
+        it.max_envs = 200;
+        it.run("var s=0;for(var i=0;i<5000;i++){try{s+=i}catch(e){s-=1}}")
+            .unwrap();
+        match it.run("s").unwrap() {
+            Value::Num(n) => assert_eq!(n, 12497500.0),
+            v => panic!("{v:?}"),
+        }
     }
 
     #[test]

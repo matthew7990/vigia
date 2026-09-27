@@ -161,6 +161,50 @@ impl Interp {
         }
     }
 
+    /// Env-only collection, safe at any call depth: Rust locals never
+    /// hold envs (only Values), so every live env is reachable from the
+    /// open frames (env_stack, parents included) or captured by a Func
+    /// in the heap (scanned conservatively - dead Funcs over-retain,
+    /// never wrongly free).
+    pub(crate) fn gc_envs(&mut self) {
+        let mut marked = vec![false; self.envs.len()];
+        let mut stack: Vec<u32> = Vec::new();
+        stack.push(0);
+        stack.extend(self.env_stack.iter().copied());
+        for o in &self.heap.objs {
+            if let Obj::Func { env, .. } = o {
+                stack.push(*env);
+            }
+        }
+        while let Some(e) = stack.pop() {
+            let Some(env) = self.envs.get(e as usize) else {
+                continue;
+            };
+            if marked[e as usize] || env.free {
+                continue;
+            }
+            marked[e as usize] = true;
+            if let Some(p) = env.parent {
+                stack.push(p);
+            }
+        }
+        let mut free_envs = Vec::new();
+        for (i, &m) in marked.iter().enumerate().skip(1) {
+            if m {
+                continue;
+            }
+            let e = &mut self.envs[i];
+            if !e.free {
+                e.vars.clear();
+                e.parent = None;
+                e.free = true;
+            }
+            free_envs.push(i as u32);
+        }
+        self.free_envs = free_envs;
+        self.gc_runs += 1;
+    }
+
     /// Full mark-sweep. Callable anytime; outside eval the root set is
     /// just globals + queues. Returns per-arena free counts.
     pub fn gc(&mut self) -> GcStats {
@@ -192,6 +236,7 @@ impl Interp {
             self.protos.date,
             self.protos.promise,
             self.protos.error,
+            self.protos.regexp,
         ] {
             if p != u32::MAX {
                 m.ow.push(p);

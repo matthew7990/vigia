@@ -41,6 +41,9 @@ struct P {
 
 type R<T> = Result<T, JsError>;
 
+/// `(params, rest)` of a function or arrow head.
+type Params = (Vec<(String, Option<Expr>)>, Option<String>);
+
 /// Flatten `a.b[k](x)` into `a` + non-optional steps so an optional chain
 /// keeps the receiver for `this`. `a.b?.()` becomes Chain(a, [Member(b),
 /// Call?.]) instead of Chain(Member(a,b), [Call?.]).
@@ -328,12 +331,12 @@ impl P {
             if self.at_p("[") || self.at_p("{") {
                 let pat = self.pattern()?;
                 self.exp_p("=")?;
-                let init = self.expr()?;
+                let init = self.assign()?;
                 v.push(VarDecl::Pat(pat, init));
             } else {
                 let name = self.ident()?;
                 let init = if self.eat_p("=") {
-                    Some(self.expr()?)
+                    Some(self.assign()?)
                 } else {
                     None
                 };
@@ -466,8 +469,8 @@ impl P {
         }))
     }
 
-    /// `(a, b, ...r)`: plain idents plus one trailing rest param.
-    fn param_list(&mut self) -> R<(Vec<String>, Option<String>)> {
+    /// `(a, b=1, ...r)`: plain idents, `=` defaults, one trailing rest.
+    fn param_list(&mut self) -> R<Params> {
         let mut params = Vec::new();
         let mut rest = None;
         if !self.at_p(")") {
@@ -476,7 +479,13 @@ impl P {
                     rest = Some(self.ident()?);
                     break;
                 }
-                params.push(self.ident()?);
+                let n = self.ident()?;
+                let d = if self.eat_p("=") {
+                    Some(self.assign()?)
+                } else {
+                    None
+                };
+                params.push((n, d));
                 if !self.eat_p(",") {
                     break;
                 }
@@ -521,7 +530,7 @@ impl P {
                 self.i = save;
                 return Ok(None);
             }
-            (vec![n], None)
+            (vec![(n, None)], None)
         } else if self.at_p("(") {
             self.i += 1;
             let (ps, rest) = match self.param_list() {
@@ -668,7 +677,15 @@ impl P {
     // ---- expressions -------------------------------------------------
 
     fn expr(&mut self) -> R<Expr> {
-        self.assign()
+        // Comma sequence (lowest precedence): `a, b` evals both, yields b.
+        // Callers needing AssignmentExpression (args, array/obj literals,
+        // var inits) call assign() directly so separators keep working.
+        let mut l = self.assign()?;
+        while self.eat_p(",") {
+            let r = self.assign()?;
+            l = Expr::Bin(",", Box::new(l), Box::new(r));
+        }
+        Ok(l)
     }
 
     fn assign(&mut self) -> R<Expr> {
@@ -912,9 +929,9 @@ impl P {
         if !self.at_p(")") {
             loop {
                 if self.eat_p("...") {
-                    v.push(Expr::Spread(Box::new(self.expr()?)));
+                    v.push(Expr::Spread(Box::new(self.assign()?)));
                 } else {
-                    v.push(self.expr()?);
+                    v.push(self.assign()?);
                 }
                 if !self.eat_p(",") {
                     break;
@@ -996,9 +1013,9 @@ impl P {
                 if !self.eat_p("]") {
                     loop {
                         if self.eat_p("...") {
-                            v.push(Expr::Spread(Box::new(self.expr()?)));
+                            v.push(Expr::Spread(Box::new(self.assign()?)));
                         } else {
-                            v.push(self.expr()?);
+                            v.push(self.assign()?);
                         }
                         if self.eat_p("]") {
                             break;
@@ -1016,7 +1033,7 @@ impl P {
                 if !self.eat_p("}") {
                     loop {
                         if self.eat_p("...") {
-                            v.push(ObjEntry::Spread(self.expr()?));
+                            v.push(ObjEntry::Spread(self.assign()?));
                             if self.eat_p("}") {
                                 break;
                             }
@@ -1039,7 +1056,7 @@ impl P {
                         };
                         // `{x}` shorthand = `{x: x}`
                         let val = if self.eat_p(":") {
-                            self.expr()?
+                            self.assign()?
                         } else {
                             Expr::Ident(key.clone())
                         };

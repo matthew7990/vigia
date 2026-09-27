@@ -1,0 +1,27 @@
+<!doctype html>
+<!-- Static SPA fixture: hydration needs ?. ?? arrows for-of + DOM.
+     Kept out of gen_corpus.py on purpose: deterministic by hand. -->
+<html><head><title>SPA test</title></head>
+<body><div id="app">loading</div>
+<script>
+var config = null;
+var items = [{t:"Alpha",url:"/a"},{t:"Beta",url:"/b"},{t:"Gamma",url:"/c"}];
+var title = config?.title ?? "Items";
+var ul = document.createElement("ul");
+items.forEach(item => {
+  var name = item?.t ?? "unnamed";
+  var li = document.createElement("li");
+  var a = document.createElement("a");
+  a.textContent = name;
+  a.setAttribute("href", item?.url ?? "#");
+  li.appendChild(a);
+  ul.appendChild(li);
+});
+var app = document.getElementById("app");
+app.textContent = "";
+app.appendChild(ul);
+var total = 0;
+for (var it of items) { total += 1; }
+document.title = title + " (" + total + ")";
+</script>
+</body></html>

@@ -17,8 +17,9 @@ const MAX_HEADER: usize = 64 * 1024;
 const MAX_WIRE: usize = 8 * 1024 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const UA: &str = "vigia/0.1 (+https://github.com/matthew7990/vigia)";
-/// Chrome on Linux: what `--stealth` sends instead of `UA`.
-const UA_STEALTH: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+/// Chrome on Linux: what `--stealth` sends instead of `UA`. Shared with
+/// vigia-js so navigator.* matches the wire profile exactly.
+pub const UA_STEALTH: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 #[derive(Debug)]
 pub enum Error {

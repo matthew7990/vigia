@@ -10,7 +10,9 @@ use vigia_dom::{Dom, NodeData, NodeId};
 use vigia_session::CookieJar;
 
 use crate::ast::{Expr, Stmt};
-use crate::eval::{arg, get_prop, nat, set_prop, to_num, to_str, truthy};
+use crate::eval::{
+    arg, get_prop, nat, n_const_false, n_const_true, set_prop, to_num, to_str, truthy,
+};
 use crate::{err, po, Interp, JsError, NativeFn, NetCtx, Obj, PendingSubmit, Value};
 
 /// Same list as vigia-html: these never get a close tag when serializing.
@@ -220,20 +222,48 @@ impl Interp {
             return;
         };
         self.env_declare(0, "document", doc);
-        // Navigator needs several strings; fallible pairs first, then the
+        // Navigator needs several strings; build them first, then the
         // object (heap-cap edges skip the install silently, as elsewhere).
+        // Defaults are Chrome-shaped constants; --stealth only swaps the
+        // UA family to match the wire profile (applied in run_scripts).
+        let Ok(en_us) = self.heap.alloc_str("en-US".into()) else {
+            return;
+        };
+        let langs = match self.heap.alloc_str("en".into()) {
+            Ok(en) => self.arr_obj(vec![Value::Str(en_us), Value::Str(en)]).ok(),
+            Err(_) => None,
+        };
         let nav_pairs: Result<Vec<(String, Value)>, JsError> = (|| {
             let heap = &mut self.heap;
-            Ok(vec![
+            let mut v = vec![
                 ("userAgent".into(), Value::Str(ua)),
                 (
                     "appVersion".into(),
                     Value::Str(heap.alloc_str("5.0 (X11; Linux x86_64)".into())?),
                 ),
                 ("platform".into(), Value::Str(heap.alloc_str("Linux x86_64".into())?)),
-                ("language".into(), Value::Str(heap.alloc_str("en-US".into())?)),
+                ("language".into(), Value::Str(en_us)),
+                ("product".into(), Value::Str(heap.alloc_str("Gecko".into())?)),
+                ("productSub".into(), Value::Str(heap.alloc_str("20030107".into())?)),
+                ("appName".into(), Value::Str(heap.alloc_str("Netscape".into())?)),
+                ("appCodeName".into(), Value::Str(heap.alloc_str("Mozilla".into())?)),
+                ("vendor".into(), Value::Str(heap.alloc_str("".into())?)),
+                ("hardwareConcurrency".into(), Value::Num(8.0)),
+                ("deviceMemory".into(), Value::Num(8.0)),
+                ("maxTouchPoints".into(), Value::Num(0.0)),
+                ("cookieEnabled".into(), Value::Bool(true)),
+                ("doNotTrack".into(), Value::Null),
+                ("pdfViewerEnabled".into(), Value::Bool(true)),
                 ("onLine".into(), Value::Bool(true)),
-            ])
+                (
+                    "javaEnabled".into(),
+                    Value::Obj(heap.alloc_obj(nat("javaEnabled", n_const_false))?),
+                ),
+            ];
+            if let Some(l) = langs {
+                v.push(("languages".into(), Value::Obj(l)));
+            }
+            Ok(v)
         })();
         let (Ok(nav_pairs), Ok(loc)) = (
             nav_pairs,
@@ -307,6 +337,11 @@ impl Interp {
             let _ = self.set_location_href(&href);
         }
         self.net = net;
+        // --stealth: navigator UA family must match the wire profile or
+        // the mismatch itself is the bot signal.
+        if self.net.as_ref().is_some_and(|c| c.jar.stealth) {
+            self.apply_stealth_ua();
+        }
         let mut errs = Vec::new();
         let mut fetched = 0;
         for (n, s) in scripts.iter().enumerate() {
@@ -347,6 +382,31 @@ impl Interp {
             jar: self.net.take().map(|c| c.jar),
             pending_nav: self.pending_nav.take(),
             pending_submit: self.pending_submit.take(),
+        }
+    }
+
+    /// --stealth navigator override: Chrome 126 Linux UA family, same
+    /// strings the net layer sends on the wire (vigia_net::UA_STEALTH).
+    fn apply_stealth_ua(&mut self) {
+        let Some(nav) = self.env_get(0, "navigator") else {
+            return;
+        };
+        let ua = vigia_net::UA_STEALTH;
+        let app_ver = ua.strip_prefix("Mozilla/").unwrap_or(ua);
+        let pairs = [
+            ("userAgent", ua.to_string()),
+            ("appVersion", app_ver.to_string()),
+            ("vendor", "Google Inc.".to_string()),
+            ("product", "Gecko".to_string()),
+            ("productSub", "20030107".to_string()),
+            ("appName", "Netscape".to_string()),
+            ("appCodeName", "Mozilla".to_string()),
+        ];
+        for (k, v) in pairs {
+            let Ok(id) = self.heap.alloc_str(v) else {
+                return;
+            };
+            let _ = set_prop(&mut self.heap, nav, k, Value::Str(id));
         }
     }
 
@@ -1171,6 +1231,34 @@ impl Interp {
                 "textContent" => Ok(Value::Null),
                 "implementation" => self.impl_obj(),
                 "currentScript" => self.opt_node(self.cur_script),
+                "compatMode" => self.str_val("CSS1Compat".into()),
+                "characterSet" => self.str_val("UTF-8".into()),
+                "contentType" => self.str_val("text/html".into()),
+                "referrer" => self.str_val(String::new()),
+                "hidden" => Ok(Value::Bool(false)),
+                "visibilityState" => self.str_val("visible".into()),
+                "designMode" => self.str_val("off".into()),
+                "domain" => {
+                    let h = match self.env_get(0, "location") {
+                        Some(loc) => match get_prop(&self.heap, &self.protos, loc, "hostname") {
+                            Ok(Value::Str(id)) => self.heap.get_str(id).to_string(),
+                            _ => String::new(),
+                        },
+                        None => String::new(),
+                    };
+                    self.str_val(h)
+                }
+                "activeElement" => {
+                    let n = {
+                        let d = self.dom_ref()?;
+                        first_tag(d, "body")
+                    };
+                    self.opt_node(n)
+                }
+                "scrollingElement" => {
+                    let n = doc_element(self.dom_ref()?);
+                    self.opt_node(n)
+                }
                 "cookie" => {
                     // document.cookie: jar view minus HttpOnly. Page URL
                     // prefers the net ctx base, else the live location.
@@ -1595,6 +1683,7 @@ impl Interp {
                     self.dom_wrap(n)
                 }
                 "implementation" => self.impl_obj(),
+                "hasFocus" => Ok(Value::Bool(true)),
                 "createComment" => {
                     let t = to_str(&self.heap, arg(0));
                     let n = self.dom_mut()?.comment_node(&t);
@@ -2297,6 +2386,57 @@ mod tests {
         it2.cur_script = Some(s);
         assert_eq!(ev(&mut it2, "document.currentScript.tagName"), "SCRIPT");
         assert_eq!(ev(&mut it2, "document.currentScript === document.getElementsByTagName('script')[0]"), "true");
+    }
+
+    #[test]
+    fn stealth_ua_sync() {
+        // --stealth: JS navigator matches the wire UA (mismatch = bot flag).
+        let html = "<html><body></body></html>";
+        let mut d = Dom::new();
+        vigia_html::parse(html, &mut d);
+        let mut it = Interp::new();
+        let mut jar = CookieJar::new();
+        jar.stealth = true;
+        let out = it.run_scripts(
+            d,
+            Some(NetCtx {
+                base: vigia_url::Url::parse("http://a.com/").unwrap(),
+                jar,
+                trace: None,
+            }),
+        );
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+        assert_eq!(ev(&mut it, "navigator.userAgent.indexOf('Chrome/126') !== -1"), "true");
+        assert_eq!(ev(&mut it, "navigator.vendor"), "Google Inc.");
+        assert_eq!(ev(&mut it, "window.navigator === navigator"), "true");
+    }
+
+    #[test]
+    fn persona_surface() {
+        // Navigator constants (Chrome-shaped in both modes).
+        let mut it = interp(PAGE);
+        assert_eq!(ev(&mut it, "navigator.product"), "Gecko");
+        assert_eq!(ev(&mut it, "navigator.appName"), "Netscape");
+        assert_eq!(ev(&mut it, "navigator.hardwareConcurrency"), "8");
+        assert_eq!(ev(&mut it, "navigator.languages.join()"), "en-US,en");
+        assert_eq!(ev(&mut it, "navigator.cookieEnabled"), "true");
+        assert_eq!(ev(&mut it, "navigator.javaEnabled()"), "false");
+        assert_eq!(ev(&mut it, "navigator.maxTouchPoints"), "0");
+        assert_eq!(ev(&mut it, "typeof navigator.webdriver"), "undefined");
+        // Screen + viewport persona.
+        assert_eq!(ev(&mut it, "screen.width"), "1920");
+        assert_eq!(ev(&mut it, "screen.colorDepth"), "24");
+        assert_eq!(ev(&mut it, "screen.orientation.type"), "landscape-primary");
+        assert_eq!(ev(&mut it, "innerWidth"), "1366");
+        assert_eq!(ev(&mut it, "devicePixelRatio"), "1");
+        assert_eq!(ev(&mut it, "window.innerWidth"), "1366");
+        // Document props.
+        assert_eq!(ev(&mut it, "document.compatMode"), "CSS1Compat");
+        assert_eq!(ev(&mut it, "document.characterSet"), "UTF-8");
+        assert_eq!(ev(&mut it, "document.hidden"), "false");
+        assert_eq!(ev(&mut it, "document.visibilityState"), "visible");
+        assert_eq!(ev(&mut it, "document.hasFocus()"), "true");
+        assert_eq!(ev(&mut it, "document.designMode"), "off");
     }
 
     #[test]

@@ -1365,6 +1365,7 @@ impl Interp {
             ("getTime", n_date_get_time),
             ("toISOString", n_date_iso),
             ("valueOf", n_date_get_time),
+            ("getTimezoneOffset", n_date_tz),
         ]);
         self.protos.url = self.proto_bag(&[]);
         self.protos.uint8array = self.proto_bag(&[
@@ -1562,6 +1563,7 @@ impl Interp {
                     "createDocumentFragment",
                     "querySelector",
                     "querySelectorAll",
+                    "hasFocus",
                 ][..],
             ),
             ("HTMLFormElement", &["submit"][..]),
@@ -1969,6 +1971,47 @@ impl Interp {
         // Numeric globals (writable in sloppy reality; plain slots here).
         self.env_declare(0, "NaN", Value::Num(f64::NAN));
         self.env_declare(0, "Infinity", Value::Num(f64::INFINITY));
+        // Static viewport persona (no layout engine): 1366x768 desktop,
+        // mirrored on window via the env0 seeding in set_dom.
+        for (n, v) in [
+            ("innerWidth", 1366.0),
+            ("innerHeight", 768.0),
+            ("outerWidth", 1366.0),
+            ("outerHeight", 768.0),
+            ("screenX", 0.0),
+            ("screenY", 0.0),
+            ("scrollX", 0.0),
+            ("scrollY", 0.0),
+            ("pageXOffset", 0.0),
+            ("pageYOffset", 0.0),
+            ("devicePixelRatio", 1.0),
+        ] {
+            self.env_declare(0, n, Value::Num(v));
+        }
+        // window.screen persona (orientation object nested).
+        {
+            let land = self.heap.alloc_str("landscape-primary".into());
+            if let Ok(land) = land {
+                if let Ok(ori) = self.obj_pairs(vec![
+                    ("angle".into(), Value::Num(0.0)),
+                    ("type".into(), Value::Str(land)),
+                ]) {
+                    if let Ok(scr) = self.obj_pairs(vec![
+                        ("width".into(), Value::Num(1920.0)),
+                        ("height".into(), Value::Num(1080.0)),
+                        ("availWidth".into(), Value::Num(1920.0)),
+                        ("availHeight".into(), Value::Num(1040.0)),
+                        ("availLeft".into(), Value::Num(0.0)),
+                        ("availTop".into(), Value::Num(0.0)),
+                        ("colorDepth".into(), Value::Num(24.0)),
+                        ("pixelDepth".into(), Value::Num(24.0)),
+                        ("orientation".into(), Value::Obj(ori)),
+                    ]) {
+                        self.env_declare(0, "screen", Value::Obj(scr));
+                    }
+                }
+            }
+        }
         // window.performance (ruxit probes exactly this surface).
         {
             let mut pp: Vec<(String, Value)> = Vec::new();
@@ -6263,6 +6306,13 @@ fn n_url_revoke(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value,
     Ok(Value::Undef)
 }
 
+/// Fixed persona offset (America/Montevideo, no DST): UTC-3. A real
+/// browser reports the OS zone; without tz data this stays constant
+/// (and deterministic for tests) - documented.
+fn n_date_tz(_it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(-180.0))
+}
+
 fn n_date_get_time(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
     Ok(match get_prop(&it.heap, &it.protos, this, "__ms")? {
         Value::Num(n) => Value::Num(n),
@@ -8803,6 +8853,17 @@ fn n_history_href(_it: &mut Interp, _this: Value, args: &[Value]) -> Result<Valu
     Ok(arg(args, 0))
 }
 
+/// Constant natives for host predicates (javaEnabled=false…).
+pub(crate) fn n_const_false(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(Value::Bool(false))
+}
+
+pub(crate) fn n_const_true(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(Value::Bool(true))
+}
+
 /// ResizeObserver: records observations, never fires (no layout engine
 /// to observe - poppers just never reposition). Enough for sidebar code
 /// that constructs + observes + disconnects at boot.
@@ -10281,6 +10342,12 @@ mod tests {
         assert_eq!(disp("matchMedia('(min-width: 100px)').matches"), "false");
         assert_eq!(disp("matchMedia('(min-width: 100px)').media"), "(min-width: 100px)");
         assert_eq!(disp("var m=matchMedia('x');m.addListener(function(){});m.matches"), "false");
+    }
+
+    #[test]
+    fn persona_surface() {
+        // Timezone is engine-level (no DOM needed).
+        assert_eq!(disp("new Date(0).getTimezoneOffset()"), "-180");
     }
 
     #[test]

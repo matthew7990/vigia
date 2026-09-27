@@ -9152,6 +9152,131 @@ fn n_idb_fire_deny(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Val
     Ok(Value::Undef)
 }
 
+/// navigator.plugins / mimeTypes: Chrome PDF viewer persona. Real
+/// plugin objects (indexed + named access, length) so presence and
+/// enumeration read desktop-Chrome-like. No actual viewers behind them.
+fn n_mime_obj(it: &mut Interp, typ: &str, suffixes: &str) -> Result<Value, JsError> {
+    let t = Value::Str(it.heap.alloc_str(typ.to_string())?);
+    let s = Value::Str(it.heap.alloc_str(suffixes.to_string())?);
+    let d = Value::Str(it.heap.alloc_str("".into())?);
+    Ok(Value::Obj(it.obj_pairs(vec![
+        ("type".into(), t),
+        ("suffixes".into(), s),
+        ("description".into(), d),
+    ])?))
+}
+
+fn n_plugin_item(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    // item(i)/namedItem(name): the single mime when the key matches.
+    let key = to_str(&it.heap, arg(args, 0));
+    let mime = get_prop(&it.heap, &it.protos, this, "0")?;
+    if key == "0" {
+        return Ok(mime);
+    }
+    let mtype = match get_prop(&it.heap, &it.protos, mime, "type") {
+        Ok(Value::Str(id)) => it.heap.get_str(id).to_string(),
+        _ => String::new(),
+    };
+    if !mtype.is_empty() && key == mtype {
+        Ok(mime)
+    } else {
+        Ok(Value::Null)
+    }
+}
+
+fn n_plugin_obj(
+    it: &mut Interp,
+    name: &str,
+    filename: &str,
+    desc: &str,
+    mime: Value,
+) -> Result<Value, JsError> {
+    let n = Value::Str(it.heap.alloc_str(name.to_string())?);
+    let f = Value::Str(it.heap.alloc_str(filename.to_string())?);
+    let d = Value::Str(it.heap.alloc_str(desc.to_string())?);
+    let item = Value::Obj(it.heap.alloc_obj(nat("item", n_plugin_item))?);
+    let named = Value::Obj(it.heap.alloc_obj(nat("namedItem", n_plugin_item))?);
+    Ok(Value::Obj(it.obj_pairs(vec![
+        ("0".into(), mime),
+        ("name".into(), n),
+        ("filename".into(), f),
+        ("description".into(), d),
+        ("length".into(), Value::Num(1.0)),
+        ("item".into(), item),
+        ("namedItem".into(), named),
+    ])?))
+}
+
+pub(crate) fn n_plugins_arr(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let pdf = n_mime_obj(it, "application/pdf", "pdf")?;
+    let chrome_pdf = n_mime_obj(it, "application/x-google-chrome-pdf", "pdf")?;
+    let p1 = n_plugin_obj(
+        it,
+        "Chrome PDF Viewer",
+        "internal-pdf-viewer",
+        "Portable Document Format",
+        pdf,
+    )?;
+    let p2 = n_plugin_obj(
+        it,
+        "Chromium PDF Viewer",
+        "internal-pdf-viewer",
+        "Portable Document Format",
+        chrome_pdf,
+    )?;
+    let item = Value::Obj(it.heap.alloc_obj(nat("item", n_plugins_item))?);
+    let named = Value::Obj(it.heap.alloc_obj(nat("namedItem", n_plugins_item))?);
+    let refresh = Value::Obj(it.heap.alloc_obj(nat("refresh", n_plugins_refresh))?);
+    Ok(Value::Obj(it.obj_pairs(vec![
+        ("0".into(), p1),
+        ("1".into(), p2),
+        ("length".into(), Value::Num(2.0)),
+        ("item".into(), item),
+        ("namedItem".into(), named),
+        ("refresh".into(), refresh),
+    ])?))
+}
+
+fn n_plugins_item(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    // item(i)/namedItem(name) over the two entries.
+    let key = to_str(&it.heap, arg(args, 0));
+    for k in ["0", "1"] {
+        let p = get_prop(&it.heap, &it.protos, this, k)?;
+        if key == k {
+            return Ok(p);
+        }
+        if let Value::Obj(id) = p {
+            if let Obj::Ordinary { pairs, .. } = it.heap.obj(id) {
+                if let Some((_, v)) = pairs.iter().find(|(kk, _)| kk == &"name") {
+                    if to_str(&it.heap, *v) == key {
+                        return Ok(p);
+                    }
+                }
+            }
+        }
+    }
+    Ok(Value::Null)
+}
+
+fn n_plugins_refresh(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(Value::Undef)
+}
+
+pub(crate) fn n_mimetypes_arr(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let m1 = n_mime_obj(it, "application/pdf", "pdf")?;
+    let m2 = n_mime_obj(it, "application/x-google-chrome-pdf", "pdf")?;
+    let item = Value::Obj(it.heap.alloc_obj(nat("item", n_plugins_item))?);
+    let named = Value::Obj(it.heap.alloc_obj(nat("namedItem", n_plugins_item))?);
+    Ok(Value::Obj(it.obj_pairs(vec![
+        ("0".into(), m1),
+        ("1".into(), m2),
+        ("length".into(), Value::Num(2.0)),
+        ("item".into(), item),
+        ("namedItem".into(), named),
+    ])?))
+}
+
 /// `Function(p1, .., pn, body)` / `new Function(...)`: params and body
 /// are source fragments, compiled in global scope like V8 (sloppy).
 /// Parse errors surface as plain errors (SyntaxError shape at catch).

@@ -11,8 +11,9 @@ use vigia_session::CookieJar;
 
 use crate::ast::{Expr, Stmt};
 use crate::eval::{
-    arg, get_prop, nat, n_connection, n_const_false, n_geolocation, n_indexed_db, n_send_beacon,
-    n_user_agent_data, set_prop, to_num, to_str, truthy,
+    arg, get_prop, nat, n_connection, n_const_false, n_geolocation, n_indexed_db,
+    n_mimetypes_arr, n_plugins_arr, n_send_beacon, n_user_agent_data, set_prop, to_num, to_str,
+    truthy,
 };
 use crate::{err, po, Interp, JsError, NativeFn, NetCtx, Obj, PendingSubmit, Value};
 
@@ -279,6 +280,12 @@ impl Interp {
             ("userAgentData", n_user_agent_data),
             ("indexedDB", n_indexed_db),
         ] {
+            match mk(self, Value::Undef, &[]) {
+                Ok(v) => nav_extra.push((k.into(), v)),
+                Err(_) => break,
+            }
+        }
+        for (k, mk) in [("plugins", n_plugins_arr as NativeFn), ("mimeTypes", n_mimetypes_arr)] {
             match mk(self, Value::Undef, &[]) {
                 Ok(v) => nav_extra.push((k.into(), v)),
                 Err(_) => break,
@@ -2443,11 +2450,21 @@ mod tests {
         assert_eq!(ev(&mut it, "navigator.userAgentData.brands.length"), "3");
         assert_eq!(ev(&mut it, "typeof navigator.indexedDB.open"), "function");
         assert_eq!(ev(&mut it, "typeof IDBRequest"), "function");
-        // getHighEntropyValues resolves the static dict.
+        // getHighEntropyValues resolves the static dict (microtasks drain
+        // after the completion value, so read back in a second run).
         assert_eq!(
-            ev(&mut it, "var r='';navigator.userAgentData.getHighEntropyValues().then(function(d){r=d.platform});r"),
-            ""
+            ev(&mut it, "var p=navigator.userAgentData.getHighEntropyValues();p instanceof Promise"),
+            "true"
         );
+        it.run("var r='none';navigator.userAgentData.getHighEntropyValues().then(function(d){r=d.platform})").unwrap();
+        assert_eq!(ev(&mut it, "r"), "Linux");
+        // Plugins persona: length + named lookup.
+        assert_eq!(ev(&mut it, "navigator.plugins.length"), "2");
+        assert_eq!(ev(&mut it, "navigator.plugins[0].name"), "Chrome PDF Viewer");
+        assert_eq!(ev(&mut it, "navigator.plugins.namedItem('Chromium PDF Viewer').filename"), "internal-pdf-viewer");
+        assert_eq!(ev(&mut it, "navigator.mimeTypes.length"), "2");
+        assert_eq!(ev(&mut it, "navigator.mimeTypes[0].type"), "application/pdf");
+        assert_eq!(ev(&mut it, "navigator.plugins.item(5)"), "null");
     }
 
     #[test]

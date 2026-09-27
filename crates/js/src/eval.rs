@@ -8,7 +8,7 @@ use std::rc::Rc;
 use vigia_json::Json;
 
 use crate::ast::{
-    ClassCtor, ClassMember, Expr, FnDef, MemberKind, ObjEntry, OptOp, Pat, Stmt, VarDecl,
+    ClassCtor, ClassMember, Expr, FnDef, MemberKind, ObjEntry, OptOp, Pat, Stmt, VarDecl, VarKind,
 };
 use crate::{
     err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
@@ -1000,6 +1000,7 @@ impl Interp {
             ("toISOString", n_date_iso),
             ("valueOf", n_date_get_time),
         ]);
+        self.protos.url = self.proto_bag(&[]);
         // Map/Set/WeakMap prototypes; `size` is an accessor (no data slot).
         // (One block per kind: sharing `self` mutably across a table would
         // need unsafe, which this codebase forbids outside vigia-mem.)
@@ -1127,6 +1128,15 @@ impl Interp {
         self.ctor("Number", n_number_cast, pr.number, &[]);
         self.ctor("Boolean", n_boolean_cast, u32::MAX, &[]);
         self.ctor("Date", n_date, pr.date, &[("now", n_date_now)]);
+        self.ctor(
+            "URL",
+            n_url_ctor,
+            pr.url,
+            &[
+                ("createObjectURL", n_url_create),
+                ("revokeObjectURL", n_url_revoke),
+            ],
+        );
         self.ctor("RegExp", n_regexp_ctor, pr.regexp, &[]);
         self.ctor(
             "Symbol",
@@ -1138,6 +1148,25 @@ impl Interp {
         self.ctor("Set", n_set_ctor, pr.set, &[]);
         self.ctor("WeakMap", n_weakmap_ctor, pr.weakmap, &[]);
         self.ctor("Error", n_error, pr.error, &[]);
+        // Error subtypes: own prototype under Error.prototype (so
+        // `instanceof Error` holds) with their `name`, same construct
+        // behavior as Error (message on `this`).
+        for name in ["TypeError", "RangeError", "SyntaxError", "ReferenceError"] {
+            let eproto = po(pr.error);
+            let id = match self.heap.alloc_obj(Obj::Ordinary {
+                pairs: vec![],
+                proto: eproto,
+            }) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            if let Ok(nm) = self.heap.alloc_str(name.to_string()) {
+                if let Obj::Ordinary { pairs, .. } = self.heap.obj_mut(id) {
+                    pairs.push(("name".into(), Value::Str(nm)));
+                }
+            }
+            self.ctor(name, n_error, id, &[]);
+        }
         self.ctor(
             "Promise",
             n_promise_ctor,
@@ -1293,6 +1322,13 @@ impl Interp {
                 let f = self.func_obj(def.clone(), env)?;
                 if let Some(n) = &def.name {
                     self.env_declare(env, n, Value::Obj(f));
+                    // Annex B (sloppy): a block-level `function` also
+                    // binds - and assigns on block entry - in the
+                    // enclosing function scope (a no-op at function top
+                    // level and global scope, where env already is it).
+                    if env != self.func_env {
+                        self.env_declare(self.func_env, n, Value::Obj(f));
+                    }
                 }
             }
         }
@@ -1314,25 +1350,52 @@ impl Interp {
                 self.last = self.expr(env, e)?;
                 Ok(Flow::Normal)
             }
-            Stmt::VarDecl(ds) => {
+            Stmt::VarDecl(kind, ds) => {
+                // `var` binds function scope; `let`/`const` the block.
+                let benv = if *kind == VarKind::Var {
+                    self.func_env
+                } else {
+                    env
+                };
                 for d in ds {
                     match d {
                         VarDecl::Plain(n, init) => {
-                            let v = match init {
-                                Some(e) => self.expr(env, e)?,
-                                None => Value::Undef,
-                            };
-                            self.env_declare(env, n, v);
+                            match init {
+                                Some(e) => {
+                                    let v = self.expr(env, e)?;
+                                    self.env_declare(benv, n, v);
+                                }
+                                // Bare `var x;` never overwrites (a hoisted
+                                // function or earlier value survives).
+                                None => {
+                                    if !self.envs[benv as usize].vars.contains_key(n) {
+                                        self.env_declare(benv, n, Value::Undef);
+                                    }
+                                }
+                            }
                         }
                         VarDecl::Pat(pat, init) => {
                             let v = self.expr(env, init)?;
-                            self.destructure(env, pat, v, false)?;
+                            self.destructure(env, benv, pat, v, false)?;
                         }
                     }
                 }
                 Ok(Flow::Normal)
             }
-            Stmt::FnDecl(_) => Ok(Flow::Normal), // hoisted
+            Stmt::FnDecl(def) => {
+                // Direct members were already hoisted; (re)declaring here
+                // is a harmless overwrite - and it covers single-statement
+                // positions (`if (x) function f(){}`) that no hoist pass
+                // visits. Mirror Annex-B into function scope when nested.
+                let f = self.func_obj(def.clone(), env)?;
+                if let Some(n) = &def.name {
+                    self.env_declare(env, n, Value::Obj(f));
+                    if env != self.func_env {
+                        self.env_declare(self.func_env, n, Value::Obj(f));
+                    }
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::ClassDecl(n, c) => {
                 // Never hoisted: earlier use is "not defined".
                 match c {
@@ -1408,21 +1471,21 @@ impl Interp {
             Stmt::For(init, test, upd, body) => self.stmt_for(env, init, test, upd, body),
             Stmt::ForOf {
                 pat,
-                is_decl,
+                decl,
                 iter,
                 body,
             } => {
                 let items = self.for_of_items(env, iter)?;
-                self.stmt_each(env, pat, *is_decl, &items, body)
+                self.stmt_each(env, pat, decl, &items, body)
             }
             Stmt::ForIn {
                 pat,
-                is_decl,
+                decl,
                 obj,
                 body,
             } => {
                 let keys = self.for_in_keys(env, obj)?;
-                self.stmt_each(env, pat, *is_decl, &keys, body)
+                self.stmt_each(env, pat, decl, &keys, body)
             }
             Stmt::Switch { disc, cases } => {
                 let v = self.expr(env, disc)?;
@@ -1503,13 +1566,132 @@ impl Interp {
         }
     }
 
-    /// Braced body in a fresh env only when it declares names - the
-    /// scoping rule Stmt::Block and the try clauses share.
+    /// Innermost call chain for error context ("a > b > ?"),
+    /// truncated to the last 6 frames. Empty at top level.
+    fn js_chain(&self) -> String {
+        let mut parts = Vec::new();
+        for &id in &self.js_stack {
+            let nm = match self.heap.obj(id) {
+                Obj::Func { def, .. } => def.name.clone().unwrap_or_else(|| "?".into()),
+                Obj::Native { name, .. } => name.to_string(),
+                _ => "?".into(),
+            };
+            parts.push(nm);
+        }
+        if parts.len() > 6 {
+            parts = parts[parts.len() - 6..].to_vec();
+        }
+        parts.join(" > ")
+    }
+
+    /// "{n} is not defined", plus the call chain when inside calls.
+    fn undefined_err(&self, n: &str) -> JsError {
+        let mut m = format!("{n} is not defined");
+        if !self.js_stack.is_empty() {
+            m.push_str(&format!(" (in {})", self.js_chain()));
+        }
+        err(m)
+    }
+
+    /// Hoist `var` bindings (as undefined) and block-level function
+    /// declarations into the function env, once per function entry.
+    /// `let`/`const`/classes stay lexical (TDZ preserved). Functions win
+    /// over vars regardless of source order; `var` never overwrites.
+    pub(crate) fn hoist_vars(&mut self, stmts: &[Stmt], fenv: u32) -> Result<(), JsError> {
+        for s in stmts {
+            match s {
+                Stmt::VarDecl(kind, ds) if *kind == VarKind::Var => {
+                    for d in ds {
+                        match d {
+                            VarDecl::Plain(n, _) => self.hoist_name(fenv, n),
+                            VarDecl::Pat(pat, _) => self.hoist_pat(fenv, pat),
+                        }
+                    }
+                }
+                Stmt::FnDecl(def) => {
+                    if let Some(n) = &def.name {
+                        let f = self.func_obj(def.clone(), fenv)?;
+                        self.env_declare(fenv, n, Value::Obj(f));
+                    }
+                }
+                Stmt::If(_, t, e) => {
+                    self.hoist_vars(std::slice::from_ref(t), fenv)?;
+                    if let Some(e) = e {
+                        self.hoist_vars(std::slice::from_ref(e), fenv)?;
+                    }
+                }
+                Stmt::While(_, b)
+                | Stmt::DoWhile(b, _)
+                | Stmt::Label(_, b)
+                | Stmt::For(_, _, _, b) => {
+                    self.hoist_vars(std::slice::from_ref(b), fenv)?;
+                }
+                Stmt::ForOf { body, .. } | Stmt::ForIn { body, .. } => {
+                    self.hoist_vars(std::slice::from_ref(body), fenv)?;
+                }
+                Stmt::Switch { cases, .. } => {
+                    for (_, body) in cases {
+                        self.hoist_vars(body, fenv)?;
+                    }
+                }
+                Stmt::Try {
+                    body, catch, finally,
+                } => {
+                    self.hoist_vars(body, fenv)?;
+                    if let Some((_, cbody)) = catch {
+                        self.hoist_vars(cbody, fenv)?;
+                    }
+                    if let Some(f) = finally {
+                        self.hoist_vars(f, fenv)?;
+                    }
+                }
+                Stmt::Block(ss) => self.hoist_vars(ss, fenv)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Declare one hoisted name as undefined unless present (functions
+    /// and earlier vars win over later `var`s).
+    fn hoist_name(&mut self, fenv: u32, n: &str) {
+        if !self.envs[fenv as usize].vars.contains_key(n) {
+            self.env_declare(fenv, n, Value::Undef);
+        }
+    }
+
+    /// Ident leaves of a pattern, for the hoist pre-pass (defaults are
+    /// runtime expressions, never evaluated here).
+    fn hoist_pat(&mut self, fenv: u32, pat: &Pat) {
+        match pat {
+            Pat::Ident(n) => self.hoist_name(fenv, n),
+            Pat::Arr(els, rest) => {
+                for el in els.iter().flatten() {
+                    self.hoist_pat(fenv, &el.0);
+                }
+                if let Some(r) = rest {
+                    self.hoist_name(fenv, r);
+                }
+            }
+            Pat::Obj(fields, rest) => {
+                for f in fields {
+                    self.hoist_pat(fenv, &f.pat);
+                }
+                if let Some(r) = rest {
+                    self.hoist_name(fenv, r);
+                }
+            }
+        }
+    }
+
     fn exec_scoped(&mut self, env: u32, ss: &[Stmt]) -> Result<Flow, JsError> {
-        if ss
-            .iter()
-            .any(|s| matches!(s, Stmt::VarDecl(_) | Stmt::FnDecl(_) | Stmt::ClassDecl(..)))
-        {
+        // Fresh env only for block-scoped bindings (`let`/`const`,
+        // functions, classes). Pure-`var` blocks bind function scope.
+        if ss.iter().any(|s| match s {
+            Stmt::VarDecl(k, _) => *k != VarKind::Var,
+            Stmt::FnDecl(_) | Stmt::ClassDecl(..) => true,
+            _ => false,
+        }) {
             let e2 = self.new_env(env)?;
             self.exec_block(ss, e2)
         } else {
@@ -1532,6 +1714,8 @@ impl Interp {
         let r = self.exec_scoped(env, body);
         let r = match (r, catch) {
             (Err(e), Some((param, cbody))) if e.catchable() => {
+                // Caught: the in-flight chain belongs to a handled throw.
+                self.throw_chain = None;
                 match self.catch_env(env, param.as_deref(), e) {
                     Ok(cenv) => self.exec_block(cbody, cenv),
                     Err(e2) => Err(e2),
@@ -1680,13 +1864,13 @@ impl Interp {
         &mut self,
         env: u32,
         pat: &Pat,
-        is_decl: bool,
+        decl: &Option<VarKind>,
         items: &[Value],
         body: &Stmt,
     ) -> Result<Flow, JsError> {
         let fenv = self.new_env(env)?;
         self.env_stack.push(fenv);
-        let r = self.stmt_each_loop(fenv, pat, is_decl, items, body);
+        let r = self.stmt_each_loop(fenv, pat, decl, items, body);
         self.env_stack.pop();
         r
     }
@@ -1695,23 +1879,29 @@ impl Interp {
         &mut self,
         fenv: u32,
         pat: &Pat,
-        is_decl: bool,
+        decl: &Option<VarKind>,
         items: &[Value],
         body: &Stmt,
     ) -> Result<Flow, JsError> {
         let mine = self.label_direct.take();
+        // `var` targets bind function scope; everything else the loop env.
+        let benv = match decl {
+            Some(VarKind::Var) => self.func_env,
+            _ => fenv,
+        };
         for &item in items {
             self.tick()?;
             self.maybe_gc();
-            match (pat, is_decl) {
+            match (pat, decl) {
                 // Bare `for (x of ...)` assigns (possibly to a global).
-                (Pat::Ident(n), false) => {
+                (Pat::Ident(n), None) => {
                     if !self.env_set(fenv, n, item) {
                         self.env_declare(0, n, item);
                     }
                 }
-                // Declarations and patterns always bind fresh.
-                _ => self.destructure(fenv, pat, item, !is_decl)?,
+                // Declarations always bind fresh (patterns may assign
+                // through nested member leaves - handled inside).
+                _ => self.destructure(fenv, benv, pat, item, decl.is_none())?,
             }
             match self.stmt(fenv, body)? {
                 Flow::Normal => {}
@@ -1730,9 +1920,7 @@ impl Interp {
             Expr::Bool(b) => Ok(Value::Bool(*b)),
             Expr::Null => Ok(Value::Null),
             Expr::Undef => Ok(Value::Undef),
-            Expr::Ident(n) => self
-                .env_get(env, n)
-                .ok_or_else(|| err(format!("{n} is not defined"))),
+            Expr::Ident(n) => self.env_get(env, n).ok_or_else(|| self.undefined_err(n)),
             Expr::Arr(items) => {
                 let mut v = Vec::with_capacity(items.len());
                 for it in items {
@@ -1791,7 +1979,7 @@ impl Interp {
             Expr::Assign(op, l, r) => self.assign(env, op, l, r),
             Expr::Destructure(pat, rhs) => {
                 let v = self.expr(env, rhs)?;
-                self.destructure(env, pat, v, true)?;
+                self.destructure(env, env, pat, v, true)?;
                 Ok(v)
             }
             Expr::Call(c, args) => self.call(env, c, args),
@@ -1861,25 +2049,59 @@ impl Interp {
                     }
                 }
                 let args = self.eval_args(env, args)?;
-                // proto = callee.prototype when it's an object (JS); natives
-                // may ignore `this` and return their own object anyway.
-                let proto = match get_prop(&self.heap, &self.protos, f, "prototype")? {
-                    Value::Obj(p) => Some(p),
-                    _ => po(self.protos.object),
-                };
-                let obj = self.heap.alloc_obj(Obj::Ordinary {
-                    pairs: vec![],
-                    proto,
-                })?;
-                let r = self.call_value(f, Value::Obj(obj), &args, None)?;
-                Ok(match r {
-                    Value::Obj(_) => r,
-                    _ => Value::Obj(obj),
-                })
+                self.construct_value(f, &args)
             }
         }
     }
 
+    /// `new f(...args)`: unwrap bound functions (outermost first,
+    /// prepending their bound args), then build `this` from the final
+    /// target's `prototype` and call it. Bound arrows and non-functions
+    /// throw like V8 ("not a constructor").
+    fn construct_value(&mut self, f: Value, args: &[Value]) -> Result<Value, JsError> {
+        let mut target = f;
+        let mut full = args.to_vec();
+        loop {
+            let Value::Obj(id) = target else {
+                return Err(err("not a constructor"));
+            };
+            match self.heap.obj(id) {
+                Obj::Native { name, .. } if *name == "bound" => {
+                    let t = get_prop(&self.heap, &self.protos, target, "__t")?;
+                    let mut pre = match get_prop(&self.heap, &self.protos, target, "__a")? {
+                        Value::Obj(aid) => arr_items(self, aid),
+                        _ => Vec::new(),
+                    };
+                    pre.append(&mut full);
+                    full = pre;
+                    target = t;
+                }
+                Obj::Func { def, .. } => {
+                    if def.is_arrow {
+                        return Err(err("arrow is not a constructor"));
+                    }
+                    break;
+                }
+                Obj::Native { .. } => break, // natives take `this` as given
+                _ => return Err(err("not a constructor")),
+            }
+        }
+        // proto = target.prototype when it's an object (JS); natives may
+        // ignore `this` and return their own object anyway.
+        let proto = match get_prop(&self.heap, &self.protos, target, "prototype")? {
+            Value::Obj(p) => Some(p),
+            _ => po(self.protos.object),
+        };
+        let obj = self.heap.alloc_obj(Obj::Ordinary {
+            pairs: vec![],
+            proto,
+        })?;
+        let r = self.call_value(target, Value::Obj(obj), &full, None)?;
+        Ok(match r {
+            Value::Obj(_) => r,
+            _ => Value::Obj(obj),
+        })
+    }
     fn unary(&mut self, env: u32, op: &str, e: &Expr) -> Result<Value, JsError> {
         match op {
             "typeof" => {
@@ -2158,9 +2380,7 @@ impl Interp {
 
     fn get_ref(&mut self, env: u32, e: &Expr) -> Result<Value, JsError> {
         match e {
-            Expr::Ident(n) => self
-                .env_get(env, n)
-                .ok_or_else(|| err(format!("{n} is not defined"))),
+            Expr::Ident(n) => self.env_get(env, n).ok_or_else(|| self.undefined_err(n)),
             Expr::Member(o, k) => {
                 let v = self.expr(env, o)?;
                 self.recv_get(v, k)
@@ -2202,20 +2422,30 @@ impl Interp {
     /// destructuring assignment (`[a] = e`) and undeclared for-targets.
     /// Declare `n = v`, or assign through the scope chain (sloppy
     /// global fallback) when `assign` is set.
-    fn bind_name(&mut self, env: u32, n: &str, v: Value, assign: bool) {
+    fn bind_name(&mut self, env: u32, benv: u32, n: &str, v: Value, assign: bool) {
         if assign {
             if !self.env_set(env, n, v) {
                 self.env_declare(0, n, v);
             }
         } else {
-            self.env_declare(env, n, v);
+            self.env_declare(benv, n, v);
         }
     }
 
-    fn destructure(&mut self, env: u32, pat: &Pat, v: Value, assign: bool) -> Result<(), JsError> {
+    /// Pattern binding with separate eval env (`env`: defaults evaluate
+    /// here, scope chain starts here) and bind env (`benv`: declarations
+    /// land here - function scope for `var`, current env otherwise).
+    fn destructure(
+        &mut self,
+        env: u32,
+        benv: u32,
+        pat: &Pat,
+        v: Value,
+        assign: bool,
+    ) -> Result<(), JsError> {
         match pat {
             Pat::Ident(n) => {
-                self.bind_name(env, n, v, assign);
+                self.bind_name(env, benv, n, v, assign);
                 Ok(())
             }
             Pat::Arr(els, rest) => {
@@ -2242,12 +2472,12 @@ impl Interp {
                             item = self.expr(env, d)?;
                         }
                     }
-                    self.destructure(env, p, item, assign)?;
+                    self.destructure(env, benv, p, item, assign)?;
                 }
                 if let Some(r) = rest {
                     let extra = items.get(els.len()..).unwrap_or(&[]).to_vec();
                     let arr = self.arr_obj(extra)?;
-                    self.bind_name(env, r, Value::Obj(arr), assign);
+                    self.bind_name(env, benv, r, Value::Obj(arr), assign);
                 }
                 Ok(())
             }
@@ -2268,7 +2498,7 @@ impl Interp {
                             item = self.expr(env, d)?;
                         }
                     }
-                    self.destructure(env, &f.pat, item, assign)?;
+                    self.destructure(env, benv, &f.pat, item, assign)?;
                 }
                 if let Some(r) = rest {
                     // Own props minus the consumed keys.
@@ -2289,7 +2519,7 @@ impl Interp {
                     };
                     pairs.retain(|(k, _)| !taken.contains(k));
                     let obj = self.obj_pairs(pairs)?;
-                    self.bind_name(env, r, Value::Obj(obj), assign);
+                    self.bind_name(env, benv, r, Value::Obj(obj), assign);
                 }
                 Ok(())
             }
@@ -2610,6 +2840,16 @@ impl Interp {
             self.call_depth -= 1;
             return Err(fatal("max call depth"));
         }
+        // Optional call trace for bundle debugging (VIGIA_JSTRACE=1):
+        // callee name per entry, stderr. Zero cost when unset.
+        let tracing = std::env::var_os("VIGIA_JSTRACE").is_some();
+        if tracing {
+            let name = match &c {
+                C::Fn(def, _) => def.name.clone().unwrap_or_else(|| "?".into()),
+                C::Nat(_) => "[native]".into(),
+            };
+            eprintln!("{:>width$}js> {name}", "", width = self.call_depth as usize);
+        }
         // Root callee/this/args for the call's duration: GC can't see Rust
         // locals, so a callback a native holds (arr.map's f) or an IIFE
         // temp would otherwise be swept mid-execution.
@@ -2631,6 +2871,9 @@ impl Interp {
                 // next to exec_block (below) so the `?`s above cannot
                 // leak it; every exit below restores it.
                 let sup = self.func_super(id);
+                // Hoist `var`s (as undefined) and nested function
+                // declarations before params: defaults may read them.
+                self.hoist_vars(&def.body, cenv)?;
                 for (i, (p, d)) in def.params.iter().enumerate() {
                     let mut v = args.get(i).copied().unwrap_or(Value::Undef);
                     if matches!(v, Value::Undef) {
@@ -2640,7 +2883,7 @@ impl Interp {
                     }
                     match p {
                         Pat::Ident(n) => self.env_declare(cenv, n, v),
-                        _ => self.destructure(cenv, p, v, false)?,
+                        _ => self.destructure(cenv, cenv, p, v, false)?,
                     }
                 }
                 if let Some(r) = &def.rest {
@@ -2672,13 +2915,19 @@ impl Interp {
                 };
                 self.env_declare(cenv, "this", this_val);
                 // `await` binds to the nearest enclosing fn, so the flag
-                // is shadowed per call rather than accumulated.
+                // is shadowed per call rather than accumulated. Same for
+                // the Annex-B hoist scope below.
                 let prev_async = self.fn_async;
                 self.fn_async = def.is_async;
+                let prev_fenv = self.func_env;
+                self.func_env = cenv;
                 let pushed_super = sup.is_some();
                 if let Some(s) = sup {
                     self.super_stack.push(s);
                 }
+                // JS call chain for error context (ids; names resolve
+                // lazily). Popped with the rest below - no `?` between.
+                self.js_stack.push(id);
                 let mut r = match self.exec_block(&def.body, cenv) {
                     Ok(Flow::Return(v)) => Ok(v),
                     Ok(_) => Ok(Value::Undef),
@@ -2714,7 +2963,18 @@ impl Interp {
                 if pushed_super {
                     self.super_stack.pop();
                 }
+                // Snapshot the chain while the innermost frame is still on
+                // it (first/innermost Err wins; outer frames see None set).
+                // Popped with the rest below - no `?` between.
+                if r.is_err() && self.throw_chain.is_none() {
+                    let c = self.js_chain();
+                    if !c.is_empty() {
+                        self.throw_chain = Some(c);
+                    }
+                }
+                self.js_stack.pop();
                 self.fn_async = prev_async;
+                self.func_env = prev_fenv;
                 (def.is_async, r)
             }
             C::Nat(nf) => {
@@ -2722,7 +2982,15 @@ impl Interp {
                 // carry bound state in their own props ("__p", "__f", ...).
                 let prev = self.cur_native;
                 self.cur_native = f;
+                self.js_stack.push(id);
                 let r = nf(self, this, args);
+                if r.is_err() && self.throw_chain.is_none() {
+                    let c = self.js_chain();
+                    if !c.is_empty() {
+                        self.throw_chain = Some(c);
+                    }
+                }
+                self.js_stack.pop();
                 self.cur_native = prev;
                 (false, r)
             }
@@ -2799,10 +3067,17 @@ impl Interp {
 
     /// Boundary render: a thrown value becomes its text (the heap id
     /// inside Throw isn't rooted once the error leaves eval); Msg and
-    /// Fatal pass through unchanged.
-    pub(crate) fn bound_err(&self, e: JsError) -> JsError {
+    /// Fatal pass through unchanged. Handled throws append the snapshot
+    /// chain ("TypeError: x (in a > b)") for bundle debugging.
+    pub(crate) fn bound_err(&mut self, e: JsError) -> JsError {
         match e {
-            JsError::Throw(v) => err(self.thrown_text(v)),
+            JsError::Throw(v) => {
+                let mut t = self.thrown_text(v);
+                if let Some(c) = self.throw_chain.take() {
+                    t.push_str(&format!(" (in {c})"));
+                }
+                err(t)
+            }
             _ => e,
         }
     }
@@ -3223,6 +3498,8 @@ fn n_obj_freeze(_it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value,
 
 /// Shared by defineProperty/defineProperties: data (`value`) or accessor
 /// (`get`/`set`) descriptor; flags ignored (all props stay mutable).
+/// Attribute-only descriptors (`{writable:false}`, no value/get/set)
+/// keep the existing value like V8 (only absent keys become undefined).
 fn define_one(it: &mut Interp, target: Value, key: &str, desc: Value) -> Result<(), JsError> {
     if !matches!(target, Value::Obj(_)) {
         return Err(err("defineProperty: target must be an object"));
@@ -3248,8 +3525,25 @@ fn define_one(it: &mut Interp, target: Value, key: &str, desc: Value) -> Result<
         set_prop(&mut it.heap, target, key, acc)?;
         return Ok(());
     }
-    let v = get_prop(&it.heap, &it.protos, desc, "value")?;
-    set_prop(&mut it.heap, target, key, v)
+    // Own `value` (even explicit undefined) overwrites; a descriptor
+    // without one only touches flags - the value survives.
+    let has_value = match desc {
+        Value::Obj(id) => own_prop(&it.heap, id, "value").is_some(),
+        _ => false,
+    };
+    if has_value || own_val(&it.heap, target, key).is_none() {
+        let v = get_prop(&it.heap, &it.protos, desc, "value")?;
+        set_prop(&mut it.heap, target, key, v)?;
+    }
+    Ok(())
+}
+
+/// Own (non-inherited) value of `key` on an object, if present.
+fn own_val(h: &Heap, target: Value, key: &str) -> Option<Value> {
+    let Value::Obj(id) = target else {
+        return None;
+    };
+    own_prop(h, id, key)
 }
 
 fn n_obj_define_property(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
@@ -4315,6 +4609,93 @@ fn n_date(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError
 fn n_date_now(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
     let _ = it;
     Ok(Value::Num(now_ms()))
+}
+
+// -- URL -----------------------------------------------------------------------------
+
+/// `new URL(input, base?)`: components materialized as own string props
+/// (read-only snapshot - setters stay unimplemented).
+fn n_url_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let input = to_str(&it.heap, arg(args, 0));
+    let url = match arg(args, 1) {
+        Value::Undef => vigia_url::Url::parse(&input),
+        b => {
+            let bs = to_str(&it.heap, b);
+            vigia_url::Url::parse(&bs).and_then(|base| base.join(&input))
+        }
+    }
+    .map_err(|e| err(format!("invalid URL: {e}")))?;
+    let mut props = Vec::with_capacity(8);
+    let str_prop = |pairs: &mut Vec<(String, Value)>,
+                        heap: &mut Heap,
+                        k: &str,
+                        v: String| {
+        let id = heap.alloc_str(v)?;
+        pairs.push((k.into(), Value::Str(id)));
+        Ok::<(), JsError>(())
+    };
+    str_prop(&mut props, &mut it.heap, "href", url.to_string())?;
+    str_prop(&mut props, &mut it.heap, "protocol", format!("{}:", url.scheme))?;
+    str_prop(
+        &mut props,
+        &mut it.heap,
+        "host",
+        if url.host.is_empty() {
+            String::new()
+        } else {
+            url.host_header()
+        },
+    )?;
+    str_prop(&mut props, &mut it.heap, "hostname", url.host.clone())?;
+    str_prop(
+        &mut props,
+        &mut it.heap,
+        "port",
+        url.port.map(|p| p.to_string()).unwrap_or_default(),
+    )?;
+    str_prop(&mut props, &mut it.heap, "pathname", url.path.clone())?;
+    str_prop(
+        &mut props,
+        &mut it.heap,
+        "search",
+        url.query.as_deref().map(|q| format!("?{q}")).unwrap_or_default(),
+    )?;
+    str_prop(
+        &mut props,
+        &mut it.heap,
+        "hash",
+        url.fragment
+            .as_deref()
+            .map(|f| format!("#{f}"))
+            .unwrap_or_default(),
+    )?;
+    str_prop(
+        &mut props,
+        &mut it.heap,
+        "origin",
+        if url.host.is_empty() {
+            "null".into()
+        } else {
+            format!("{}://{}", url.scheme, url.host_header())
+        },
+    )?;
+    let proto = po(it.protos.url);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Ordinary {
+        pairs: props,
+        proto,
+    })?))
+}
+
+fn n_url_create(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    // Opaque unique handle; nothing backs it (no Blob URLs resolve here).
+    let n = it.blob_next;
+    it.blob_next = n.wrapping_add(1);
+    Ok(Value::Str(it.heap.alloc_str(format!("blob:vigia-{n}"))?))
+}
+
+fn n_url_revoke(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(Value::Undef)
 }
 
 fn n_date_get_time(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
@@ -6259,6 +6640,106 @@ mod tests {
     }
 
     #[test]
+    fn annex_b_block_functions() {
+        // Sloppy Annex B: block-level declarations hoist to fn scope.
+        assert_eq!(disp("if(true){function ge(){return 42}}ge()"), "42");
+        assert_eq!(disp("var f;if(true){function ge(){return 1}}f=ge;f()"), "1");
+        assert_eq!(disp("function o(){if(true){function g(){return 2}}return g()}o()"), "2");
+        assert_eq!(disp("typeof neverdef !== 'undefined' ? 1 : 1"), "1");
+        // Single-statement positions declare on execution.
+        assert_eq!(disp("if(true)function h(){return 3}h()"), "3");
+    }
+
+    #[test]
+    fn var_hoisting() {
+        // `var` reads undefined before its statement (function scope).
+        assert_eq!(disp("var r=typeof v;var v=1;r"), "undefined");
+        // `var` leaks out of blocks and loops.
+        assert_eq!(disp("{var b=2}b"), "2");
+        assert_eq!(disp("for(var i=0;i<3;i++){}i"), "3");
+        assert_eq!(disp("function f(){if(true){var z=9}}f();typeof z"), "undefined");
+        // ...but stays inside functions.
+        assert_eq!(disp("function f(){var q=1}try{f()}catch(e){}typeof q"), "undefined");
+        // `let` keeps TDZ and block scope.
+        assert!(errmsg("x;let x=1").contains("not defined"));
+        assert!(errmsg("{let y=1}y").contains("not defined"));
+        // `var` never overwrites a hoisted function.
+        assert_eq!(disp("function f(){};var f;typeof f"), "function");
+    }
+
+    #[test]
+    fn error_subtypes() {        assert_eq!(disp("new TypeError('x').name"), "TypeError");
+        assert_eq!(disp("new TypeError('x').toString()"), "TypeError: x");
+        assert_eq!(disp("new RangeError('r') instanceof Error"), "true");
+        assert_eq!(disp("new TypeError('t') instanceof TypeError"), "true");
+        assert_eq!(disp("new SyntaxError('s').message"), "s");
+        assert_eq!(disp("new ReferenceError('r').name"), "ReferenceError");
+        assert_eq!(disp("typeof TypeError"), "function");
+    }
+
+    #[test]
+    fn throw_chain_context() {        // Uncaught thrown Errors carry the innermost call chain.
+        assert_eq!(
+            errmsg("function a(){throw new Error('x')}function b(){a()}b()"),
+            "Error: x (in b > a)"
+        );
+        // Caught throws leave no stale chain for later errors.
+        assert_eq!(
+            errmsg("function a(){throw new Error('x')}try{a()}catch(e){}throw new Error('y')"),
+            "Error: y"
+        );
+    }
+
+    #[test]
+    fn define_property_keeps_value() {
+        // Attribute-only descriptors don't touch the value (Babel emits
+        // `defineProperty(C, "prototype", {writable:false})` per class).
+        assert_eq!(
+            disp("function C(){this.v=1}Object.defineProperty(C,'prototype',{writable:false});var o=new C();o.v"),
+            "1"
+        );
+        assert_eq!(
+            disp("function C(){}Object.defineProperty(C,'prototype',{writable:false});new C() instanceof C"),
+            "true"
+        );
+        assert_eq!(disp("var o={k:3};Object.defineProperty(o,'k',{enumerable:true});o.k"), "3");
+        assert_eq!(disp("var o={};Object.defineProperty(o,'k',{enumerable:true});o.k"), "undefined");
+        assert_eq!(disp("var o={};Object.defineProperty(o,'k',{value:42});o.k"), "42");
+    }
+
+    #[test]
+    fn bound_construct() {
+        // `new` on a bound fn constructs the target (fresh `this`,
+        // bound args first), like V8.
+        assert_eq!(disp("function P(a,b){this.a=a;this.b=b}var o=new (P.bind(null,1))(2);o.a"), "1");
+        assert_eq!(disp("function P(a,b){this.a=a;this.b=b}var o=new (P.bind(null,1))(2);o.b"), "2");
+        assert_eq!(disp("function P(){ }var o=new (P.bind(null))();o instanceof P"), "true");
+        assert_eq!(
+            disp("function E(t){if(!(this instanceof E))throw new TypeError('nope');this.t=t}new (E.bind(null))(5).t"),
+            "5"
+        );
+        assert!(errmsg("new ((()=>{}).bind(null))()").contains("not a constructor"));
+    }
+
+    #[test]
+    fn url_ctor() {        assert_eq!(
+            disp("var u=new URL('/p?q=1#h','https://a.com/x');u.href"),
+            "https://a.com/p?q=1#h"
+        );
+        assert_eq!(disp("var u=new URL('/p','https://a.com/x');u.protocol"), "https:");
+        assert_eq!(disp("var u=new URL('/p','https://a.com/x');u.hostname"), "a.com");
+        assert_eq!(disp("var u=new URL('/p','https://a.com/x');u.pathname"), "/p");
+        assert_eq!(disp("var u=new URL('/p?q=1','https://a.com/x');u.search"), "?q=1");
+        assert_eq!(disp("var u=new URL('/p#h','https://a.com/x');u.hash"), "#h");
+        assert_eq!(disp("var u=new URL('/p','https://a.com/x');u.origin"), "https://a.com");
+        assert_eq!(disp("var u=new URL('https://b.com:8080/y');u.port"), "8080");
+        assert_eq!(disp("new URL('https://a.com/x') instanceof URL"), "true");
+        assert_eq!(disp("URL.createObjectURL(0).slice(0,5)"), "blob:");
+        assert_eq!(disp("URL.revokeObjectURL('blob:x')"), "undefined");
+        assert!(errmsg("new URL(':::')").contains("invalid URL"));
+    }
+
+    #[test]
     fn labels() {
         assert_eq!(disp("var t=0;a:{t=1;break a;t=2}t"), "1");
         assert_eq!(
@@ -7146,7 +7627,7 @@ mod tests {
         assert_eq!(
             out("Promise.resolve(1).then(function(){nope()})\
                 .catch(function(e){console.log('err:'+e)})"),
-            "err:nope is not defined\n"
+            "err:nope is not defined (in ?)\n"
         );
         // catch's return value recovers the chain
         assert_eq!(
@@ -7157,7 +7638,7 @@ mod tests {
         // executor throwing rejects the promise
         assert_eq!(
             out("new Promise(function(){nope()}).catch(function(e){console.log(e)})"),
-            "nope is not defined\n"
+            "nope is not defined (in Promise > ?)\n"
         );
         // Promise.reject with no handler -> drain error surfaces from run()
         assert!(errmsg("Promise.reject('boom')").contains("unhandled rejection"));

@@ -287,6 +287,7 @@ impl Interp {
             self.protos.map,
             self.protos.set,
             self.protos.weakmap,
+            self.protos.url,
         ] {
             if p != u32::MAX {
                 m.ow.push(p);

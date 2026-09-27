@@ -2125,7 +2125,7 @@ mod tests {
              f().catch(function(e){seen=e})",
         )
         .unwrap();
-        assert_eq!(ev(&mut it, "seen"), "nope is not defined");
+        assert_eq!(ev(&mut it, "seen"), "nope is not defined (in f)");
     }
 
     // ---- external <script src> --------------------------------------------

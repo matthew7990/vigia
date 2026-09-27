@@ -73,6 +73,15 @@ pub enum VarDecl {
     Pat(Pat, Expr),
 }
 
+/// `var` (function-scoped, hoisted as undefined) vs `let`/`const`
+/// (block-scoped; reads before declaration stay "not defined").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VarKind {
+    Var,
+    Let,
+    Const,
+}
+
 /// Destructuring pattern: identifier leaves (plus nested patterns),
 /// element/field defaults, holes (`[,,]`) and a trailing rest name.
 #[derive(Debug, Clone)]
@@ -164,8 +173,9 @@ pub struct FnDef {
 #[derive(Debug, Clone)]
 pub enum Stmt {
     Expr(Expr),
-    /// var/let/const are the same for now; Vec covers `var a=1, b=2`.
-    VarDecl(Vec<VarDecl>),
+    /// Vec covers `var a=1, b=2`. `var` binds function scope (hoisted);
+    /// `let`/`const` bind the current block env.
+    VarDecl(VarKind, Vec<VarDecl>),
     FnDecl(Rc<FnDef>),
     Return(Option<Expr>),
     If(Expr, Box<Stmt>, Option<Box<Stmt>>),
@@ -176,10 +186,12 @@ pub enum Stmt {
     For(Option<Box<Stmt>>, Option<Expr>, Option<Expr>, Box<Stmt>),
     /// Strict `for-of` over arrays and strings only:
     /// `for (var|let|const x of iter) body` (decl) or `for (x of iter) body`.
-    /// Targets take patterns: `for (var {k} of xs)`.
+    /// Targets take patterns: `for (var {k} of xs)`. `var` targets bind
+    /// in function scope (visible after the loop); `let`/`const` in the
+    /// loop env; bare targets assign.
     ForOf {
         pat: Pat,
-        is_decl: bool,
+        decl: Option<VarKind>,
         iter: Expr,
         body: Box<Stmt>,
     },
@@ -187,7 +199,7 @@ pub enum Stmt {
     /// indices). Anything else iterates zero times.
     ForIn {
         pat: Pat,
-        is_decl: bool,
+        decl: Option<VarKind>,
         obj: Expr,
         body: Box<Stmt>,
     },

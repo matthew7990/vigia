@@ -8,7 +8,7 @@
 use std::rc::Rc;
 
 use crate::ast::{
-    ClassMember, Expr, FnDef, MemberKind, ObjEntry, ObjField, OptOp, Pat, Stmt, VarDecl,
+    ClassMember, Expr, FnDef, MemberKind, ObjEntry, ObjField, OptOp, Pat, Stmt, VarDecl, VarKind,
 };
 use crate::eval::fmt_num;
 use crate::lex::{lex, Tok, Token};
@@ -239,10 +239,15 @@ impl P {
                 Ok(Stmt::Block(self.block_body()?))
             }
             Tok::Kw("var") | Tok::Kw("let") | Tok::Kw("const") => {
+                let kind = match self.peek() {
+                    Tok::Kw("var") => VarKind::Var,
+                    Tok::Kw("const") => VarKind::Const,
+                    _ => VarKind::Let,
+                };
                 self.i += 1;
                 let d = self.var_decls()?;
                 self.semi()?;
-                Ok(Stmt::VarDecl(d))
+                Ok(Stmt::VarDecl(kind, d))
             }
             Tok::Kw("function") => {
                 self.i += 1;
@@ -1225,11 +1230,13 @@ impl P {
 
     fn try_for_of(&mut self) -> R<Option<Stmt>> {
         let save = self.i;
-        let is_decl = matches!(
-            self.peek(),
-            Tok::Kw("var") | Tok::Kw("let") | Tok::Kw("const")
-        );
-        if is_decl {
+        let decl = match self.peek() {
+            Tok::Kw("var") => Some(VarKind::Var),
+            Tok::Kw("let") => Some(VarKind::Let),
+            Tok::Kw("const") => Some(VarKind::Const),
+            _ => None,
+        };
+        if decl.is_some() {
             self.i += 1;
         }
         // Loop targets take patterns too: `for (var {k} of xs)`.
@@ -1263,14 +1270,14 @@ impl P {
         Ok(Some(if is_of {
             Stmt::ForOf {
                 pat,
-                is_decl,
+                decl,
                 iter: target,
                 body: Box::new(b?),
             }
         } else {
             Stmt::ForIn {
                 pat,
-                is_decl,
+                decl,
                 obj: target,
                 body: Box::new(b?),
             }
@@ -1289,10 +1296,15 @@ impl P {
             self.peek(),
             Tok::Kw("var") | Tok::Kw("let") | Tok::Kw("const")
         ) {
+            let kind = match self.peek() {
+                Tok::Kw("var") => VarKind::Var,
+                Tok::Kw("const") => VarKind::Const,
+                _ => VarKind::Let,
+            };
             self.i += 1;
             let d = self.var_decls()?;
             self.exp_p(";")?;
-            Some(Box::new(Stmt::VarDecl(d)))
+            Some(Box::new(Stmt::VarDecl(kind, d)))
         } else {
             let e = self.expr()?;
             self.exp_p(";")?;
@@ -1990,7 +2002,7 @@ mod tests {
             s => panic!("{s:?}"),
         }
         match parse_program("var a=1,b=2").unwrap().remove(0) {
-            Stmt::VarDecl(d) => assert_eq!(d.len(), 2),
+            Stmt::VarDecl(_, d) => assert_eq!(d.len(), 2),
             s => panic!("{s:?}"),
         }
         assert!(matches!(

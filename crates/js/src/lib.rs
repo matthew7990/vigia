@@ -8,7 +8,9 @@
 //!
 //! v1 semantic choices (deliberate deviations from full JS):
 //! - `;` optional before `}`, EOF, or a newline-separated token (ASI-lite).
-//! - var/let/const all declare in the current (block) env; no var-hoisting.
+//! - `var` hoists to function scope (undefined until assigned);
+//!   `let`/`const` stay block-scoped; sloppy block-level `function`
+//!   declarations mirror into function scope (Annex B).
 //! - Function declarations hoist within their block.
 //! - `this` bound for `o.m()` and `o[i]()` calls, else undefined.
 //! - Assignment to an undeclared name creates a global (sloppy mode).
@@ -309,6 +311,7 @@ pub struct Protos {
     pub map: u32,
     pub set: u32,
     pub weakmap: u32,
+    pub url: u32,
 }
 
 impl Protos {
@@ -327,6 +330,7 @@ impl Protos {
             map: u32::MAX,
             set: u32::MAX,
             weakmap: u32::MAX,
+            url: u32::MAX,
         }
     }
 }
@@ -509,10 +513,24 @@ pub struct Interp {
     pub(crate) cur_native: Value,
     /// true while an `async function` body is on the stack (gate for await).
     pub(crate) fn_async: bool,
+    /// Scope env of the innermost in-flight function (its call env).
+    /// Annex-B hoisting mirrors block-level `function` declarations here.
+    /// Always an ancestor-or-self of open envs, so GC-safe without rooting.
+    pub(crate) func_env: u32,
     /// Parent ctors of in-flight derived-class methods (innermost last):
     /// `super()` / `super.m` resolve against the top. Pushed by
     /// call_value for Funcs carrying `__super`, popped on return.
     pub(crate) super_stack: Vec<Value>,
+    /// In-flight call chain (func obj ids, innermost last) for error
+    /// context ("x is not defined (in S > ?)"). Pushed next to the
+    /// super_stack push so `?`s cannot leak it.
+    pub(crate) js_stack: Vec<u32>,
+    /// Chain snapshot at the innermost unwinding frame of the current
+    /// in-flight throw (None when no throw is unwinding). Cleared on
+    /// catch and at run() entry; bound_err appends it to the report.
+    pub(crate) throw_chain: Option<String>,
+    /// Blob URL counter for createObjectURL (opaque handles only).
+    pub(crate) blob_next: u32,
     /// Label of the directly-enclosing `name:` when it wraps the loop
     /// about to run (taken by it at start). Lets `continue name` resume
     /// the right loop instead of an inner one restarting itself.
@@ -577,7 +595,11 @@ impl Interp {
             handled_promises: HashSet::new(),
             cur_native: Value::Undef,
             fn_async: false,
+            func_env: 0,
             super_stack: Vec::new(),
+            js_stack: Vec::new(),
+            throw_chain: None,
+            blob_next: 0,
             label_direct: None,
             free_envs: Vec::new(),
             symbol_registry: HashMap::new(),
@@ -606,6 +628,10 @@ impl Interp {
     pub fn run(&mut self, src: &str) -> Result<Value, JsError> {
         self.install_builtins();
         let stmts = parse::parse_program(src)?;
+        // Top-level `var`s hoist to the global scope (func_env is 0).
+        self.func_env = 0;
+        self.throw_chain = None;
+        self.hoist_vars(&stmts, 0)?;
         let r = self.exec_block(&stmts, 0);
         let mut errs = Vec::new();
         self.drain(&mut errs);

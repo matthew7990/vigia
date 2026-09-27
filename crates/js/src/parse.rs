@@ -344,15 +344,7 @@ impl P {
     /// return value in a promise at call time).
     fn fn_tail(&mut self, name: Option<String>, is_async: bool) -> R<Rc<FnDef>> {
         self.exp_p("(")?;
-        let mut params = Vec::new();
-        if !self.at_p(")") {
-            loop {
-                params.push(self.ident()?);
-                if !self.eat_p(",") {
-                    break;
-                }
-            }
-        }
+        let (params, rest) = self.param_list()?;
         self.exp_p(")")?;
         self.exp_p("{")?;
         self.in_fn += 1;
@@ -364,7 +356,33 @@ impl P {
             body: body?,
             is_async,
             is_arrow: false,
+            rest,
         }))
+    }
+
+    /// `(a, b, ...r)`: plain idents plus one trailing rest param.
+    fn param_list(&mut self) -> R<(Vec<String>, Option<String>)> {
+        let mut params = Vec::new();
+        let mut rest = None;
+        if !self.at_p(")") {
+            loop {
+                if self.eat_p("...") {
+                    rest = Some(self.ident()?);
+                    break;
+                }
+                params.push(self.ident()?);
+                if !self.eat_p(",") {
+                    break;
+                }
+                if self.at_p(")") {
+                    break;
+                }
+            }
+        }
+        if rest.is_some() && !self.at_p(")") {
+            return Err(err("rest param must be last"));
+        }
+        Ok((params, rest))
     }
 
     /// `x => e`, `(a,b) => e`, `(a) => { stmts }`, plus `async` variants.
@@ -390,43 +408,30 @@ impl P {
         } else {
             false
         };
-        let params = if matches!(self.peek(), Tok::Ident(_)) {
+        let (params, rest) = if matches!(self.peek(), Tok::Ident(_)) {
             let n = self.ident()?;
             // `x =>` only: `x + 1` must fall back to normal assign.
             if !self.at_p("=>") {
                 self.i = save;
                 return Ok(None);
             }
-            vec![n]
+            (vec![n], None)
         } else if self.at_p("(") {
             self.i += 1;
-            let mut ps = Vec::new();
-            if !self.at_p(")") {
-                loop {
-                    // Empty `()` is valid; anything non-ident aborts.
-                    match self.peek().clone() {
-                        Tok::Ident(s) => {
-                            self.i += 1;
-                            ps.push(s);
-                        }
-                        _ => {
-                            self.i = save;
-                            return Ok(None);
-                        }
-                    }
-                    if !self.eat_p(",") {
-                        break;
-                    }
-                    if self.at_p(")") {
-                        break;
-                    }
+            let (ps, rest) = match self.param_list() {
+                // Not a param list (or a bad rest): not an arrow; let the
+                // normal expression parse report it.
+                Err(_) => {
+                    self.i = save;
+                    return Ok(None);
                 }
-            }
+                Ok(v) => v,
+            };
             if !self.eat_p(")") || !self.at_p("=>") {
                 self.i = save;
                 return Ok(None);
             }
-            ps
+            (ps, rest)
         } else {
             self.i = save;
             return Ok(None);
@@ -450,6 +455,7 @@ impl P {
                 body: vec![Stmt::Return(Some(e))],
                 is_async,
                 is_arrow: true,
+                rest,
             }))));
         };
         Ok(Some(Expr::Func(Rc::new(FnDef {
@@ -458,6 +464,7 @@ impl P {
             body,
             is_async,
             is_arrow: true,
+            rest,
         }))))
     }
 

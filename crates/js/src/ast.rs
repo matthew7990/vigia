@@ -64,6 +64,8 @@ pub struct FnDef {
     /// Arrow: lexical `this`, no `new`, no own `prototype` (prototype kept
     /// as harmless stub for now).
     pub is_arrow: bool,
+    /// Trailing `...args`: collects surplus call args into an array.
+    pub rest: Option<String>,
 }
 
 #[derive(Debug)]

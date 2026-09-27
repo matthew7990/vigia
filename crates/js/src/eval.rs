@@ -1575,6 +1575,11 @@ impl Interp {
                 for (i, p) in def.params.iter().enumerate() {
                     self.env_declare(cenv, p, args.get(i).copied().unwrap_or(Value::Undef));
                 }
+                if let Some(r) = &def.rest {
+                    let extra = args.get(def.params.len()..).unwrap_or(&[]).to_vec();
+                    let arr = self.arr_obj(extra)?;
+                    self.env_declare(cenv, r, Value::Obj(arr));
+                }
                 if let Some(n) = &def.name {
                     // named fn exprs can self-recurse via their own name
                     self.env_declare(cenv, n, f);
@@ -4219,8 +4224,15 @@ mod tests {
         assert_eq!(disp("({x: 1, ...null}).x"), "1");
         assert_eq!(disp("({...'hi'})[1]"), "i");
         assert!(errmsg("var x = [...5]").contains("non-array"));
-        // Rest params are the next unit: still a parse error today.
-        assert!(errmsg("var f = (...a) => a").contains("unexpected"));
+    }
+
+    #[test]
+    fn rest_params() {
+        assert_eq!(disp("function f(a,...r){return r.length}f(1,2,3)"), "2");
+        assert_eq!(disp("function f(a,...r){return a}f(1,2,3)"), "1");
+        assert_eq!(disp("var g=(...a)=>a.length;g(1,2,3,4)"), "4");
+        assert_eq!(disp("function h(...r){return r}h()"), "[]");
+        assert!(errmsg("function f(...a,b){}").contains("rest param must be last"));
     }
 
     #[test]

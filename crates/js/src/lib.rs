@@ -32,7 +32,7 @@
 //!   void, method/get/set shorthand in literals, Symbol, Map/Set/WeakMap,
 //!   Object.freeze/defineProperty.
 //! - No classes, logical assignment, **, delete, computed keys, labels,
-//!   generators, BigInt, dynamic import, __proto__ accessor.
+//!   generators, dynamic import, __proto__ accessor.
 //! - Events: addEventListener + inline `on*` attrs, bubble phase only
 //!   (no capture). Dispatch is synchronous.
 //! - Async (synchronous engine, real semantics where the model allows):
@@ -236,6 +236,25 @@ pub enum Obj {
         desc: Option<u32>,
         proto: Option<u32>,
     },
+    /// BigInt primitive (boxed): sign + little-endian base-2^32 magnitude.
+    /// u32 limbs (not u64) so limb products fit u64 without overflow, and
+    /// half the limbs of a byte array. Canonical: no leading zero limbs,
+    /// zero is `neg: false` + empty mag, so value equality is field
+    /// equality. Identity is NOT the obj id: strict_eq compares values.
+    BigInt {
+        neg: bool,
+        mag: Vec<u32>,
+        proto: Option<u32>,
+    },
+    /// BigInt64Array / BigUint64Array store (`signed` selects): raw u64
+    /// bits per element (f64 storage would lose precision past 2^53).
+    /// Reads box into BigInt; writes wrap mod 2^64. Copies like Typed.
+    Big64 {
+        signed: bool,
+        elems: Vec<u64>,
+        pairs: Vec<(String, Value)>,
+        proto: Option<u32>,
+    },
     /// Map entries in insertion order (SameValueZero keys).
     Map {
         entries: Vec<(Value, Value)>,
@@ -370,6 +389,9 @@ pub struct Protos {
     pub error: u32,
     pub regexp: u32,
     pub symbol: u32,
+    pub bigint: u32,
+    pub bigint64array: u32,
+    pub biguint64array: u32,
     pub map: u32,
     pub set: u32,
     pub weakmap: u32,
@@ -425,6 +447,9 @@ impl Protos {
             error: u32::MAX,
             regexp: u32::MAX,
             symbol: u32::MAX,
+            bigint: u32::MAX,
+            bigint64array: u32::MAX,
+            biguint64array: u32::MAX,
             map: u32::MAX,
             set: u32::MAX,
             weakmap: u32::MAX,

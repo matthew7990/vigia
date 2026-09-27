@@ -158,6 +158,19 @@ impl Marker {
                             self.ow.push(*p);
                         }
                     }
+                    Obj::BigInt { proto, .. } => {
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
+                    Obj::Big64 { pairs, proto, .. } => {
+                        for (_, v) in pairs {
+                            self.val(*v);
+                        }
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
                     Obj::Map { entries, proto } | Obj::WeakMap { entries, proto } => {
                         for (k, v) in entries {
                             self.val(*k);
@@ -329,6 +342,9 @@ impl Interp {
             self.protos.error,
             self.protos.regexp,
             self.protos.symbol,
+            self.protos.bigint,
+            self.protos.bigint64array,
+            self.protos.biguint64array,
             self.protos.map,
             self.protos.set,
             self.protos.weakmap,
@@ -502,8 +518,13 @@ mod tests {
 
     #[test]
     fn cap_far_exceeded_when_garbage() {
-        // ~3000 allocations against cap 500: completes only via GC reuse.
-        let mut it = Interp::with_cap(500);
+        // ~1500 allocations against a cap just above install: completes
+        // only via GC reuse (self-calibrated like its siblings; the old
+        // absolute cap 500 fell below the install footprint as builtins
+        // were added).
+        let mut it = Interp::with_cap(1_000_000);
+        it.run("0").unwrap();
+        it.heap.cap = it.heap.live() + 100;
         let v = it.run("var t,i;for(i=0;i<1500;i++){t={n:i}}i").unwrap();
         assert_eq!(v, Value::Num(1500.0));
         assert!(it.gc_runs > 0);
@@ -568,8 +589,33 @@ mod tests {
     }
 
     #[test]
+    fn bigint_and_views_survive_gc() {
+        // The new mark arms (BigInt proto, Big64 pairs/proto) keep live
+        // bigints reachable across a collection mid-churn. (The array is
+        // signed, so the probe value stays inside i64 to avoid wrap.)
+        let mut it = Interp::with_cap(1_000_000);
+        it.run("0").unwrap();
+        it.heap.cap = it.heap.live() + 400;
+        it.run(
+            "var b=BigInt('1234567890123456789');\
+             var a=new BigInt64Array([b]);\
+             for(var i=0;i<300;i++){var t={n:i}}",
+        )
+        .unwrap();
+        assert!(it.gc_runs > 0, "gc never ran");
+        assert_eq!(disp(&mut it, "String(b)"), "1234567890123456789");
+        assert_eq!(disp(&mut it, "String(a[0])"), "1234567890123456789");
+    }
+
+    #[test]
     fn freelist_reuses_slots() {
-        let mut it = Interp::with_cap(1000);
+        // Headroom past the 200-iteration churn so no mid-loop collection
+        // steals the garbage (self-calibrated: the old absolute cap 1000
+        // started collecting mid-loop once install + churn passed its 70%;
+        // the threshold is 70% of the total cap, hence +600, not +200).
+        let mut it = Interp::with_cap(1_000_000);
+        it.run("0").unwrap();
+        it.heap.cap = it.heap.live() + 600;
         it.run("for(var i=0;i<200;i++){var t={x:i}}").unwrap();
         let len = it.heap.objs.len();
         let st = it.gc();

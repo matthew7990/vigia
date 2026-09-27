@@ -40,7 +40,11 @@ pub(crate) fn truthy(h: &Heap, v: Value) -> bool {
         Value::Bool(b) => b,
         Value::Num(n) => n != 0.0 && !n.is_nan(),
         Value::Str(id) => !h.get_str(id).is_empty(),
-        Value::Obj(_) => true,
+        // 0n is falsy like 0 (boxed BigInts need the value check).
+        Value::Obj(id) => match h.obj(id) {
+            Obj::BigInt { mag, .. } => mag.iter().any(|&w| w != 0),
+            _ => true,
+        },
     }
 }
 
@@ -62,7 +66,12 @@ pub(crate) fn to_num(h: &Heap, v: Value) -> f64 {
             }
             s.parse().unwrap_or(f64::NAN)
         }
-        Value::Obj(_) => f64::NAN,
+        // BigInt -> Number is allowed explicitly (Number(x)); precision past
+        // 2^53 is inherently lost, like V8.
+        Value::Obj(id) => match h.obj(id) {
+            Obj::BigInt { neg, mag, .. } => bi_to_f64(*neg, mag),
+            _ => f64::NAN,
+        },
     }
 }
 
@@ -128,6 +137,19 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
                 .map(|e| to_str(h, Value::Num(*e)))
                 .collect::<Vec<_>>()
                 .join(","),
+            // 64-bit views join raw decimal elements (no boxing: to_str
+            // lacks &mut; matches Array join semantics via ToString).
+            Obj::Big64 { signed, elems, .. } => elems
+                .iter()
+                .map(|e| {
+                    if *signed {
+                        (*e as i64).to_string()
+                    } else {
+                        e.to_string()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(","),
             Obj::DView { .. } => "[object DataView]".into(),
             Obj::Buf { .. } => "[object ArrayBuffer]".into(),
             Obj::Proxy { target, .. } => to_str(h, Value::Obj(*target)),
@@ -138,6 +160,9 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
             Obj::Dom { .. } => "[object Node]".into(),
             Obj::Promise { .. } => "[object Promise]".into(),
             Obj::Accessor { .. } => "[object Accessor]".into(),
+            // Explicit String(x) on a BigInt renders decimal (only implicit
+            // `+`/template paths throw - enforced at those sites, not here).
+            Obj::BigInt { neg, mag, .. } => bi_fmt(*neg, mag, 10),
             // No Dom access here: String(style) gives the tag, use cssText.
             Obj::Style { .. } => "[object CSSStyleDeclaration]".into(),
             Obj::RegExp { pat, flags, .. } => {
@@ -178,7 +203,18 @@ fn strict_eq(h: &Heap, l: Value, r: Value) -> bool {
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Num(a), Value::Num(b)) => a == b,
         (Value::Str(a), Value::Str(b)) => h.get_str(a) == h.get_str(b),
-        (Value::Obj(a), Value::Obj(b)) => a == b,
+        // Boxed BigInts compare by value (canonical form makes field
+        // equality exact); every other object by identity.
+        (Value::Obj(a), Value::Obj(b)) => {
+            a == b
+                || matches!(
+                    (h.obj(a), h.obj(b)),
+                    (
+                        Obj::BigInt { neg: an, mag: am, .. },
+                        Obj::BigInt { neg: bn, mag: bm, .. }
+                    ) if an == bn && am == bm
+                )
+        }
         _ => false,
     }
 }
@@ -186,6 +222,11 @@ fn strict_eq(h: &Heap, l: Value, r: Value) -> bool {
 fn loose_eq(h: &Heap, l: Value, r: Value) -> bool {
     if strict_eq(h, l, r) {
         return true;
+    }
+    // BigInt-involved loose equality compares mathematical values (spec);
+    // handled in one place so the Num/Str/Bool arms below never see one.
+    if is_big(h, l) || is_big(h, r) {
+        return loose_big(h, l, r);
     }
     match (l, r) {
         (Value::Null, Value::Undef) | (Value::Undef, Value::Null) => true,
@@ -207,6 +248,7 @@ pub(crate) fn type_str(h: &Heap, v: Value) -> &'static str {
         Value::Obj(id) => match h.obj(id) {
             Obj::Func { .. } | Obj::Native { .. } => "function",
             Obj::Symbol { .. } => "symbol",
+            Obj::BigInt { .. } => "bigint",
             _ => "object",
         },
     }
@@ -307,6 +349,22 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
             "byteOffset" => Some(Value::Num(*off as f64)),
             _ => None,
         },
+        // BigInts expose no own props. Big64 indices are NOT served here
+        // (boxing needs &mut, which own_prop lacks): indexed reads go
+        // through get_index, `in`/hasOwnProperty via the has_prop/n_has_own
+        // fast paths below; length/byteLength/expandos live here.
+        Obj::BigInt { .. } => None,
+        Obj::Big64 {
+            elems, pairs, ..
+        } => {
+            if key == "length" {
+                return Some(Value::Num(elems.len() as f64));
+            }
+            if key == "byteLength" {
+                return Some(Value::Num((elems.len() * 8) as f64));
+            }
+            pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+        }
         Obj::RegExp {
             pat,
             flags,
@@ -348,6 +406,8 @@ pub(crate) fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
         | Obj::Bytes { proto, .. }
         | Obj::Buf { proto, .. }
         | Obj::Typed { proto, .. }
+        | Obj::BigInt { proto, .. }
+        | Obj::Big64 { proto, .. }
         | Obj::DView { proto, .. } => *proto,
         Obj::Native { .. } => po(protos.function_),
         Obj::Promise { .. } => po(protos.promise),
@@ -382,6 +442,15 @@ pub(crate) fn walk_props(h: &Heap, protos: &Protos, start: Option<u32>, key: &st
 
 /// `key in v` over the proto chain (rhs must already be an object).
 fn has_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> bool {
+    // Big64 canonical indices read true (own_prop can't serve them: boxing
+    // an element needs &mut, which it lacks).
+    if let Value::Obj(id) = v {
+        if let Obj::Big64 { elems, .. } = h.obj(id) {
+            if key.parse::<usize>().is_ok_and(|i| i < elems.len()) {
+                return true;
+            }
+        }
+    }
     let mut cur = match v {
         Value::Obj(id) => Some(id),
         _ => return false,
@@ -751,6 +820,10 @@ pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<
                 let kind = *kind;
                 return typed_set(h, rid, kind, key, val);
             }
+            // Big64 named/element stores (wrap mod 2^64, like typed_set).
+            if matches!(h.obj(rid), Obj::Big64 { .. }) {
+                return b64_set(h, rid, key, val);
+            }
             match h.obj_mut(rid) {
             Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
                 match pairs.iter_mut().find(|(k, _)| k == key) {
@@ -819,6 +892,25 @@ fn get_index(h: &mut Heap, protos: &Protos, v: Value, k: Value) -> Result<Value,
     match v {
         Value::Obj(id) => {
             let n = to_num(h, k);
+            // Big64 read first (immutable borrow ends), box after: indexed
+            // reads yield fresh BigInts (value equality keeps
+            // `a[0] === a[0]` true across boxes).
+            if let Obj::Big64 { signed, elems, .. } = h.obj(id) {
+                let signed = *signed;
+                if n >= 0.0 && n.fract() == 0.0 {
+                    match elems.get(n as usize).copied() {
+                        Some(bits) => {
+                            let (neg, mag) = if signed {
+                                bi_from_i64(bits as i64)
+                            } else {
+                                bi_from_u64(bits)
+                            };
+                            return Ok(bi_alloc_hp(h, protos, neg, mag)?);
+                        }
+                        None => return Ok(Value::Undef),
+                    }
+                }
+            }
             match h.obj(id) {
                 Obj::Arr { items, .. } if n >= 0.0 && n.fract() == 0.0 => {
                     Ok(items.get(n as usize).copied().unwrap_or(Value::Undef))
@@ -888,6 +980,22 @@ fn set_index(h: &mut Heap, v: Value, k: Value, val: Value) -> Result<(), JsError
                     if let Obj::Typed { elems, .. } = h.obj_mut(id) {
                         if let Some(slot) = elems.get_mut(n as usize) {
                             *slot = ne;
+                        }
+                    }
+                    return Ok(());
+                }
+                let key = to_str(h, k);
+                return set_prop(h, v, &key, val);
+            }
+            // Big64 stores wrap mod 2^64 (sloppy coerce like the Typed
+            // neighbors; out-of-range canonical indices drop).
+            if matches!(h.obj(id), Obj::Big64 { .. }) {
+                let n = to_num(h, k);
+                if n >= 0.0 && n.fract() == 0.0 {
+                    let w = b64_wrap(h, val);
+                    if let Obj::Big64 { elems, .. } = h.obj_mut(id) {
+                        if let Some(slot) = elems.get_mut(n as usize) {
+                            *slot = w;
                         }
                     }
                     return Ok(());
@@ -1418,6 +1526,8 @@ impl Interp {
             ("getInt32", n_dv_get_i32),
             ("getFloat32", n_dv_get_f32),
             ("getFloat64", n_dv_get_f64),
+            ("getBigInt64", n_dv_get_bi64),
+            ("getBigUint64", n_dv_get_bu64),
             ("setUint8", n_dv_set_u8),
             ("setUint16", n_dv_set_u16),
             ("setUint32", n_dv_set_u32),
@@ -1426,7 +1536,17 @@ impl Interp {
             ("setInt32", n_dv_set_i32),
             ("setFloat32", n_dv_set_f32),
             ("setFloat64", n_dv_set_f64),
+            ("setBigInt64", n_dv_set_bi64),
+            ("setBigUint64", n_dv_set_bu64),
         ]);
+        self.protos.bigint = self.proto_bag(&[
+            ("toString", n_big_to_string),
+            ("valueOf", n_big_value_of),
+        ]);
+        // One method set shared by both 64-bit views (signedness rides the
+        // instance); only fill is implemented, the rest are gaps (see b64).
+        self.protos.bigint64array = self.proto_bag(&[("fill", n_b64_fill)]);
+        self.protos.biguint64array = self.proto_bag(&[("fill", n_b64_fill)]);
         self.protos.textencoder = self.proto_bag(&[("encode", n_te_encode)]);
         self.protos.textdecoder = self.proto_bag(&[("decode", n_td_decode)]);
         self.protos.resizeobserver = self.proto_bag(&[
@@ -1856,6 +1976,14 @@ impl Interp {
             pr.float64array,
             &[("of", n_f64_of), ("from", n_f64_from)],
         );
+        self.ctor(
+            "BigInt",
+            n_bigint_cast,
+            pr.bigint,
+            &[("asUintN", n_big_as_uint_n), ("asIntN", n_big_as_int_n)],
+        );
+        self.ctor("BigInt64Array", n_bi64_ctor, pr.bigint64array, &[]);
+        self.ctor("BigUint64Array", n_bu64_ctor, pr.biguint64array, &[]);
         self.ctor("DataView", n_dv_ctor, pr.dataview, &[]);
         self.ctor("TextEncoder", n_te_ctor, pr.textencoder, &[]);
         self.ctor("TextDecoder", n_td_ctor, pr.textdecoder, &[]);
@@ -1891,6 +2019,8 @@ impl Interp {
             ("Int32Array", 4.0),
             ("Float32Array", 4.0),
             ("Float64Array", 8.0),
+            ("BigInt64Array", 8.0),
+            ("BigUint64Array", 8.0),
         ] {
             if let Some(c) = self.env_get(0, name) {
                 let _ = set_prop(&mut self.heap, c, "BYTES_PER_ELEMENT", Value::Num(bpe));
@@ -2819,6 +2949,19 @@ impl Interp {
                     Ok(bytes.iter().map(|b| Value::Num(*b as f64)).collect())
                 }
                 Obj::Typed { elems, .. } => Ok(elems.iter().map(|e| Value::Num(*e)).collect()),
+                Obj::Big64 { signed, elems, .. } => {
+                    let signed = *signed;
+                    let mut out = Vec::with_capacity(elems.len());
+                    for bits in elems.clone() {
+                        let (neg, mag) = if signed {
+                            bi_from_i64(bits as i64)
+                        } else {
+                            bi_from_u64(bits)
+                        };
+                        out.push(bi_alloc(self, neg, mag)?);
+                    }
+                    Ok(out)
+                }
                 Obj::Set { items, .. } => Ok(items.clone()),
                 Obj::Map { entries, .. } => {
                     let mut out = Vec::with_capacity(entries.len());
@@ -2870,6 +3013,10 @@ impl Interp {
                     keys.extend((0..elems.len()).map(|i| i.to_string()));
                     keys.extend(pairs.iter().map(|(k, _)| k.clone()));
                 }
+                Obj::Big64 { elems, pairs, .. } => {
+                    keys.extend((0..elems.len()).map(|i| i.to_string()));
+                    keys.extend(pairs.iter().map(|(k, _)| k.clone()));
+                }
                 Obj::Promise { pairs, .. } => {
                     keys.extend(pairs.iter().map(|(k, _)| k.clone()));
                 }
@@ -2878,6 +3025,7 @@ impl Interp {
                 | Obj::Style { .. }
                 | Obj::Accessor { .. }
                 | Obj::Symbol { .. }
+                | Obj::BigInt { .. }
                 | Obj::Map { .. }
                 | Obj::Set { .. }
                 | Obj::WeakMap { .. }
@@ -3041,6 +3189,10 @@ impl Interp {
                 for (cooked, e) in parts {
                     s.push_str(cooked);
                     let v = self.expr(env, e)?;
+                    // No implicit BigInt -> string (spec): templates throw.
+                    if is_big(&self.heap, v) {
+                        return Err(err("Cannot convert a BigInt value to a string"));
+                    }
                     s.push_str(&to_str(&self.heap, v));
                 }
                 s.push_str(tail);
@@ -3238,6 +3390,27 @@ impl Interp {
             }
             _ => {
                 let v = self.expr(env, e)?;
+                // BigInt unary (spec): `-` negates, `~` is -x-1 exactly,
+                // `+` throws (no implicit BigInt -> Number). Anything else
+                // (`!`, …) uses the generic path below (truthy).
+                if let Some((neg, mag)) = bi_val(&self.heap, v) {
+                    match op {
+                        "-" => return bi_alloc(self, !neg && !bi_is_zero(&mag), mag),
+                        "+" => return Err(err("Cannot convert a BigInt value to a number")),
+                        "~" => {
+                            return if neg {
+                                let mut m = mag;
+                                bi_dec(&mut m);
+                                bi_alloc(self, false, m)
+                            } else {
+                                let mut m = mag;
+                                bi_inc(&mut m);
+                                bi_alloc(self, true, m)
+                            };
+                        }
+                        _ => {}
+                    }
+                }
                 Ok(match op {
                     "-" => Value::Num(-to_num(&self.heap, v)),
                     "+" => Value::Num(to_num(&self.heap, v)),
@@ -3366,6 +3539,21 @@ impl Interp {
                     }
                     Ok(Value::Bool(true))
                 }
+                // Big64 indices are non-configurable (false) like the other
+                // views; expandos delete like ordinary props.
+                Obj::Big64 { elems, .. } => {
+                    let locked = key
+                        .parse::<usize>()
+                        .map(|i| i < elems.len())
+                        .unwrap_or(false);
+                    if locked {
+                        return Ok(Value::Bool(false));
+                    }
+                    if let Obj::Big64 { pairs, .. } = self.heap.obj_mut(id) {
+                        pairs.retain(|(k, _)| k != key);
+                    }
+                    Ok(Value::Bool(true))
+                }
                 _ => Ok(Value::Bool(true)),
             },
             Value::Str(_) | Value::Num(_) | Value::Bool(_) => Ok(Value::Bool(true)),
@@ -3383,6 +3571,14 @@ impl Interp {
     /// ++/-- on a resolved reference; `old` picks postfix semantics.
     fn bump(&mut self, env: u32, e: &Expr, delta: f64, old: bool) -> Result<Value, JsError> {
         let cur = self.get_ref(env, e)?;
+        // ++/-- on a BigInt stays a BigInt (spec); the array store below
+        // wraps it like any other BigInt write.
+        if let Some((neg, mag)) = bi_val(&self.heap, cur) {
+            let (nneg, nmag) = bi_step(neg, mag, delta > 0.0);
+            let next = bi_alloc(self, nneg, nmag)?;
+            self.set_ref(env, e, next)?;
+            return Ok(if old { cur } else { next });
+        }
         let prev = to_num(&self.heap, cur);
         let next = prev + delta;
         self.set_ref(env, e, Value::Num(next))?;
@@ -3436,6 +3632,20 @@ impl Interp {
     }
 
     fn apply_bin(&mut self, op: &str, l: Value, r: Value) -> Result<Value, JsError> {
+        // BigInt-involved operators dispatch separately (spec): mixed
+        // arithmetic/bitwise/shifts throw, `==`/relational compare
+        // numerically, `+` never coerces strings.
+        if is_big(&self.heap, l) || is_big(&self.heap, r) {
+            if op == "in" && is_big(&self.heap, r) {
+                return Err(err("cannot use 'in' on a BigInt"));
+            }
+            if op == "instanceof" {
+                return Ok(Value::Bool(false));
+            }
+            if op != "in" {
+                return bin_big(self, op, l, r);
+            }
+        }
         let h = &mut self.heap;
         Ok(match op {
             // JS +: string concat when either side is string/object
@@ -3789,6 +3999,19 @@ impl Interp {
                     Ok(bytes.iter().map(|b| Value::Num(*b as f64)).collect())
                 }
                 Obj::Typed { elems, .. } => Ok(elems.iter().map(|e| Value::Num(*e)).collect()),
+                Obj::Big64 { signed, elems, .. } => {
+                    let signed = *signed;
+                    let mut out = Vec::with_capacity(elems.len());
+                    for bits in elems.clone() {
+                        let (neg, mag) = if signed {
+                            bi_from_i64(bits as i64)
+                        } else {
+                            bi_from_u64(bits)
+                        };
+                        out.push(bi_alloc(self, neg, mag)?);
+                    }
+                    Ok(out)
+                }
                 Obj::Set { items, .. } => Ok(items.clone()),
                 Obj::Map { entries, .. } => {
                     let mut out = Vec::with_capacity(entries.len());
@@ -3912,11 +4135,31 @@ impl Interp {
                     out.extend(pairs.clone());
                     Ok(out)
                 }
+                Obj::Big64 {
+                    signed,
+                    elems,
+                    pairs,
+                    ..
+                } => {
+                    let (signed, elems, pairs) = (*signed, elems.clone(), pairs.clone());
+                    let mut out = Vec::with_capacity(elems.len() + pairs.len());
+                    for (i, bits) in elems.iter().enumerate() {
+                        let (neg, mag) = if signed {
+                            bi_from_i64(*bits as i64)
+                        } else {
+                            bi_from_u64(*bits)
+                        };
+                        out.push((i.to_string(), bi_alloc(self, neg, mag)?));
+                    }
+                    out.extend(pairs);
+                    Ok(out)
+                }
                 Obj::Ordinary { pairs, .. }
                 | Obj::Func { pairs, .. }
                 | Obj::Native { pairs, .. } => Ok(pairs.clone()),
                 Obj::Promise { pairs, .. } => Ok(pairs.clone()),
-                Obj::RegExp { .. }
+                Obj::BigInt { .. }
+                | Obj::RegExp { .. }
                 | Obj::Dom { .. }
                 | Obj::Style { .. }
                 | Obj::Accessor { .. }
@@ -4542,9 +4785,28 @@ impl Interp {
     /// REPL-style display: objects as JSON, scalars via ToString.
     pub fn inspect(&self, v: Value) -> String {
         match v {
-            Value::Obj(_) => val_to_json(&self.heap, v, 0)
-                .map(|j| j.to_string())
-                .unwrap_or_else(|_| "[object Object]".into()),
+            // BigInts render with the `n` suffix (V8 console shape); 64-bit
+            // views render element-wise since JSON cannot hold them.
+            Value::Obj(id) => match self.heap.obj(id) {
+                Obj::BigInt { neg, mag, .. } => format!("{}n", bi_fmt(*neg, mag, 10)),
+                Obj::Big64 { signed, elems, .. } => {
+                    let parts: Vec<String> = elems
+                        .iter()
+                        .map(|b| {
+                            let (n, m) = if *signed {
+                                bi_from_i64(*b as i64)
+                            } else {
+                                bi_from_u64(*b)
+                            };
+                            format!("{}n", bi_fmt(n, &m, 10))
+                        })
+                        .collect();
+                    format!("[{}]", parts.join(", "))
+                }
+                _ => val_to_json(&self.heap, v, 0)
+                    .map(|j| j.to_string())
+                    .unwrap_or_else(|_| "[object Object]".into()),
+            },
             _ => to_str(&self.heap, v),
         }
     }
@@ -4886,6 +5148,10 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
         }
         Value::Str(id) => Json::Str(h.get_str(id).to_string()),
         Value::Obj(id) => match h.obj(id) {
+            // JSON cannot represent BigInts, boxed or in 64-bit views.
+            Obj::BigInt { .. } | Obj::Big64 { .. } => {
+                return Err(err("Do not know how to serialize a BigInt"));
+            }
             Obj::Proxy { target, .. } => return val_to_json(h, Value::Obj(*target), depth),
             Obj::Ordinary { pairs, .. } => Json::Obj(
                 pairs
@@ -4971,7 +5237,14 @@ fn cb_args(item: Value, idx: usize, arr: Value) -> [Value; 3] {
 fn n_has_own(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
     let key = to_str(&it.heap, arg(args, 0));
     let hit = match this {
-        Value::Obj(id) => own_prop(&it.heap, id, &key).is_some(),
+        // Big64 canonical indices read true (own_prop can't serve them:
+        // boxing an element needs &mut, which it lacks).
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Big64 { elems, .. } if key.parse::<usize>().is_ok_and(|i| i < elems.len()) => {
+                true
+            }
+            _ => own_prop(&it.heap, id, &key).is_some(),
+        },
         _ => false,
     };
     Ok(Value::Bool(hit))
@@ -5028,6 +5301,14 @@ fn n_obj_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
             Obj::WeakMap { .. } => "[object WeakMap]",
             Obj::Bytes { .. } => "[object Uint8Array]",
             Obj::Typed { kind, .. } => t_tag(*kind),
+            Obj::BigInt { .. } => "[object BigInt]",
+            Obj::Big64 { signed, .. } => {
+                if *signed {
+                    "[object BigInt64Array]"
+                } else {
+                    "[object BigUint64Array]"
+                }
+            }
             Obj::DView { .. } => "[object DataView]",
             Obj::Buf { .. } => "[object ArrayBuffer]",
             Obj::Proxy { .. } => "[object Object]",
@@ -5051,7 +5332,38 @@ fn n_object(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsErr
 
 /// Own enumerable (key, value) pairs; arrays enumerate as index strings.
 /// Proxies enumerate the target (ownKeys trap is a documented gap).
-fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
+/// Big64 indices box into fresh BigInts (the only arm needing &mut).
+fn own_pairs(it: &mut Interp, v: Value) -> Vec<(String, Value)> {
+    if let Value::Obj(id) = v {
+        let rid = proxy_resolve(&it.heap, id);
+        if matches!(it.heap.obj(rid), Obj::Big64 { .. }) {
+            let (signed, elems, pairs) = match it.heap.obj(rid) {
+                Obj::Big64 {
+                    signed,
+                    elems,
+                    pairs,
+                    ..
+                } => (*signed, elems.clone(), pairs.clone()),
+                _ => unreachable!(),
+            };
+            let mut out = Vec::with_capacity(elems.len() + pairs.len());
+            for (i, bits) in elems.iter().enumerate() {
+                let (neg, mag) = if signed {
+                    bi_from_i64(*bits as i64)
+                } else {
+                    bi_from_u64(*bits)
+                };
+                let proto = po(it.protos.bigint);
+                match it.heap.alloc_obj(Obj::BigInt { neg, mag, proto }) {
+                    Ok(bid) => out.push((i.to_string(), Value::Obj(bid))),
+                    Err(_) => break, // heap-cap edge: partial list
+                }
+            }
+            out.extend(pairs);
+            return out;
+        }
+    }
+    let h = &it.heap;
     match v {
         Value::Obj(id) => match h.obj(proxy_resolve(h, id)) {
             Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
@@ -5085,11 +5397,14 @@ fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
                 out
             }
             Obj::Promise { pairs, .. } => pairs.clone(),
+            // Big64 returns early above (indices need &mut to box).
+            Obj::Big64 { .. } => unreachable!("Big64 pairs box above"),
             Obj::Dom { .. }
             | Obj::RegExp { .. }
             | Obj::Style { .. }
             | Obj::Accessor { .. }
             | Obj::Symbol { .. }
+            | Obj::BigInt { .. }
             | Obj::Map { .. }
             | Obj::Set { .. }
             | Obj::WeakMap { .. }
@@ -5103,7 +5418,7 @@ fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
 }
 
 fn n_obj_keys(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
-    let pairs = own_pairs(&it.heap, arg(args, 0));
+    let pairs = own_pairs(it, arg(args, 0));
     let mut out = Vec::with_capacity(pairs.len());
     for (k, _) in pairs {
         out.push(Value::Str(it.heap.alloc_str(k)?));
@@ -5112,13 +5427,13 @@ fn n_obj_keys(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Js
 }
 
 fn n_obj_values(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
-    let pairs = own_pairs(&it.heap, arg(args, 0));
+    let pairs = own_pairs(it, arg(args, 0));
     let out: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
     Ok(Value::Obj(it.arr_obj(out)?))
 }
 
 fn n_obj_entries(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
-    let pairs = own_pairs(&it.heap, arg(args, 0));
+    let pairs = own_pairs(it, arg(args, 0));
     let mut out = Vec::with_capacity(pairs.len());
     for (k, v) in pairs {
         let k = Value::Str(it.heap.alloc_str(k)?);
@@ -5133,7 +5448,7 @@ fn n_obj_assign(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, 
         return Err(err("assign: target must be an object"));
     }
     for src in &args[1.min(args.len())..] {
-        for (k, v) in own_pairs(&it.heap, *src) {
+        for (k, v) in own_pairs(it, *src) {
             set_prop(&mut it.heap, target, &k, v)?;
         }
     }
@@ -5153,7 +5468,7 @@ fn n_obj_create(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, 
     // Optional descriptors ({key: {value/get/set,...}}) install like
     // defineProperty each (Babel _inherits' constructor backlink).
     if let Value::Obj(_) = arg(args, 1) {
-        for (k, d) in own_pairs(&it.heap, arg(args, 1)) {
+        for (k, d) in own_pairs(it, arg(args, 1)) {
             define_one(it, obj, &k, d)?;
         }
     }
@@ -5229,7 +5544,7 @@ fn n_obj_define_properties(
     args: &[Value],
 ) -> Result<Value, JsError> {
     let target = arg(args, 0);
-    for (k, d) in own_pairs(&it.heap, arg(args, 1)) {
+    for (k, d) in own_pairs(it, arg(args, 1)) {
         define_one(it, target, &k, d)?;
     }
     Ok(target)
@@ -5251,6 +5566,10 @@ fn n_obj_own_names(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Valu
                 .chain(pairs.iter().map(|(k, _)| k.clone()))
                 .collect(),
             Obj::Typed { elems, pairs, .. } => (0..elems.len())
+                .map(|i| i.to_string())
+                .chain(pairs.iter().map(|(k, _)| k.clone()))
+                .collect(),
+            Obj::Big64 { elems, pairs, .. } => (0..elems.len())
                 .map(|i| i.to_string())
                 .chain(pairs.iter().map(|(k, _)| k.clone()))
                 .collect(),
@@ -5339,6 +5658,37 @@ fn describe_own(it: &mut Interp, target: Value, key: &str) -> Result<Value, JsEr
                     pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
                 }
             }
+            Obj::Big64 {
+                signed,
+                elems,
+                pairs,
+                ..
+            } => {
+                if key == "length" {
+                    desc = vec![
+                        ("value".into(), Value::Num(elems.len() as f64)),
+                        ("writable".into(), Value::Bool(false)),
+                        ("enumerable".into(), Value::Bool(false)),
+                        ("configurable".into(), Value::Bool(false)),
+                    ];
+                    return Ok(Value::Obj(it.obj_pairs(desc)?));
+                }
+                if let Ok(i) = key.parse::<usize>() {
+                    match elems.get(i).copied() {
+                        Some(bits) => {
+                            let (neg, mag) = if *signed {
+                                bi_from_i64(bits as i64)
+                            } else {
+                                bi_from_u64(bits)
+                            };
+                            Some(bi_alloc(it, neg, mag)?)
+                        }
+                        None => None,
+                    }
+                } else {
+                    pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+                }
+            }
             _ => None,
         },
         _ => None,
@@ -5389,6 +5739,10 @@ fn n_obj_get_descs(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Valu
                 .chain(pairs.iter().map(|(k, _)| k.clone()))
                 .collect(),
             Obj::Typed { elems, pairs, .. } => (0..elems.len())
+                .map(|i| i.to_string())
+                .chain(pairs.iter().map(|(k, _)| k.clone()))
+                .collect(),
+            Obj::Big64 { elems, pairs, .. } => (0..elems.len())
                 .map(|i| i.to_string())
                 .chain(pairs.iter().map(|(k, _)| k.clone()))
                 .collect(),
@@ -6618,6 +6972,11 @@ fn n_str_replace(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, 
 }
 
 fn n_str_concat(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    // No implicit BigInt -> string here either (engine-wide rule: only the
+    // explicit String(x) call renders a BigInt).
+    if is_big(&it.heap, this) || args.iter().any(|a| is_big(&it.heap, *a)) {
+        return Err(err("Cannot convert a BigInt value to a string"));
+    }
     let mut s = this_str(it, this);
     for a in args {
         s.push_str(&to_str(&it.heap, *a));
@@ -7611,6 +7970,8 @@ fn u8_src_items(it: &Interp, v: Value) -> Vec<u8> {
             Obj::Arr { items, .. } => items.iter().map(|x| to_u8(&it.heap, *x)).collect(),
             Obj::Bytes { bytes, .. } => bytes.clone(),
             Obj::Buf { bytes, .. } => bytes.clone(),
+            // Big64 elements feed their low byte (wrap mod 256, like u8).
+            Obj::Big64 { elems, .. } => elems.iter().map(|e| *e as u8).collect(),
             _ => u8_len_items(it, Value::Obj(id)),
         },
         _ => u8_len_items(it, v),
@@ -7756,7 +8117,7 @@ fn n_buf_is_view(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value,
     let hit = match arg(args, 0) {
         Value::Obj(id) => matches!(
             it.heap.obj(id),
-            Obj::Bytes { .. } | Obj::Typed { .. } | Obj::DView { .. }
+            Obj::Bytes { .. } | Obj::Typed { .. } | Obj::DView { .. } | Obj::Big64 { .. }
         ),
         _ => false,
     };
@@ -7910,6 +8271,19 @@ fn from_raw(it: &mut Interp, v: Value) -> Result<Vec<Value>, JsError> {
                 Ok(bytes.iter().map(|b| Value::Num(*b as f64)).collect())
             }
             Obj::Typed { elems, .. } => Ok(elems.iter().map(|e| Value::Num(*e)).collect()),
+            Obj::Big64 { signed, elems, .. } => {
+                let signed = *signed;
+                let mut out = Vec::with_capacity(elems.len());
+                for bits in elems.clone() {
+                    let (neg, mag) = if signed {
+                        bi_from_i64(bits as i64)
+                    } else {
+                        bi_from_u64(bits)
+                    };
+                    out.push(bi_alloc(it, neg, mag)?);
+                }
+                Ok(out)
+            },
             Obj::Buf { bytes, .. } => {
                 Ok(bytes.iter().map(|b| Value::Num(*b as f64)).collect())
             }
@@ -8120,6 +8494,9 @@ fn t_src_items(it: &Interp, kind: TypedKind, v: Value) -> Vec<f64> {
             Obj::Arr { items, .. } => items.iter().map(|x| cv(to_num(&it.heap, *x))).collect(),
             Obj::Bytes { bytes, .. } => bytes.iter().map(|b| cv(*b as f64)).collect(),
             Obj::Typed { elems, .. } => elems.iter().map(|e| cv(*e)).collect(),
+            // f64 can't hold u64 exactly past 2^53 (inherent precision loss,
+            // same as Number(big) explicit conversion).
+            Obj::Big64 { elems, .. } => elems.iter().map(|e| cv(*e as f64)).collect(),
             Obj::Buf { bytes, .. } => t_decode(kind, bytes),
             _ => t_len_items(it, kind, Value::Obj(id)),
         },
@@ -8247,6 +8624,7 @@ fn n_t_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsErro
             Obj::Arr { items, .. } => items.iter().map(|x| t_write(kind, to_num(&it.heap, *x))).collect(),
             Obj::Bytes { bytes, .. } => bytes.iter().map(|b| t_write(kind, *b as f64)).collect(),
             Obj::Typed { elems, .. } => elems.iter().map(|e| t_write(kind, *e)).collect(),
+            Obj::Big64 { elems, .. } => elems.iter().map(|e| t_write(kind, *e as f64)).collect(),
             Obj::Buf { bytes, .. } => t_decode(kind, bytes),
             _ => t_len_items(it, kind, Value::Obj(sid)),
         },
@@ -8409,6 +8787,13 @@ fn n_dv_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsE
                 let mut out = Vec::with_capacity(elems.len() * t_bpe(*kind));
                 for e in elems {
                     dv_push(&mut out, *kind, *e);
+                }
+                out
+            }
+            Obj::Big64 { elems, .. } => {
+                let mut out = Vec::with_capacity(elems.len() * 8);
+                for e in elems {
+                    out.extend_from_slice(&e.to_le_bytes());
                 }
                 out
             }
@@ -8584,6 +8969,1175 @@ fn n_dv_set_f64(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError
     dv_set(it, t, a, 8, "setFloat64")
 }
 
+// -- BigInt ------------------------------------------------------------------------
+// Boxed primitive (Obj::BigInt): sign + little-endian base-2^32 magnitude,
+// canonical (no leading zero limbs; zero is neg:false + empty mag, so field
+// equality is value equality). Out of scope (one line each): `123n` literal
+// syntax (lexer-level; BigInt("10n") rejects the `n` like V8), BigInt.prototype
+// extras beyond toString/valueOf, `new BigInt()` throwing (all natives here
+// are callable), Object(1n) boxing (passes the primitive through).
+
+/// DoS cap on bigint width, in bits: schoolbook mul/div stay tractable and
+/// hostile shifts/pows fail fast instead of hanging the page.
+const BI_MAX_BITS: usize = 1 << 20;
+
+fn bi_is_zero(mag: &[u32]) -> bool {
+    mag.iter().all(|&w| w == 0)
+}
+
+/// Strip leading zero limbs; returns the canonical sign (zero is never
+/// negative). Cheap belt-and-braces: every op maintains canonical form.
+fn bi_norm(neg: bool, mag: &mut Vec<u32>) -> bool {
+    while mag.last() == Some(&0) {
+        mag.pop();
+    }
+    neg && !mag.is_empty()
+}
+
+fn is_big(h: &Heap, v: Value) -> bool {
+    matches!(v, Value::Obj(id) if matches!(h.obj(id), Obj::BigInt { .. }))
+}
+
+/// Boxed BigInt payload, cloned (clone-then-writeback like the typed-array
+/// neighbors: callers compute on the clone, then alloc the result).
+fn bi_val(h: &Heap, v: Value) -> Option<(bool, Vec<u32>)> {
+    match v {
+        Value::Obj(id) => match h.obj(id) {
+            Obj::BigInt { neg, mag, .. } => Some((*neg, mag.clone())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Alloc a canonical boxed BigInt under BigInt.prototype.
+fn bi_alloc_hp(
+    h: &mut Heap,
+    protos: &Protos,
+    neg: bool,
+    mut mag: Vec<u32>,
+) -> Result<Value, JsError> {
+    let neg = bi_norm(neg, &mut mag);
+    let proto = po(protos.bigint);
+    Ok(Value::Obj(h.alloc_obj(Obj::BigInt { neg, mag, proto })?))
+}
+
+fn bi_alloc(it: &mut Interp, neg: bool, mag: Vec<u32>) -> Result<Value, JsError> {
+    bi_alloc_hp(&mut it.heap, &it.protos, neg, mag)
+}
+
+fn bi_add_small(mag: &mut Vec<u32>, d: u32) {
+    let mut c = d as u64;
+    for w in mag.iter_mut() {
+        if c == 0 {
+            break;
+        }
+        let s = *w as u64 + c;
+        *w = s as u32;
+        c = s >> 32;
+    }
+    if c > 0 {
+        mag.push(c as u32);
+    }
+}
+
+fn bi_mul_small(mag: &mut Vec<u32>, d: u32) {
+    if d == 0 {
+        mag.clear();
+        return;
+    }
+    if d == 1 || mag.is_empty() {
+        return;
+    }
+    let mut c = 0u64;
+    for w in mag.iter_mut() {
+        let p = *w as u64 * d as u64 + c;
+        *w = p as u32;
+        c = p >> 32;
+    }
+    if c > 0 {
+        mag.push(c as u32);
+    }
+}
+
+/// In-place divide by a small radix; returns the remainder.
+fn bi_divmod_small(mag: &mut Vec<u32>, d: u32) -> u32 {
+    let mut r = 0u64;
+    for w in mag.iter_mut().rev() {
+        let cur = (r << 32) | *w as u64;
+        *w = (cur / d as u64) as u32;
+        r = cur % d as u64;
+    }
+    while mag.last() == Some(&0) {
+        mag.pop();
+    }
+    r as u32
+}
+
+fn bi_inc(mag: &mut Vec<u32>) {
+    bi_add_small(mag, 1);
+}
+
+fn bi_dec(mag: &mut Vec<u32>) {
+    // Canonical nonzero input; trims so one step past zero comes back empty.
+    for w in mag.iter_mut() {
+        if *w != 0 {
+            *w -= 1;
+            break;
+        }
+        *w = u32::MAX;
+    }
+    while mag.last() == Some(&0) {
+        mag.pop();
+    }
+}
+
+/// (neg, mag) +/- 1 for ++/-- (canonical in, canonical out).
+fn bi_step(neg: bool, mag: Vec<u32>, up: bool) -> (bool, Vec<u32>) {
+    if bi_is_zero(&mag) {
+        return if up {
+            (false, vec![1])
+        } else {
+            (true, vec![1])
+        };
+    }
+    let mut m = mag;
+    if neg != up {
+        bi_inc(&mut m);
+        (neg, m)
+    } else {
+        bi_dec(&mut m);
+        (if bi_is_zero(&m) { false } else { neg }, m)
+    }
+}
+
+fn bi_cmp_mag(a: &[u32], b: &[u32]) -> std::cmp::Ordering {
+    // Canonical inputs: length decides, then most-significant limb first.
+    if a.len() != b.len() {
+        return a.len().cmp(&b.len());
+    }
+    for (&x, &y) in a.iter().rev().zip(b.iter().rev()) {
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn bi_cmp(an: bool, a: &[u32], bn: bool, b: &[u32]) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    if bi_is_zero(a) && bi_is_zero(b) {
+        return Equal;
+    }
+    if an != bn {
+        return if an { Less } else { Greater };
+    }
+    let o = bi_cmp_mag(a, b);
+    if an { o.reverse() } else { o }
+}
+
+fn rel_holds(op: &str, o: std::cmp::Ordering) -> bool {
+    use std::cmp::Ordering::*;
+    matches!(
+        (op, o),
+        ("<", Less) | ("<=", Less | Equal) | (">", Greater) | (">=", Greater | Equal)
+    )
+}
+
+fn bi_add_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len().max(b.len()) + 1);
+    let mut c = 0u64;
+    for i in 0..a.len().max(b.len()) {
+        let s = a.get(i).copied().unwrap_or(0) as u64 + b.get(i).copied().unwrap_or(0) as u64 + c;
+        out.push(s as u32);
+        c = s >> 32;
+    }
+    if c > 0 {
+        out.push(c as u32);
+    }
+    out
+}
+
+/// `a - b` with `a >= b` (both canonical); result canonical.
+fn bi_sub_mag(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(a.len());
+    let mut borrow = 0i64;
+    for i in 0..a.len() {
+        let d = a[i] as i64 - b.get(i).copied().unwrap_or(0) as i64 - borrow;
+        if d < 0 {
+            out.push((d + 0x1_0000_0000) as u32);
+            borrow = 1;
+        } else {
+            out.push(d as u32);
+            borrow = 0;
+        }
+    }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+fn bi_add(an: bool, a: &[u32], bn: bool, b: &[u32]) -> (bool, Vec<u32>) {
+    if bi_is_zero(a) {
+        return (bn, b.to_vec());
+    }
+    if bi_is_zero(b) {
+        return (an, a.to_vec());
+    }
+    if an == bn {
+        (an, bi_add_mag(a, b))
+    } else {
+        match bi_cmp_mag(a, b) {
+            std::cmp::Ordering::Equal => (false, Vec::new()),
+            std::cmp::Ordering::Greater => (an, bi_sub_mag(a, b)),
+            std::cmp::Ordering::Less => (bn, bi_sub_mag(b, a)),
+        }
+    }
+}
+
+fn bi_bit_len(mag: &[u32]) -> usize {
+    let mut n = mag.len() * 32;
+    if let Some(&top) = mag.last() {
+        n -= top.leading_zeros() as usize;
+    }
+    n
+}
+
+/// Magnitude product, width-capped (schoolbook is O(n^2): hostile widths
+/// fail fast instead of hanging the page).
+fn bi_mul_mag(a: &[u32], b: &[u32]) -> Result<Vec<u32>, JsError> {
+    if bi_is_zero(a) || bi_is_zero(b) {
+        return Ok(Vec::new());
+    }
+    if bi_bit_len(a) + bi_bit_len(b) > BI_MAX_BITS + 64 {
+        return Err(err("Maximum BigInt size exceeded"));
+    }
+    let mut out = vec![0u32; a.len() + b.len()];
+    for (i, &x) in a.iter().enumerate() {
+        if x == 0 {
+            continue;
+        }
+        let mut carry = 0u64;
+        for (j, &y) in b.iter().enumerate() {
+            let cur = out[i + j] as u64 + x as u64 * y as u64 + carry;
+            out[i + j] = cur as u32;
+            carry = cur >> 32;
+        }
+        let mut k = i + b.len();
+        while carry > 0 {
+            let cur = out[k] as u64 + carry;
+            out[k] = cur as u32;
+            carry = cur >> 32;
+            k += 1;
+        }
+    }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    Ok(out)
+}
+
+fn bi_shl1(mag: &mut Vec<u32>) {
+    let mut c = 0u32;
+    for w in mag.iter_mut() {
+        let n = (*w << 1) | c;
+        c = *w >> 31;
+        *w = n;
+    }
+    if c > 0 {
+        mag.push(c);
+    }
+}
+
+/// Long division on magnitudes (restoring, bit-by-bit): scraper operands
+/// are tiny and obvious correctness beats clever here. `b` must be nonzero.
+fn bi_divmod_mag(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
+    if bi_cmp_mag(a, b) == std::cmp::Ordering::Less {
+        return (Vec::new(), a.to_vec());
+    }
+    let nbits = bi_bit_len(a);
+    let mut quo = vec![0u32; a.len()];
+    let mut rem: Vec<u32> = Vec::new();
+    for i in (0..nbits).rev() {
+        bi_shl1(&mut rem);
+        if a[i / 32] >> (i % 32) & 1 == 1 {
+            bi_add_small(&mut rem, 1);
+        }
+        if bi_cmp_mag(&rem, b) != std::cmp::Ordering::Less {
+            rem = bi_sub_mag(&rem, b);
+            quo[i / 32] |= 1 << (i % 32);
+        }
+    }
+    while quo.last() == Some(&0) {
+        quo.pop();
+    }
+    (quo, rem)
+}
+
+fn bi_shl_mag(a: &[u32], k: usize) -> Vec<u32> {
+    if bi_is_zero(a) {
+        return Vec::new();
+    }
+    let (word, bit) = (k / 32, k % 32);
+    let mut out = vec![0u32; word];
+    if bit == 0 {
+        out.extend_from_slice(a);
+    } else {
+        let mut c = 0u32;
+        for &w in a {
+            out.push((w << bit) | c);
+            c = w >> (32 - bit);
+        }
+        if c > 0 {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Magnitude shift right; the flag reports dropped nonzero bits so the
+/// caller can round floor for negative operands (arithmetic `>>`).
+fn bi_shr_mag(a: &[u32], k: usize) -> (Vec<u32>, bool) {
+    let (word, bit) = (k / 32, k % 32);
+    if word >= a.len() {
+        return (Vec::new(), !bi_is_zero(a));
+    }
+    let mut out = Vec::with_capacity(a.len() - word);
+    if bit == 0 {
+        out.extend_from_slice(&a[word..]);
+    } else {
+        for i in word..a.len() {
+            out.push(a[i] >> bit | a.get(i + 1).copied().unwrap_or(0) << (32 - bit));
+        }
+    }
+    let mut lost = a[..word].iter().any(|&w| w != 0);
+    if bit != 0 {
+        if let Some(&w) = a.get(word) {
+            lost |= w & (u32::MAX >> (32 - bit)) != 0;
+        }
+    }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    (out, lost)
+}
+
+fn bi_pow_mag(base: &[u32], exp: &[u32]) -> Result<Vec<u32>, JsError> {
+    if bi_is_zero(exp) {
+        return Ok(vec![1]); // x**0 == 1, including 0n**0n
+    }
+    if bi_is_zero(base) {
+        return Ok(Vec::new());
+    }
+    if bi_cmp_mag(base, &[1]) == std::cmp::Ordering::Equal {
+        return Ok(vec![1]);
+    }
+    if bi_bit_len(exp) > 64 {
+        return Err(err("Maximum BigInt size exceeded"));
+    }
+    let mut e: u64 = 0;
+    for (i, &w) in exp.iter().enumerate() {
+        e |= (w as u64) << (i * 32);
+    }
+    // Width pre-check (each squaring step re-checks via bi_mul_mag).
+    if (e as u128).saturating_mul(bi_bit_len(base) as u128) > BI_MAX_BITS as u128 {
+        return Err(err("Maximum BigInt size exceeded"));
+    }
+    let mut acc = vec![1u32];
+    let mut b = base.to_vec();
+    while e > 0 {
+        if e & 1 == 1 {
+            acc = bi_mul_mag(&acc, &b)?;
+        }
+        e >>= 1;
+        if e > 0 {
+            b = bi_mul_mag(&b, &b)?;
+        }
+    }
+    Ok(acc)
+}
+
+/// n-limb two's complement of (neg, mag): negatives sign-extend with 1s so
+/// `&`/`|`/`^` get infinite-sign-extension semantics.
+fn bi_twos(neg: bool, mag: &[u32], n: usize) -> Vec<u32> {
+    let mut t = vec![0u32; n];
+    let m = mag.len().min(n);
+    t[..m].copy_from_slice(&mag[..m]);
+    if neg {
+        for w in t.iter_mut() {
+            *w = !*w;
+        }
+        let mut c = 1u64;
+        for w in t.iter_mut() {
+            if c == 0 {
+                break;
+            }
+            let s = *w as u64 + c;
+            *w = s as u32;
+            c = s >> 32;
+        }
+    }
+    t
+}
+
+/// Two's complement words back to (sign, magnitude). The top bit decides.
+fn bi_from_twos(t: &[u32]) -> (bool, Vec<u32>) {
+    if t.last().map(|&w| w >> 31 == 0).unwrap_or(true) {
+        let mut m = t.to_vec();
+        while m.last() == Some(&0) {
+            m.pop();
+        }
+        (false, m)
+    } else {
+        let mut m: Vec<u32> = t.iter().map(|w| !w).collect();
+        bi_add_small(&mut m, 1);
+        while m.last() == Some(&0) {
+            m.pop();
+        }
+        (true, m)
+    }
+}
+
+fn bi_bitwise(an: bool, a: &[u32], bn: bool, b: &[u32], op: u8) -> (bool, Vec<u32>) {
+    let n = a.len().max(b.len()) + 1;
+    let ta = bi_twos(an, a, n);
+    let tb = bi_twos(bn, b, n);
+    let out: Vec<u32> = ta
+        .into_iter()
+        .zip(tb)
+        .map(|(x, y)| match op {
+            b'&' => x & y,
+            b'|' => x | y,
+            _ => x ^ y,
+        })
+        .collect();
+    bi_from_twos(&out)
+}
+
+/// Exact f64-integer -> BigInt via bit decomposition (every integral f64 is
+/// an exact integer, however large). Caller guarantees finite + integral.
+fn bi_from_f64_int(n: f64) -> (bool, Vec<u32>) {
+    if n == 0.0 {
+        return (false, Vec::new()); // also kills -0.0: no negative zero
+    }
+    let neg = n < 0.0;
+    let bits = n.abs().to_bits();
+    let raw = ((bits >> 52) & 0x7ff) as i32;
+    // Integral nonzero values are always normal (subnormals are < 1).
+    debug_assert!(raw != 0);
+    let mant = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
+    let e = raw - 1075;
+    let mut mag = vec![(mant & 0xFFFF_FFFF) as u32, (mant >> 32) as u32];
+    while mag.last() == Some(&0) {
+        mag.pop();
+    }
+    if e >= 0 {
+        mag = bi_shl_mag(&mag, e as usize);
+    } else {
+        mag = bi_shr_mag(&mag, (-e) as usize).0; // lossless: input integral
+    }
+    (neg, mag)
+}
+
+fn bi_to_f64(neg: bool, mag: &[u32]) -> f64 {
+    let mut n = 0.0;
+    for (i, &w) in mag.iter().enumerate() {
+        if w != 0 {
+            n += w as f64 * 2f64.powi(i as i32 * 32);
+        }
+    }
+    if neg { -n } else { n }
+}
+
+fn bi_parse(s: &str) -> Result<(bool, Vec<u32>), ()> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok((false, Vec::new())); // BigInt("") is 0n
+    }
+    let (neg, t) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let (radix, digits) = if let Some(x) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        (16, x)
+    } else if let Some(x) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        (2, x)
+    } else if let Some(x) = t.strip_prefix("0o").or_else(|| t.strip_prefix("0O")) {
+        (8, x)
+    } else {
+        (10u32, t)
+    };
+    if digits.is_empty() {
+        return Err(());
+    }
+    let mut mag: Vec<u32> = Vec::new();
+    for c in digits.chars() {
+        let d = c.to_digit(radix).ok_or(())?;
+        bi_mul_small(&mut mag, radix);
+        bi_add_small(&mut mag, d);
+    }
+    Ok((neg && !bi_is_zero(&mag), mag))
+}
+
+fn bi_fmt(neg: bool, mag: &[u32], radix: u32) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    if bi_is_zero(mag) {
+        return "0".into();
+    }
+    let mut m = mag.to_vec();
+    let mut out: Vec<u8> = Vec::new();
+    while !bi_is_zero(&m) {
+        out.push(DIGITS[bi_divmod_small(&mut m, radix) as usize]);
+    }
+    if neg {
+        out.push(b'-');
+    }
+    out.reverse();
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn bi_from_u64(u: u64) -> (bool, Vec<u32>) {
+    if u == 0 {
+        return (false, Vec::new());
+    }
+    let mut m = vec![u as u32];
+    if u > 0xFFFF_FFFF {
+        m.push((u >> 32) as u32);
+    }
+    (false, m)
+}
+
+fn bi_from_i64(i: i64) -> (bool, Vec<u32>) {
+    if i == 0 {
+        return (false, Vec::new());
+    }
+    let (neg, u) = if i < 0 {
+        (true, i.unsigned_abs())
+    } else {
+        (false, i as u64)
+    };
+    let (_, m) = bi_from_u64(u);
+    (neg, m)
+}
+
+fn bi_bit_set(mag: &[u32], i: usize) -> bool {
+    mag.get(i / 32)
+        .map(|&w| w >> (i % 32) & 1 == 1)
+        .unwrap_or(false)
+}
+
+/// BigInt vs f64, exactly: integral Numbers convert losslessly (every
+/// integral f64 IS an exact integer); fractional ones compare via their
+/// truncation plus the leftover fraction. None = unordered (NaN).
+fn cmp_big_num(neg: bool, mag: &[u32], n: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering::*;
+    if n.is_nan() {
+        return None;
+    }
+    if n.is_infinite() {
+        return Some(if n > 0.0 { Less } else { Greater });
+    }
+    if n.fract() == 0.0 {
+        let (nn, nm) = bi_from_f64_int(n);
+        return Some(bi_cmp(neg, mag, nn, &nm));
+    }
+    let (tn, tm) = bi_from_f64_int(n.trunc());
+    match bi_cmp(neg, mag, tn, &tm) {
+        Equal => Some(if n > 0.0 { Less } else { Greater }),
+        o => Some(o),
+    }
+}
+
+enum BigOrNum {
+    Big(bool, Vec<u32>),
+    Num(f64),
+    NaN,
+}
+
+/// A string as BigInt when it parses, else as Number, else NaN-ish
+/// (mirrors the spec's ToNumeric-then-compare for `==` and relational ops).
+fn str_to_big_num(s: &str) -> BigOrNum {
+    if let Ok((neg, mag)) = bi_parse(s) {
+        return BigOrNum::Big(neg, mag);
+    }
+    match s.trim().parse::<f64>() {
+        // Rust rejects the hex/inf casings V8 accepts; exact-bigint strings
+        // took the first path, so this fallback only shapes numerics.
+        Ok(n) => {
+            if n.is_nan() {
+                BigOrNum::NaN
+            } else {
+                BigOrNum::Num(n)
+            }
+        }
+        Err(_) => BigOrNum::NaN,
+    }
+}
+
+/// Loose `==` with exactly one BigInt side (both-big is value equality).
+fn big_loose_rhs(mag: &[u32], neg: bool, h: &Heap, o: Value) -> bool {
+    match o {
+        Value::Num(n) => cmp_big_num(neg, mag, n) == Some(std::cmp::Ordering::Equal),
+        Value::Bool(b) => {
+            cmp_big_num(neg, mag, b as u8 as f64) == Some(std::cmp::Ordering::Equal)
+        }
+        Value::Str(id) => match str_to_big_num(h.get_str(id)) {
+            BigOrNum::Big(bn, bm) => neg == bn && mag == bm.as_slice(),
+            BigOrNum::Num(n) => cmp_big_num(neg, mag, n) == Some(std::cmp::Ordering::Equal),
+            BigOrNum::NaN => false,
+        },
+        _ => false,
+    }
+}
+
+fn loose_big(h: &Heap, l: Value, r: Value) -> bool {
+    match (bi_val(h, l), bi_val(h, r)) {
+        (Some((an, am)), Some((bn, bm))) => an == bn && am == bm,
+        (Some((an, am)), _) => big_loose_rhs(&am, an, h, r),
+        (_, Some((bn, bm))) => big_loose_rhs(&bm, bn, h, l),
+        (None, None) => false,
+    }
+}
+
+/// Ordering of (big) vs (non-big value): None when unordered.
+fn big_ord_rhs(mag: &[u32], neg: bool, h: &Heap, o: Value) -> Option<std::cmp::Ordering> {
+    match o {
+        Value::Num(n) => cmp_big_num(neg, mag, n),
+        Value::Bool(b) => cmp_big_num(neg, mag, b as u8 as f64),
+        Value::Str(id) => match str_to_big_num(h.get_str(id)) {
+            BigOrNum::Big(bn, bm) => Some(bi_cmp(neg, mag, bn, &bm)),
+            BigOrNum::Num(n) => cmp_big_num(neg, mag, n),
+            BigOrNum::NaN => None,
+        },
+        _ => None,
+    }
+}
+
+fn big_rel_ord(h: &Heap, l: Value, r: Value) -> Option<std::cmp::Ordering> {
+    match (bi_val(h, l), bi_val(h, r)) {
+        (Some((an, am)), Some((bn, bm))) => Some(bi_cmp(an, &am, bn, &bm)),
+        (Some((an, am)), _) => big_ord_rhs(&am, an, h, r),
+        (_, Some((bn, bm))) => big_ord_rhs(&bm, bn, h, l).map(std::cmp::Ordering::reverse),
+        (None, None) => None,
+    }
+}
+
+fn rel_big(h: &Heap, op: &str, l: Value, r: Value) -> bool {
+    big_rel_ord(h, l, r).is_some_and(|o| rel_holds(op, o))
+}
+
+/// BigInt-involved binary operator (spec): both-BigInt computes; `==`/`!=`
+/// and relational ops compare numerically across types; everything else
+/// mixed throws ("Cannot mix BigInt and other types").
+fn bin_big(it: &mut Interp, op: &str, l: Value, r: Value) -> Result<Value, JsError> {
+    match (bi_val(&it.heap, l), bi_val(&it.heap, r)) {
+        (Some((an, am)), Some((bn, bm))) => bin_big_both(it, op, an, &am, bn, &bm),
+        _ => Ok(match op {
+            "==" => Value::Bool(loose_big(&it.heap, l, r)),
+            "!=" => Value::Bool(!loose_big(&it.heap, l, r)),
+            "===" => Value::Bool(strict_eq(&it.heap, l, r)),
+            "!==" => Value::Bool(!strict_eq(&it.heap, l, r)),
+            "<" | "<=" | ">" | ">=" => Value::Bool(rel_big(&it.heap, op, l, r)),
+            _ => {
+                return Err(err(
+                    "Cannot mix BigInt and other types, use explicit conversions",
+                ));
+            }
+        }),
+    }
+}
+
+fn bin_big_both(
+    it: &mut Interp,
+    op: &str,
+    an: bool,
+    am: &[u32],
+    bn: bool,
+    bm: &[u32],
+) -> Result<Value, JsError> {
+    match op {
+        "+" => {
+            let (n, m) = bi_add(an, am, bn, bm);
+            bi_alloc(it, n, m)
+        }
+        "-" => {
+            let (n, m) = bi_add(an, am, !bn, bm);
+            bi_alloc(it, n, m)
+        }
+        "*" => {
+            let m = bi_mul_mag(am, bm)?;
+            bi_alloc(it, an != bn && !bi_is_zero(&m), m)
+        }
+        "/" => {
+            if bi_is_zero(bm) {
+                return Err(err("Division by zero"));
+            }
+            let (q, _) = bi_divmod_mag(am, bm); // magnitudes: truncation
+            bi_alloc(it, an != bn && !bi_is_zero(&q), q)
+        }
+        "%" => {
+            if bi_is_zero(bm) {
+                return Err(err("Division by zero"));
+            }
+            let (_, r) = bi_divmod_mag(am, bm); // sign follows the dividend
+            bi_alloc(it, an && !bi_is_zero(&r), r)
+        }
+        "**" => {
+            if bn && !bi_is_zero(bm) {
+                return Err(err("Exponent must be non-negative"));
+            }
+            let m = bi_pow_mag(am, bm)?;
+            let neg = an && !bi_is_zero(bm) && bm[0] & 1 == 1 && !bi_is_zero(&m);
+            bi_alloc(it, neg, m)
+        }
+        "&" => {
+            let (n, m) = bi_bitwise(an, am, bn, bm, b'&');
+            bi_alloc(it, n, m)
+        }
+        "|" => {
+            let (n, m) = bi_bitwise(an, am, bn, bm, b'|');
+            bi_alloc(it, n, m)
+        }
+        "^" => {
+            let (n, m) = bi_bitwise(an, am, bn, bm, b'^');
+            bi_alloc(it, n, m)
+        }
+        "<<" | ">>" => {
+            if bn && !bi_is_zero(bm) {
+                return Err(err("BigInt shift count must be non-negative"));
+            }
+            if bi_bit_len(bm) > 64 {
+                // Counts past the width cap: << overflows (unless the value
+                // is zero), >> settles to 0, or -1 for negatives (floor).
+                if op == "<<" {
+                    if bi_is_zero(am) {
+                        return bi_alloc(it, false, Vec::new());
+                    }
+                    return Err(err("Maximum BigInt size exceeded"));
+                }
+                return if !an || bi_is_zero(am) {
+                    bi_alloc(it, false, Vec::new())
+                } else {
+                    bi_alloc(it, true, vec![1])
+                };
+            }
+            let mut k: usize = 0;
+            for (i, &w) in bm.iter().enumerate() {
+                k |= (w as usize) << (i * 32);
+            }
+            if op == "<<" {
+                if bi_bit_len(am) + k > BI_MAX_BITS {
+                    return Err(err("Maximum BigInt size exceeded"));
+                }
+                bi_alloc(it, an, bi_shl_mag(am, k))
+            } else {
+                let (q, sticky) = bi_shr_mag(am, k);
+                // Arithmetic shift floors negatives: round away on residue.
+                if an && sticky {
+                    let mut m = q;
+                    bi_inc(&mut m);
+                    bi_alloc(it, true, m)
+                } else {
+                    bi_alloc(it, an && !bi_is_zero(&q), q)
+                }
+            }
+        }
+        ">>>" => Err(err("BigInts have no unsigned right shift, use >> instead")),
+        "==" => Ok(Value::Bool(an == bn && am == bm)),
+        "!=" => Ok(Value::Bool(an != bn || am != bm)),
+        "===" => Ok(Value::Bool(an == bn && am == bm)),
+        "!==" => Ok(Value::Bool(an != bn || am != bm)),
+        "<" | "<=" | ">" | ">=" => Ok(Value::Bool(rel_holds(op, bi_cmp(an, am, bn, bm)))),
+        _ => Err(err(format!("bad op {op}"))),
+    }
+}
+
+/// ToBigInt for the BigInt() call and asUintN/asIntN: numbers truncate
+/// toward zero via exact conversion (NaN/Infinity throw); numeric strings
+/// parse; bools and BigInts pass through; null/undefined/symbols/plain
+/// objects throw.
+fn bi_from_value(it: &Interp, v: Value) -> Result<(bool, Vec<u32>), JsError> {
+    match v {
+        Value::Num(n) => {
+            if n.is_nan() {
+                return Err(err("Cannot convert NaN to a BigInt"));
+            }
+            if n.is_infinite() {
+                return Err(err("Cannot convert Infinity to a BigInt"));
+            }
+            Ok(bi_from_f64_int(n.trunc()))
+        }
+        Value::Str(id) => {
+            let s = it.heap.get_str(id).to_string();
+            bi_parse(&s).map_err(|()| err(format!("Cannot convert {s} to a BigInt")))
+        }
+        Value::Bool(b) => Ok(if b {
+            (false, vec![1])
+        } else {
+            (false, Vec::new())
+        }),
+        Value::Null => Err(err("Cannot convert null to a BigInt")),
+        Value::Undef => Err(err("Cannot convert undefined to a BigInt")),
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::BigInt { neg, mag, .. } => Ok((*neg, mag.clone())),
+            Obj::Symbol { .. } => Err(err("Cannot convert a Symbol value to a BigInt")),
+            _ => Err(err("Cannot convert object to a BigInt")),
+        },
+    }
+}
+
+/// BigInt(v): no-arg is 0n; BigInt args pass through (immutable values).
+fn n_bigint_cast(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    if args.is_empty() {
+        return bi_alloc(it, false, Vec::new());
+    }
+    let v = args[0];
+    if let Value::Obj(id) = v {
+        if matches!(it.heap.obj(id), Obj::BigInt { .. }) {
+            return Ok(v);
+        }
+    }
+    let (neg, mag) = bi_from_value(it, v)?;
+    bi_alloc(it, neg, mag)
+}
+
+fn bi_bits(h: &Heap, v: Value, op: &str) -> Result<usize, JsError> {
+    let n = to_num(h, v);
+    if n.is_nan() {
+        return Ok(0);
+    }
+    if n.fract() != 0.0 || n < 0.0 {
+        return Err(err(format!("BigInt.{op} needs a non-negative integer bit count")));
+    }
+    if n > BI_MAX_BITS as f64 {
+        return Err(err("Maximum BigInt size exceeded"));
+    }
+    Ok(n as usize)
+}
+
+/// x mod 2^bits in [0, 2^bits): mask the low limbs, complement negatives.
+/// Never allocates 2^bits: only the (capped) residue is materialized.
+fn bi_mod_pow2(neg: bool, mag: &[u32], bits: usize) -> (bool, Vec<u32>) {
+    let k = bits.div_ceil(32);
+    let mut low: Vec<u32> = mag.iter().take(k.min(mag.len())).copied().collect();
+    if bits % 32 != 0 {
+        if let Some(top) = low.last_mut() {
+            *top &= u32::MAX >> (32 - bits % 32);
+        }
+    }
+    while low.last() == Some(&0) {
+        low.pop();
+    }
+    if !neg || low.is_empty() {
+        return (false, low);
+    }
+    let two = bi_shl_mag(&[1], bits);
+    (false, bi_sub_mag(&two, &low))
+}
+
+fn n_big_as_uint_n(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let bits = bi_bits(&it.heap, arg(args, 0), "asUintN")?;
+    let (neg, mag) = bi_from_value(it, arg(args, 1))?;
+    let (n, m) = bi_mod_pow2(neg, &mag, bits);
+    bi_alloc(it, n, m)
+}
+
+fn n_big_as_int_n(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let bits = bi_bits(&it.heap, arg(args, 0), "asIntN")?;
+    if bits == 0 {
+        return bi_alloc(it, false, Vec::new());
+    }
+    let (neg, mag) = bi_from_value(it, arg(args, 1))?;
+    let (_, u) = bi_mod_pow2(neg, &mag, bits);
+    // A set sign bit means the unsigned residue reads negative here.
+    if bi_bit_set(&u, bits - 1) {
+        let two = bi_shl_mag(&[1], bits);
+        let m = bi_sub_mag(&two, &u);
+        bi_alloc(it, true, m)
+    } else {
+        bi_alloc(it, false, u)
+    }
+}
+
+fn bi_this(it: &Interp, this: Value, op: &str) -> Result<(bool, Vec<u32>), JsError> {
+    match this {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::BigInt { neg, mag, .. } => Ok((*neg, mag.clone())),
+            _ => Err(err(format!("BigInt.prototype.{op} needs a BigInt receiver"))),
+        },
+        _ => Err(err(format!("BigInt.prototype.{op} needs a BigInt receiver"))),
+    }
+}
+
+/// BigInt.prototype.toString(radix): 2..36 like Number's (exact here, since
+/// the value is already integral).
+fn n_big_to_string(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (neg, mag) = bi_this(it, this, "toString")?;
+    let radix = match arg(args, 0) {
+        Value::Undef => 10,
+        v => to_num(&it.heap, v).trunc() as i64,
+    };
+    if !(2..=36).contains(&radix) {
+        return Err(err("toString() radix argument must be between 2 and 36"));
+    }
+    Ok(Value::Str(
+        it.heap.alloc_str(bi_fmt(neg, &mag, radix as u32))?,
+    ))
+}
+
+fn n_big_value_of(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    bi_this(it, this, "valueOf")?;
+    Ok(this)
+}
+
+// -- BigInt64Array / BigUint64Array -------------------------------------------------
+// Raw u64 elements (f64 storage would lose precision past 2^53); reads box
+// into BigInts, writes wrap mod 2^64 with sloppy coerce like the Typed
+// neighbors (never throws on value shape). Only fill() is implemented:
+// of/from/slice/subarray/join/set/indexOf are documented gaps.
+
+fn b64_this(it: &Interp, this: Value, op: &str) -> Result<(u32, bool), JsError> {
+    match this {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Big64 { signed, .. } => Ok((id, *signed)),
+            _ => Err(err(format!("{op} needs a BigInt array receiver"))),
+        },
+        _ => Err(err(format!("{op} needs a BigInt array receiver"))),
+    }
+}
+
+/// Truncated f64 wrapped into u64 range. Done via the exact bit
+/// decomposition (every integral f64 converts losslessly): the naive
+/// `((n % 2^64) + 2^64) % 2^64` rounds small values to zero in f64
+/// (2^64 + 5 is not representable), and `as u64` saturates past 2^63.
+fn b64_wrap_num(n: f64) -> u64 {
+    let n = n.trunc();
+    if !n.is_finite() || n == 0.0 {
+        return 0;
+    }
+    let (neg, mag) = bi_from_f64_int(n);
+    let m = mag.first().copied().unwrap_or(0) as u64
+        | ((mag.get(1).copied().unwrap_or(0) as u64) << 32);
+    if neg { m.wrapping_neg() } else { m }
+}
+
+/// Element write coercion: BigInts wrap exactly off the low limbs,
+/// everything else truncates through f64 like the Typed neighbors.
+fn b64_wrap(h: &Heap, v: Value) -> u64 {
+    if let Some((neg, mag)) = bi_val(h, v) {
+        let m = mag.first().copied().unwrap_or(0) as u64
+            | ((mag.get(1).copied().unwrap_or(0) as u64) << 32);
+        if neg { m.wrapping_neg() } else { m }
+    } else {
+        b64_wrap_num(to_num(h, v))
+    }
+}
+
+/// Named/element store: canonical indices wrap in range (out-of-range
+/// drops, sloppy); `length`/`byteLength` are read-only no-ops; anything
+/// else is an expando pair.
+fn b64_set(h: &mut Heap, id: u32, key: &str, val: Value) -> Result<(), JsError> {
+    if key == "length" || key == "byteLength" {
+        return Ok(());
+    }
+    let w = b64_wrap(&*h, val);
+    if let Ok(i) = key.parse::<usize>() {
+        if let Obj::Big64 { elems, .. } = h.obj_mut(id) {
+            if let Some(slot) = elems.get_mut(i) {
+                *slot = w;
+            }
+        }
+        return Ok(());
+    }
+    if let Obj::Big64 { pairs, .. } = h.obj_mut(id) {
+        match pairs.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = val,
+            None => pairs.push((key.to_string(), val)),
+        }
+    }
+    Ok(())
+}
+
+/// Length-based element source for the ctor (mirrors t_len_items).
+fn b64_len_items(it: &Interp, v: Value) -> Vec<u64> {
+    let len = match get_prop(&it.heap, &it.protos, v, "length") {
+        Ok(Value::Num(n)) if n > 0.0 => (n.floor() as usize).min(1 << 28),
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let key = i.to_string();
+        let n = match get_prop(&it.heap, &it.protos, v, &key) {
+            Ok(x) => b64_wrap(&it.heap, x),
+            Err(_) => 0,
+        };
+        out.push(n);
+    }
+    out
+}
+
+/// Shared Big64 constructor: length, source view/array, or buffer (+ byte
+/// offset/element length, 8-aligned like the Typed views).
+fn b64_ctor(it: &mut Interp, signed: bool, proto: u32, args: &[Value]) -> Result<Value, JsError> {
+    let elems: Vec<u64> = match arg(args, 0) {
+        Value::Undef => Vec::new(),
+        v @ (Value::Num(_) | Value::Str(_) | Value::Bool(_) | Value::Null) => {
+            vec![0; typed_len(&it.heap, v)?]
+        }
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::BigInt { .. }) => {
+            vec![0; typed_len(&it.heap, Value::Obj(id))?]
+        }
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Buf { .. }) => {
+            let bytes = match it.heap.obj(id) {
+                Obj::Buf { bytes, .. } => bytes.clone(),
+                _ => unreachable!(),
+            };
+            let off = match arg(args, 1) {
+                Value::Undef => 0,
+                v => {
+                    let n = to_num(&it.heap, v).trunc();
+                    if n < 0.0 || n.fract() != 0.0 || !(n as usize).is_multiple_of(8) {
+                        return Err(err("typed array buffer offset misaligned"));
+                    }
+                    n as usize
+                }
+            };
+            if off > bytes.len() || bytes.len() % 8 != 0 {
+                return Err(err("typed array buffer length mismatch"));
+            }
+            let mut els: Vec<u64> = bytes[off..]
+                .chunks_exact(8)
+                .map(|w| {
+                    u64::from_le_bytes([
+                        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+                    ])
+                })
+                .collect();
+            if !matches!(arg(args, 2), Value::Undef) {
+                let want = typed_len(&it.heap, arg(args, 2))?;
+                if want > els.len() {
+                    return Err(err("typed array length out of range"));
+                }
+                els.truncate(want);
+            }
+            els
+        }
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Big64 { elems, .. } => elems.clone(),
+            Obj::Bytes { bytes, .. } => bytes.iter().map(|b| *b as u64).collect(),
+            Obj::Typed { elems, .. } => elems.iter().map(|e| b64_wrap_num(*e)).collect(),
+            Obj::Arr { items, .. } => {
+                items.iter().map(|x| b64_wrap(&it.heap, *x)).collect()
+            }
+            _ => b64_len_items(it, Value::Obj(id)),
+        },
+    };
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Big64 {
+        signed,
+        elems,
+        pairs: Vec::new(),
+        proto: po(proto),
+    })?))
+}
+
+fn n_bi64_ctor(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    b64_ctor(it, true, it.protos.bigint64array, a)
+}
+
+fn n_bu64_ctor(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    b64_ctor(it, false, it.protos.biguint64array, a)
+}
+
+fn n_b64_fill(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (id, _) = b64_this(it, this, "fill")?;
+    let w = b64_wrap(&it.heap, arg(args, 0));
+    let len = match it.heap.obj(id) {
+        Obj::Big64 { elems, .. } => elems.len(),
+        _ => unreachable!(),
+    };
+    let (a, c) = match (arg(args, 1), arg(args, 2)) {
+        (Value::Undef, Value::Undef) => (0, len),
+        (s, Value::Undef) => typed_range(len, to_num(&it.heap, s), len as f64),
+        (s, e) => typed_range(len, to_num(&it.heap, s), to_num(&it.heap, e)),
+    };
+    if let Obj::Big64 { elems, .. } = it.heap.obj_mut(id) {
+        elems[a..c].fill(w);
+    }
+    Ok(this)
+}
+
+// -- DataView 64-bit accessors -------------------------------------------------------
+// Values cross as boxed BigInts (exact); setters coerce like Big64 element
+// writes (wrap mod 2^64) and return undefined like the other setters.
+
+fn dv_big_get(
+    it: &mut Interp,
+    this: Value,
+    args: &[Value],
+    signed: bool,
+    name: &str,
+) -> Result<Value, JsError> {
+    let id = dv_this(it, this, name)?;
+    let (bytes, at, le) = dv_args(it, id, args)?;
+    dv_need(&bytes, at, 8)?;
+    let w = &bytes[at..at + 8];
+    let bits = if le {
+        u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]])
+    } else {
+        u64::from_be_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]])
+    };
+    let (neg, mag) = if signed {
+        bi_from_i64(bits as i64)
+    } else {
+        bi_from_u64(bits)
+    };
+    bi_alloc(it, neg, mag)
+}
+
+fn dv_big_set(
+    it: &mut Interp,
+    this: Value,
+    args: &[Value],
+    name: &str,
+) -> Result<Value, JsError> {
+    let id = dv_this(it, this, name)?;
+    let (bytes_len, off) = match it.heap.obj(id) {
+        Obj::DView { bytes, off, .. } => (bytes.len(), *off),
+        _ => unreachable!(),
+    };
+    let at = match to_num(&it.heap, arg(args, 0)).trunc() {
+        n if n < 0.0 => return Err(err("DataView offset out of bounds")),
+        n => off + n as usize,
+    };
+    if at + 8 > bytes_len {
+        return Err(err("DataView offset out of bounds"));
+    }
+    let le = truthy(&it.heap, arg(args, 2));
+    let w = b64_wrap(&it.heap, arg(args, 1));
+    let enc = if le { w.to_le_bytes() } else { w.to_be_bytes() };
+    if let Obj::DView { bytes, .. } = it.heap.obj_mut(id) {
+        bytes[at..at + 8].copy_from_slice(&enc);
+    }
+    Ok(Value::Undef)
+}
+
+fn n_dv_get_bi64(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_big_get(it, t, a, true, "getBigInt64")
+}
+
+fn n_dv_get_bu64(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_big_get(it, t, a, false, "getBigUint64")
+}
+
+fn n_dv_set_bi64(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_big_set(it, t, a, "setBigInt64")
+}
+
+fn n_dv_set_bu64(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_big_set(it, t, a, "setBigUint64")
+}
+
 // -- TextEncoder / TextDecoder -----------------------------------------------------
 // UTF-8 via Rust's own encoding (engine strings are UTF-8); lossy decode
 // substitutes U+FFFD like V8's non-fatal path. Only utf-8 and latin1
@@ -8698,6 +10252,20 @@ fn reflect_get(it: &mut Interp, target: Value, key: &str) -> Result<Value, JsErr
         if matches!(it.heap.obj(id), Obj::Proxy { .. }) {
             return it.proxy_get(id, key, target);
         }
+        // Big64 canonical indices box here (get_prop can't: it lacks &mut).
+        if let Obj::Big64 { signed, elems, .. } = it.heap.obj(id) {
+            let signed = *signed;
+            if let Ok(i) = key.parse::<usize>() {
+                if let Some(bits) = elems.get(i).copied() {
+                    let (neg, mag) = if signed {
+                        bi_from_i64(bits as i64)
+                    } else {
+                        bi_from_u64(bits)
+                    };
+                    return bi_alloc(it, neg, mag);
+                }
+            }
+        }
     }
     let val = get_prop(&it.heap, &it.protos, target, key)?;
     it.invoke_getter(val, target, key)
@@ -8771,7 +10339,7 @@ fn n_reflect_get_proto(it: &mut Interp, _this: Value, args: &[Value]) -> Result<
 fn n_reflect_own_keys(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     // ownKeys trap is a documented gap: proxies report the target's keys.
     let mut keys = Vec::new();
-    for (k, _) in own_pairs(&it.heap, arg(args, 0)) {
+    for (k, _) in own_pairs(it, arg(args, 0)) {
         keys.push(Value::Str(it.heap.alloc_str(k)?));
     }
     Ok(Value::Obj(it.arr_obj(keys)?))
@@ -11580,6 +13148,323 @@ mod tests {
             "[object DataView]"
         );
         assert!(errmsg("new DataView(new ArrayBuffer(2)).getUint16(1)").contains("out of bounds"));
+    }
+
+    #[test]
+    fn bigint_construct() {
+        assert_eq!(disp("String(BigInt(42))"), "42");
+        assert_eq!(disp("String(BigInt(3.99))"), "3");
+        assert_eq!(disp("String(BigInt(-3.99))"), "-3");
+        assert_eq!(disp("String(BigInt(1.5))"), "1");
+        assert_eq!(disp("String(BigInt(true))"), "1");
+        assert_eq!(disp("String(BigInt(false))"), "0");
+        assert_eq!(disp("String(BigInt('123'))"), "123");
+        assert_eq!(disp("String(BigInt('  -42  '))"), "-42");
+        assert_eq!(disp("String(BigInt('0xff'))"), "255");
+        assert_eq!(disp("String(BigInt('0B101'))"), "5");
+        assert_eq!(disp("String(BigInt('0o17'))"), "15");
+        assert_eq!(disp("String(BigInt('-0x10'))"), "-16");
+        assert_eq!(disp("String(BigInt(''))"), "0");
+        assert_eq!(disp("String(BigInt())"), "0");
+        assert_eq!(disp("String(new BigInt(5))"), "5");
+        assert_eq!(disp("String(BigInt(BigInt(7)))"), "7");
+        // Exact past f64 (a double would print 1.2345678901234568e+29).
+        assert_eq!(
+            disp("String(BigInt('123456789012345678901234567890'))"),
+            "123456789012345678901234567890"
+        );
+        // Exact f64-integer decomposition (the double 1e30, not 10^30).
+        assert_eq!(disp("String(BigInt(1e30))"), "1000000000000000019884624838656");
+        assert!(errmsg("BigInt(NaN)").contains("Cannot convert NaN"));
+        assert!(errmsg("BigInt(Infinity)").contains("Infinity"));
+        assert!(errmsg("BigInt(-Infinity)").contains("Infinity"));
+        assert!(errmsg("BigInt('1.5')").contains("Cannot convert"));
+        assert!(errmsg("BigInt('abc')").contains("Cannot convert"));
+        assert!(errmsg("BigInt('10n')").contains("Cannot convert"));
+        assert!(errmsg("BigInt('0x')").contains("Cannot convert"));
+        assert!(errmsg("BigInt(undefined)").contains("undefined"));
+        assert!(errmsg("BigInt(null)").contains("null"));
+        assert!(errmsg("BigInt({})").contains("object"));
+    }
+
+    #[test]
+    fn bigint_arith() {
+        assert_eq!(disp("String(BigInt(10)+BigInt(3))"), "13");
+        assert_eq!(disp("String(BigInt(10)-BigInt(30))"), "-20");
+        assert_eq!(disp("String(BigInt(123456789)*BigInt(987654321))"), "121932631112635269");
+        assert_eq!(disp("String(BigInt(7)/BigInt(2))"), "3");
+        assert_eq!(disp("String(BigInt(-7)/BigInt(2))"), "-3");
+        assert_eq!(disp("String(BigInt(7)/BigInt(-2))"), "-3");
+        assert_eq!(disp("String(BigInt(-7)%BigInt(2))"), "-1");
+        assert_eq!(disp("String(BigInt(7)%BigInt(-2))"), "1");
+        assert_eq!(disp("String(BigInt(2)**BigInt(10))"), "1024");
+        assert_eq!(disp("String(BigInt(-2)**BigInt(3))"), "-8");
+        assert_eq!(disp("String(BigInt(-2)**BigInt(2))"), "4");
+        assert_eq!(disp("String(BigInt(0)**BigInt(0))"), "1");
+        assert_eq!(disp("String(BigInt(5)-BigInt(5))"), "0");
+        assert_eq!(disp("String(-BigInt(5))"), "-5");
+        assert_eq!(disp("String(-BigInt(-5))"), "5");
+        assert_eq!(disp("String(~BigInt(5))"), "-6");
+        assert_eq!(disp("String(~BigInt(-1))"), "0");
+        assert_eq!(disp("String(~BigInt(0))"), "-1");
+        assert!(errmsg("BigInt(1)/BigInt(0)").contains("Division by zero"));
+        assert!(errmsg("BigInt(1)%BigInt(0)").contains("Division by zero"));
+        assert!(errmsg("BigInt(2)**BigInt(-1)").contains("non-negative"));
+        assert!(errmsg("BigInt(1)+1").contains("mix"));
+        assert!(errmsg("1+BigInt(1)").contains("mix"));
+        assert!(errmsg("BigInt(2)*2").contains("mix"));
+        assert!(errmsg("BigInt(2)-'x'").contains("mix"));
+    }
+
+    #[test]
+    fn bigint_shifts_bits() {
+        assert_eq!(disp("String(BigInt(1)<<BigInt(8))"), "256");
+        assert_eq!(disp("String(BigInt(256)>>BigInt(4))"), "16");
+        assert_eq!(disp("String(-BigInt(8)>>BigInt(2))"), "-2");
+        assert_eq!(disp("String(-BigInt(7)>>BigInt(2))"), "-2");
+        assert_eq!(disp("String(BigInt(6)&BigInt(3))"), "2");
+        assert_eq!(disp("String(BigInt(6)|BigInt(3))"), "7");
+        assert_eq!(disp("String(BigInt(6)^BigInt(3))"), "5");
+        assert_eq!(disp("String(BigInt(-1)&BigInt(5))"), "5");
+        assert_eq!(disp("String(BigInt(-6)|BigInt(3))"), "-5");
+        assert_eq!(disp("String(BigInt(-6)^BigInt(-3))"), "7");
+        assert!(errmsg("BigInt(1)>>>BigInt(1)").contains("unsigned right shift"));
+        assert!(errmsg("BigInt(1)<<BigInt(-1)").contains("non-negative"));
+        assert!(errmsg("BigInt(1)<<1").contains("mix"));
+        assert!(errmsg("BigInt(1)&1").contains("mix"));
+    }
+
+    #[test]
+    fn bigint_compare() {
+        assert!(boolean("BigInt(1)<BigInt(2)"));
+        assert!(boolean("BigInt(2)<=BigInt(2)"));
+        assert!(boolean("BigInt(3)>BigInt(2)"));
+        assert!(!boolean("BigInt(2)>=BigInt(3)"));
+        assert!(boolean("BigInt(10)==10"));
+        assert!(!boolean("BigInt(10)===10"));
+        assert!(boolean("BigInt(10)!==10"));
+        assert!(boolean("BigInt(10)==BigInt(10)"));
+        assert!(boolean("BigInt(10)===BigInt(10)"));
+        assert!(boolean("BigInt(0)==-BigInt(0)"));
+        assert!(boolean("BigInt(10)=='10'"));
+        assert!(boolean("BigInt(10)=='0xa'"));
+        assert!(!boolean("BigInt(10)=='a'"));
+        assert!(!boolean("BigInt(5)==5.5"));
+        assert!(boolean("BigInt(5)<5.5"));
+        assert!(boolean("BigInt(5)>4.5"));
+        assert!(!boolean("BigInt(5)==NaN"));
+        assert!(!boolean("BigInt(5)<NaN"));
+        assert!(boolean("BigInt(5)<Infinity"));
+        assert!(boolean("BigInt(5)>-Infinity"));
+        assert!(!boolean("BigInt(5)==Infinity"));
+        assert!(boolean("BigInt(1)==true"));
+        assert!(boolean("BigInt(0)==false"));
+        assert!(!boolean("BigInt(2)==true"));
+        assert!(boolean("BigInt(1)<'2'"));
+        assert!(!boolean("BigInt(1)<'a'"));
+        assert!(!boolean("BigInt(1)==null"));
+        // Relational ops never throw on mixed pairs (only arithmetic does).
+        assert!(boolean("BigInt(5)<10"));
+        assert!(boolean("10>BigInt(5)"));
+    }
+
+    #[test]
+    fn bigint_statics() {
+        assert_eq!(disp("String(BigInt.asUintN(8, BigInt(256)))"), "0");
+        assert_eq!(disp("String(BigInt.asUintN(8, BigInt(-1)))"), "255");
+        assert_eq!(disp("String(BigInt.asUintN(8, BigInt(255)))"), "255");
+        assert_eq!(disp("String(BigInt.asUintN(8, 256))"), "0");
+        assert_eq!(disp("String(BigInt.asIntN(8, BigInt(255)))"), "-1");
+        assert_eq!(disp("String(BigInt.asIntN(8, BigInt(127)))"), "127");
+        assert_eq!(disp("String(BigInt.asIntN(8, BigInt(128)))"), "-128");
+        assert_eq!(disp("String(BigInt.asIntN(8, BigInt(-128)))"), "-128");
+        assert_eq!(disp("String(BigInt.asIntN(8, BigInt(-129)))"), "127");
+        assert_eq!(disp("String(BigInt.asUintN(0, BigInt(123)))"), "0");
+        assert_eq!(disp("String(BigInt.asIntN(0, BigInt(123)))"), "0");
+        assert_eq!(
+            disp("String(BigInt.asUintN(64, BigInt(-1)))"),
+            "18446744073709551615"
+        );
+        assert!(errmsg("BigInt.asUintN(-1, BigInt(1))").contains("bit count"));
+        assert!(errmsg("BigInt.asIntN(1.5, BigInt(1))").contains("bit count"));
+        // The second arg converts like BigInt() (fractionals truncate).
+        assert_eq!(disp("String(BigInt.asUintN(8, 1.5))"), "1");
+    }
+
+    #[test]
+    fn bigint_string_conv() {
+        assert_eq!(disp("BigInt(255).toString(16)"), "ff");
+        assert_eq!(disp("BigInt(10).toString(2)"), "1010");
+        assert_eq!(disp("BigInt(8).toString(8)"), "10");
+        assert_eq!(disp("BigInt(35).toString(36)"), "z");
+        assert_eq!(disp("BigInt(-10).toString(16)"), "-a");
+        assert_eq!(disp("BigInt(123).toString()"), "123");
+        assert!(errmsg("BigInt(1).toString(1)").contains("radix"));
+        assert!(errmsg("BigInt(1).toString(37)").contains("radix"));
+        assert_eq!(disp("String(BigInt(5).valueOf())"), "5");
+        assert_eq!(disp("String(BigInt(42))"), "42");
+        assert_eq!(num("Number(BigInt(42))"), 42.0);
+        assert_eq!(disp("typeof BigInt(1)"), "bigint");
+        assert_eq!(disp("BigInt(42)"), "42n");
+        assert_eq!(
+            disp("Object.prototype.toString.call(BigInt(1))"),
+            "[object BigInt]"
+        );
+        assert_eq!(disp("BigInt(0)?'t':'f'"), "f");
+        assert_eq!(disp("BigInt(1)?'t':'f'"), "t");
+        assert_eq!(disp("!BigInt(0)"), "true");
+        assert_eq!(disp("var x=BigInt(5);x++;String(x)"), "6");
+        assert_eq!(disp("var x=BigInt(5);++x;String(x)"), "6");
+        assert_eq!(disp("var x=BigInt(5);x--;String(x)"), "4");
+        assert_eq!(disp("var x=BigInt(5);x++"), "5n");
+        assert_eq!(disp("var m=new Map();m.set(BigInt(1),'a');m.set(BigInt(1),'b');m.get(BigInt(1))"), "b");
+        assert_eq!(disp("var m=new Map();m.set(BigInt(1),'a');m.set(1,'b');m.size"), "2");
+        assert_eq!(disp("var s=new Set();s.add(BigInt(1));s.add(BigInt(1));s.size"), "1");
+        assert_eq!(disp("[BigInt(1)].indexOf(BigInt(1))"), "0");
+        assert_eq!(disp("[BigInt(1),BigInt(2)].includes(BigInt(2))"), "true");
+        // Implicit string conversion throws; explicit String()/Number() work.
+        assert!(errmsg("'a'.concat(BigInt(1))").contains("string"));
+        assert!(errmsg("'a'+BigInt(1)").contains("mix"));
+        assert!(errmsg("BigInt(1)+'a'").contains("mix"));
+        assert!(errmsg("`x${BigInt(1)}`").contains("string"));
+        assert!(errmsg("JSON.stringify(BigInt(1))").contains("BigInt"));
+        assert!(errmsg("JSON.stringify([BigInt(1)])").contains("BigInt"));
+        assert!(errmsg("+BigInt(1)").contains("number"));
+    }
+
+    #[test]
+    fn bigint_arrays() {
+        assert_eq!(disp("new BigInt64Array(3).length"), "3");
+        assert_eq!(disp("new BigUint64Array(2).length"), "2");
+        assert_eq!(
+            disp("var a=new BigInt64Array(2);a[0]=BigInt(5);a[1]=BigInt(-3);String(a[0])+','+String(a[1])"),
+            "5,-3"
+        );
+        assert_eq!(
+            disp("var a=new BigInt64Array(1);a[0]=BigInt('18446744073709551616');String(a[0])"),
+            "0"
+        );
+        assert_eq!(
+            disp("var a=new BigInt64Array(1);a[0]=BigInt('18446744073709551615');String(a[0])"),
+            "-1"
+        );
+        assert_eq!(
+            disp("var a=new BigUint64Array(1);a[0]=BigInt(-1);String(a[0])"),
+            "18446744073709551615"
+        );
+        assert_eq!(disp("var a=new BigInt64Array(1);a[0]=5;String(a[0])"), "5");
+        assert_eq!(disp("var a=new BigInt64Array(3);a.fill(BigInt(7));String(a[1])"), "7");
+        assert_eq!(
+            disp("var a=new BigInt64Array(4);a.fill(BigInt(9),1,3);String(a[0])+String(a[1])+String(a[2])+String(a[3])"),
+            "0990"
+        );
+        assert_eq!(disp("BigInt64Array.BYTES_PER_ELEMENT"), "8");
+        assert_eq!(disp("BigUint64Array.BYTES_PER_ELEMENT"), "8");
+        assert_eq!(disp("new BigInt64Array(3).byteLength"), "24");
+        assert_eq!(disp("ArrayBuffer.isView(new BigInt64Array(1))"), "true");
+        assert_eq!(disp("ArrayBuffer.isView(new BigUint64Array(1))"), "true");
+        assert_eq!(
+            disp("Object.prototype.toString.call(new BigInt64Array(1))"),
+            "[object BigInt64Array]"
+        );
+        assert_eq!(
+            disp("Object.prototype.toString.call(new BigUint64Array(1))"),
+            "[object BigUint64Array]"
+        );
+        assert_eq!(
+            disp("var a=new BigInt64Array([BigInt(1),BigInt(2)]);a.length+','+String(a[1])"),
+            "2,2"
+        );
+        assert_eq!(disp("new BigInt64Array(new ArrayBuffer(16)).length"), "2");
+        assert_eq!(disp("new BigInt64Array(BigInt(3)).length"), "3");
+        assert!(errmsg("new BigInt64Array(new ArrayBuffer(8),1)").contains("misaligned"));
+        assert!(errmsg("new BigInt64Array(new ArrayBuffer(7))").contains("mismatch"));
+        assert_eq!(
+            disp("var s='';for(var x of new BigInt64Array([BigInt(1),BigInt(2)])){s+=String(x)};s"),
+            "12"
+        );
+        assert_eq!(disp("Object.keys(new BigInt64Array(2)).join()"), "0,1");
+        assert_eq!(
+            disp("var a=new BigInt64Array(2);(0 in a)+'|'+(9 in a)+'|'+('length' in a)"),
+            "true|false|true"
+        );
+        assert_eq!(disp("var a=new BigInt64Array(1);a.hasOwnProperty('0')"), "true");
+        assert_eq!(disp("var a=new BigInt64Array([BigInt(4)]);a[0]===a[0]"), "true");
+        assert_eq!(disp("var a=new BigInt64Array(1);delete a[0]"), "false");
+        assert_eq!(disp("var a=new BigInt64Array(1);delete a[0];String(a[0])"), "0");
+        assert_eq!(disp("var a=new BigInt64Array(1);a[5]=BigInt(9);a.length"), "1");
+        assert_eq!(
+            disp("var a=[...new BigInt64Array([BigInt(3)])];String(a[0])"),
+            "3"
+        );
+        assert_eq!(
+            disp("var a=Array.from(new BigUint64Array([BigInt(6)]));String(a[0])"),
+            "6"
+        );
+        assert_eq!(disp("new BigInt64Array([BigInt(1),BigInt(-2)])"), "[1n, -2n]");
+        assert!(errmsg("JSON.stringify(new BigInt64Array(1))").contains("BigInt"));
+        assert_eq!(disp("new BigInt64Array(1) instanceof BigInt64Array"), "true");
+        assert_eq!(disp("BigInt(1) instanceof BigInt"), "false");
+        assert_eq!(disp("typeof BigInt64Array"), "function");
+        assert_eq!(disp("var o={...new BigInt64Array([BigInt(8)])};String(o[0])"), "8");
+        assert_eq!(disp("var s='';for(var k in new BigInt64Array([BigInt(9)])){s+=k};s"), "0");
+        assert_eq!(disp("var o={'0':'x'};BigInt(0) in o"), "true");
+        assert_eq!(
+            disp("var b=new BigInt64Array([BigInt(1)]);var d=new DataView(b);String(d.getBigUint64(0,true))"),
+            "1"
+        );
+    }
+
+    #[test]
+    fn dataview_bigint() {
+        assert_eq!(
+            disp("var d=new DataView(new ArrayBuffer(16));d.setBigInt64(0,BigInt('1234567890123456789'));String(d.getBigInt64(0))"),
+            "1234567890123456789"
+        );
+        assert_eq!(
+            disp("var d=new DataView(new ArrayBuffer(16));d.setBigInt64(0,BigInt('1234567890123456789'),true);String(d.getBigInt64(0,true))"),
+            "1234567890123456789"
+        );
+        // Default is big-endian: an LE read of a BE-stored 1n is 2^56.
+        assert_eq!(
+            disp("var d=new DataView(new ArrayBuffer(8));d.setBigUint64(0,BigInt(1));String(d.getBigUint64(0,true))"),
+            "72057594037927936"
+        );
+        assert_eq!(
+            disp("var d=new DataView(new ArrayBuffer(8));d.setBigUint64(0,BigInt('18446744073709551615'));String(d.getBigUint64(0))"),
+            "18446744073709551615"
+        );
+        assert_eq!(
+            disp("var d=new DataView(new ArrayBuffer(8));d.setBigInt64(0,BigInt(-2));String(d.getBigInt64(0))"),
+            "-2"
+        );
+        assert_eq!(
+            disp("var d=new DataView(new ArrayBuffer(8));d.setBigUint64(0,BigInt('18446744073709551616'));String(d.getBigUint64(0))"),
+            "0"
+        );
+        assert_eq!(
+            disp("var d=new DataView(new ArrayBuffer(8));d.setBigInt64(0,BigInt(1))"),
+            "undefined"
+        );
+        assert!(errmsg("new DataView(new ArrayBuffer(8)).getBigInt64(1)").contains("out of bounds"));
+        assert!(errmsg("new DataView(new ArrayBuffer(8)).setBigUint64(1,BigInt(1))").contains("out of bounds"));
+    }
+
+    #[test]
+    fn bigint_loader_shape() {
+        // The Google Maps loader shape: presence checks, wrapping helpers,
+        // bigint loop counters, and switch dispatch on bigint tags.
+        assert!(boolean(
+            "typeof BigInt==='function'&&typeof BigInt64Array==='function'\
+             &&typeof BigUint64Array==='function'&&typeof BigInt.asUintN==='function'\
+             &&typeof BigInt.asIntN==='function'"
+        ));
+        assert_eq!(disp("String(BigInt.asUintN(32, BigInt('4294967296')))"), "0");
+        assert_eq!(disp("var c=0;for(var i=BigInt(0);i<BigInt(3);i++){c++}c"), "3");
+        assert_eq!(
+            disp("var x=BigInt(2);switch(x){case BigInt(1):'a';break;case BigInt(2):'b';break;default:'c'}"),
+            "b"
+        );
     }
 
     #[test]

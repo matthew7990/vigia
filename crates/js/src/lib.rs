@@ -600,6 +600,8 @@ pub struct Interp {
     /// style/link node -> CSSStyleSheet facade (ownerNode/cssRules/
     /// insertRule), so `el.sheet === el.sheet`. Cleared by set_dom.
     pub(crate) sheets: HashMap<NodeId, u32>,
+    /// classList facades per element (cached for === identity).
+    pub(crate) token_lists: HashMap<NodeId, u32>,
     /// node -> (event type, handler) listeners. JS values, so they live
     /// here rather than on DOM nodes. Cleared by set_dom.
     pub(crate) listeners: HashMap<NodeId, Vec<(String, Value)>>,
@@ -716,6 +718,7 @@ impl Interp {
             dom_objs: HashMap::new(),
             cur_script: None,
             sheets: HashMap::new(),
+            token_lists: HashMap::new(),
             listeners: HashMap::new(),
             net: None,
             pending_nav: None,

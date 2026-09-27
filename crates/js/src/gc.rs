@@ -396,6 +396,9 @@ impl Interp {
         for &o in self.sheets.values() {
             m.ow.push(o);
         }
+        for &o in self.token_lists.values() {
+            m.ow.push(o);
+        }
         for &s in self.heap.intern.values() {
             m.sw.push(s);
         }

@@ -674,6 +674,54 @@ impl Interp {
         Ok(Value::Obj(o))
     }
 
+    /// DOMTokenList facade for an element's class attr (cached for ===).
+    /// Methods carry the node id and mutate live; length/value are
+    /// accessors over the same attribute.
+    fn class_list_for(&mut self, n: NodeId) -> Result<Value, JsError> {
+        if let Some(&o) = self.token_lists.get(&n) {
+            return Ok(Value::Obj(o));
+        }
+        let mut pairs = vec![("__node".into(), Value::Num(n as f64))];
+        for (nm, f) in [
+            ("add", n_tokens_add as NativeFn),
+            ("remove", n_tokens_remove),
+            ("toggle", n_tokens_toggle),
+            ("contains", n_tokens_contains),
+            ("item", n_tokens_item),
+            ("replace", n_tokens_replace),
+        ] {
+            let m = self.heap.alloc_obj(nat(nm, f))?;
+            let _ = set_prop(&mut self.heap, Value::Obj(m), "__node", Value::Num(n as f64));
+            pairs.push((nm.into(), Value::Obj(m)));
+        }
+        let proto = po(self.protos.object);
+        for (nm, get, set) in [
+            ("length", n_tokens_len as NativeFn, None),
+            ("value", n_tokens_value_get, Some(n_tokens_value_set)),
+        ] {
+            let g = self.heap.alloc_obj(nat(nm, get))?;
+            let _ = set_prop(&mut self.heap, Value::Obj(g), "__node", Value::Num(n as f64));
+            let s = match set {
+                Some(f) => {
+                    let s = self.heap.alloc_obj(nat(nm, f))?;
+                    let _ = set_prop(
+                        &mut self.heap,
+                        Value::Obj(s),
+                        "__node",
+                        Value::Num(n as f64),
+                    );
+                    Some(s)
+                }
+                None => None,
+            };
+            let acc = self.heap.alloc_obj(Obj::Accessor { get: Some(g), set: s, proto })?;
+            pairs.push((nm.into(), Value::Obj(acc)));
+        }
+        let o = self.obj_pairs(pairs)?;
+        self.token_lists.insert(n, o);
+        Ok(Value::Obj(o))
+    }
+
     /// CSSStyleSheet facade for a <style>/<link> node (cached for ===).
     /// Rules are {cssText} stubs - no cascade runs on them here; enough
     /// for emotion-style insertRule loops (ownerNode match + length).
@@ -1496,6 +1544,7 @@ impl Interp {
                     let s = self.heap.alloc_obj(Obj::Style { node: id })?;
                     Ok(Value::Obj(s))
                 }
+                "classList" => self.class_list_for(id),
                 "checked" => Ok(Value::Bool(self.dom_ref()?.attr(id, "checked").is_some())),
                 "disabled" => Ok(Value::Bool(self.dom_ref()?.attr(id, "disabled").is_some())),
                 "sheet" => match self.dom_ref()?.tag_name(id) {
@@ -1988,6 +2037,63 @@ impl Interp {
                 };
                 self.node_arr(ids)
             }
+            "contains" => {
+                // Node.contains: self or a descendant (non-nodes: false).
+                let hit = match self.as_node(arg(0)) {
+                    Some(o) => id == o || is_desc(self.dom_ref()?, id, o),
+                    None => false,
+                };
+                Ok(Value::Bool(hit))
+            }
+            "matches" => {
+                if !matches!(self.dom_ref()?.node(id).data, NodeData::Element(_)) {
+                    return Err(err("matches is not a function"));
+                }
+                let sel = to_str(&self.heap, arg(0));
+                let dom = self.dom_ref()?;
+                let hits = vigia_css::query(dom, &sel).map_err(|e| err(e.to_string()))?;
+                Ok(Value::Bool(hits.contains(&id)))
+            }
+            "closest" => {
+                if !matches!(self.dom_ref()?.node(id).data, NodeData::Element(_)) {
+                    return Err(err("closest is not a function"));
+                }
+                let sel = to_str(&self.heap, arg(0));
+                let dom = self.dom_ref()?;
+                let hits = vigia_css::query(dom, &sel).map_err(|e| err(e.to_string()))?;
+                let mut cur = Some(id);
+                let mut found = None;
+                while let Some(c) = cur {
+                    if matches!(self.dom_ref()?.node(c).data, NodeData::Element(_))
+                        && hits.contains(&c)
+                    {
+                        found = Some(c);
+                        break;
+                    }
+                    cur = self.dom_ref()?.parent(c);
+                }
+                self.opt_node(found)
+            }
+            "getBoundingClientRect" => {
+                if !matches!(self.dom_ref()?.node(id).data, NodeData::Element(_)) {
+                    return Err(err("getBoundingClientRect is not a function"));
+                }
+                // No layout engine: zero geometry (honest, documented).
+                Ok(Value::Obj(zero_rect(self)?))
+            }
+            "getClientRects" => {
+                if !matches!(self.dom_ref()?.node(id).data, NodeData::Element(_)) {
+                    return Err(err("getClientRects is not a function"));
+                }
+                // Attached elements read as one (zero) rect, detached as
+                // none - the V8 shape without a layout engine.
+                if is_desc(self.dom_ref()?, 0, id) {
+                    let r = Value::Obj(zero_rect(self)?);
+                    Ok(Value::Obj(self.arr_obj(vec![r])?))
+                } else {
+                    Ok(Value::Obj(self.arr_obj(Vec::new())?))
+                }
+            }
             _ => match self.dom_proto_call(id, name, &args)? {
                 Some(v) => Ok(v),
                 None => Err(err(format!("{name} is not a function"))),
@@ -2305,6 +2411,144 @@ fn n_style_remove_prop(it: &mut Interp, _this: Value, args: &[Value]) -> Result<
         Value::Undef => Ok(Value::Str(it.heap.alloc_str(String::new())?)),
         v => Ok(v),
     }
+}
+
+// ---- classList (DOMTokenList) --------------------------------------------
+
+/// Live token list of the class attribute (whitespace-split).
+fn tokens_read(it: &Interp, n: NodeId) -> Vec<String> {
+    it.dom_ref()
+        .map(|d| {
+            d.attr(n, "class")
+                .unwrap_or("")
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tokens_node(it: &Interp) -> Result<NodeId, JsError> {
+    match style_native_node(it) {
+        Some(n) => Ok(n),
+        None => Err(err("classList method needs a classList")),
+    }
+}
+
+/// Zero DOMRect: no layout engine, so geometry is all zeros.
+fn zero_rect(it: &mut Interp) -> Result<u32, JsError> {
+    it.obj_pairs(vec![
+        ("x".into(), Value::Num(0.0)),
+        ("y".into(), Value::Num(0.0)),
+        ("width".into(), Value::Num(0.0)),
+        ("height".into(), Value::Num(0.0)),
+        ("top".into(), Value::Num(0.0)),
+        ("left".into(), Value::Num(0.0)),
+        ("bottom".into(), Value::Num(0.0)),
+        ("right".into(), Value::Num(0.0)),
+    ])
+}
+
+fn n_tokens_add(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = tokens_node(it)?;
+    let mut toks = tokens_read(it, n);
+    for a in args {
+        let t = to_str(&it.heap, *a);
+        if t.is_empty() || t.split_whitespace().count() != 1 {
+            return Err(err("classList.add: invalid token"));
+        }
+        if !toks.iter().any(|x| x == &t) {
+            toks.push(t);
+        }
+    }
+    it.dom_mut()?.set_attr(n, "class", &toks.join(" "));
+    Ok(Value::Undef)
+}
+
+fn n_tokens_remove(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = tokens_node(it)?;
+    let mut toks = tokens_read(it, n);
+    for a in args {
+        let t = to_str(&it.heap, *a);
+        if t.is_empty() || t.split_whitespace().count() != 1 {
+            return Err(err("classList.remove: invalid token"));
+        }
+        toks.retain(|x| x != &t);
+    }
+    it.dom_mut()?.set_attr(n, "class", &toks.join(" "));
+    Ok(Value::Undef)
+}
+
+fn n_tokens_toggle(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = tokens_node(it)?;
+    let t = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    if t.is_empty() || t.split_whitespace().count() != 1 {
+        return Err(err("classList.toggle: invalid token"));
+    }
+    let mut toks = tokens_read(it, n);
+    let has = toks.iter().any(|x| x == &t);
+    let force = args.get(1).copied();
+    let want = match force {
+        Some(v) if !matches!(v, Value::Undef) => truthy(&it.heap, v),
+        _ => !has,
+    };
+    if want && !has {
+        toks.push(t);
+    } else if !want {
+        toks.retain(|x| x != &t);
+    }
+    it.dom_mut()?.set_attr(n, "class", &toks.join(" "));
+    Ok(Value::Bool(want))
+}
+
+fn n_tokens_contains(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = tokens_node(it)?;
+    let t = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    Ok(Value::Bool(tokens_read(it, n).iter().any(|x| x == &t)))
+}
+
+fn n_tokens_item(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = tokens_node(it)?;
+    let i = to_num(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    let toks = tokens_read(it, n);
+    if i.is_nan() || i < 0.0 || i as usize >= toks.len() {
+        return Ok(Value::Null);
+    }
+    it.str_val(toks[i as usize].clone())
+}
+
+fn n_tokens_replace(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = tokens_node(it)?;
+    let old = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    let new = to_str(&it.heap, args.get(1).copied().unwrap_or(Value::Undef));
+    let mut toks = tokens_read(it, n);
+    let hit = toks.iter().position(|x| x == &old);
+    match hit {
+        Some(i) => {
+            toks[i] = new;
+            it.dom_mut()?.set_attr(n, "class", &toks.join(" "));
+            Ok(Value::Bool(true))
+        }
+        None => Ok(Value::Bool(false)),
+    }
+}
+
+fn n_tokens_len(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let n = tokens_node(it)?;
+    Ok(Value::Num(tokens_read(it, n).len() as f64))
+}
+
+fn n_tokens_value_get(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let n = tokens_node(it)?;
+    let c = it.dom_ref()?.attr(n, "class").unwrap_or("").to_string();
+    it.str_val(c)
+}
+
+fn n_tokens_value_set(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = tokens_node(it)?;
+    let v = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    it.dom_mut()?.set_attr(n, "class", v.trim());
+    Ok(Value::Undef)
 }
 
 /// sheet.insertRule(rule, index=0): store a {cssText} stub, return index.
@@ -2878,6 +3122,47 @@ mod tests {
             ev(&mut it, "var d=document.createElement('div');d.style.backgroundColor='blue';d.style.getPropertyValue('background-color')"),
             "blue"
         );
+    }
+
+    #[test]
+    fn traversal_and_tokens() {
+        let mut it = interp(
+            "<html><body><div id=a class='x y'><p id=b>hi</p></div></body></html>",
+        );
+        // classList live on the class attribute.
+        assert_eq!(ev(&mut it, "var d=document.getElementById('a');d.classList.length"), "2");
+        assert_eq!(ev(&mut it, "var d=document.getElementById('a');d.classList.contains('x')"), "true");
+        assert_eq!(
+            ev(&mut it, "var d=document.getElementById('a');d.classList.add('z');d.className"),
+            "x y z"
+        );
+        assert_eq!(
+            ev(&mut it, "var d=document.getElementById('a');d.classList.remove('x');d.classList.value"),
+            "y z"
+        );
+        assert_eq!(ev(&mut it, "var d=document.getElementById('a');d.classList.toggle('y')"), "false");
+        assert_eq!(ev(&mut it, "var d=document.getElementById('a');d.classList === d.classList"), "true");
+        assert_eq!(ev(&mut it, "var d=document.getElementById('a');d.classList.item(0)"), "z");
+        // contains / matches / closest.
+        assert_eq!(
+            ev(&mut it, "var a=document.getElementById('a');var b=document.getElementById('b');a.contains(b)"),
+            "true"
+        );
+        assert_eq!(
+            ev(&mut it, "var b=document.getElementById('b');b.contains(b)"),
+            "true"
+        );
+        assert_eq!(ev(&mut it, "var b=document.getElementById('b');b.matches('p')"), "true");
+        assert_eq!(ev(&mut it, "var b=document.getElementById('b');b.matches('div')"), "false");
+        assert_eq!(
+            ev(&mut it, "var b=document.getElementById('b');b.closest('div').id"),
+            "a"
+        );
+        assert_eq!(ev(&mut it, "var b=document.getElementById('b');b.closest('.nope')"), "null");
+        // Geometry without a layout engine: zero rect, attached reads one.
+        assert_eq!(ev(&mut it, "var b=document.getElementById('b');b.getBoundingClientRect().width"), "0");
+        assert_eq!(ev(&mut it, "var b=document.getElementById('b');b.getClientRects().length"), "1");
+        assert_eq!(ev(&mut it, "var d=document.createElement('div');d.getClientRects().length"), "0");
     }
 
     #[test]

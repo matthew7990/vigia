@@ -1535,6 +1535,7 @@ impl Interp {
                     "removeChild",
                     "remove",
                     "cloneNode",
+                    "contains",
                     "addEventListener",
                     "removeEventListener",
                     "dispatchEvent",
@@ -1551,6 +1552,10 @@ impl Interp {
                     "querySelectorAll",
                     "getElementsByTagName",
                     "getElementsByClassName",
+                    "closest",
+                    "matches",
+                    "getBoundingClientRect",
+                    "getClientRects",
                 ][..],
             ),
             (

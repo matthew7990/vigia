@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use vigia_json::Json;
 
-use crate::ast::{Expr, FnDef, Stmt};
+use crate::ast::{Expr, FnDef, OptOp, Stmt};
 use crate::{
     err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
     Protos, ThenHandler, Timer, Value,
@@ -765,6 +765,9 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::For(init, test, upd, body) => self.stmt_for(env, init, test, upd, body),
+            Stmt::ForOf { name, is_decl, iter, body } => {
+                self.stmt_for_of(env, name, *is_decl, iter, body)
+            }
             Stmt::Block(ss) => self.exec_scoped(env, ss),
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
@@ -891,6 +894,64 @@ impl Interp {
         Ok(Flow::Normal)
     }
 
+    /// Strict for-of over arrays and strings. Objects and other iterables
+    /// report `not iterable` instead of silently producing nothing.
+    fn stmt_for_of(
+        &mut self,
+        env: u32,
+        name: &str,
+        is_decl: bool,
+        iter: &Expr,
+        body: &Stmt,
+    ) -> Result<Flow, JsError> {
+        let v = self.expr(env, iter)?;
+        let items: Vec<Value> = match v {
+            Value::Obj(id) => match self.heap.obj(id) {
+                Obj::Arr { items, .. } => items.clone(),
+                _ => return Err(err("for-of only over arrays and strings")),
+            },
+            Value::Str(id) => {
+                let s = self.heap.get_str(id).to_string();
+                let mut out = Vec::new();
+                for ch in s.chars() {
+                    out.push(Value::Str(self.heap.alloc_str(ch.to_string())?));
+                }
+                out
+            }
+            _ => return Err(err("for-of only over arrays and strings")),
+        };
+        let fenv = self.new_env(env)?;
+        self.env_stack.push(fenv);
+        let r = self.stmt_for_of_loop(fenv, name, is_decl, &items, body);
+        self.env_stack.pop();
+        r
+    }
+
+    fn stmt_for_of_loop(
+        &mut self,
+        fenv: u32,
+        name: &str,
+        is_decl: bool,
+        items: &[Value],
+        body: &Stmt,
+    ) -> Result<Flow, JsError> {
+        for &item in items {
+            self.tick()?;
+            self.maybe_gc();
+            if is_decl {
+                self.env_declare(fenv, name, item);
+            } else if !self.env_set(fenv, name, item) {
+                self.env_declare(0, name, item);
+            }
+            match self.stmt(fenv, body)? {
+                Flow::Normal | Flow::Continue => {}
+                Flow::Break => break,
+                f => return Ok(f),
+            }
+        }
+        Ok(Flow::Normal)
+    }
+
     fn expr(&mut self, env: u32, e: &Expr) -> Result<Value, JsError> {
         match e {
             Expr::Num(n) => Ok(Value::Num(*n)),
@@ -939,6 +1000,7 @@ impl Interp {
                     None => get_prop(&self.heap, &self.protos, v, name),
                 }
             }
+            Expr::OptChain(b, ops) => self.opt_chain(env, b, ops),
             Expr::Index(o, ix) => {
                 let v = self.expr(env, o)?;
                 let k = self.expr(env, ix)?;
@@ -953,6 +1015,13 @@ impl Interp {
             Expr::Func(def) => Ok(Value::Obj(self.func_obj(def.clone(), env)?)),
             Expr::New(c, args) => {
                 let f = self.expr(env, c)?;
+                if let Value::Obj(id) = f {
+                    if let Obj::Func { def, .. } = self.heap.obj(id) {
+                        if def.is_arrow {
+                            return Err(err("arrow is not a constructor"));
+                        }
+                    }
+                }
                 let args = self.eval_args(env, args)?;
                 // proto = callee.prototype when it's an object (JS); natives
                 // may ignore `this` and return their own object anyway.
@@ -1046,6 +1115,13 @@ impl Interp {
                     return Ok(lv);
                 }
                 self.expr(env, r)
+            }
+            "??" => {
+                let lv = self.expr(env, l)?;
+                if matches!(lv, Value::Null | Value::Undef) {
+                    return self.expr(env, r);
+                }
+                Ok(lv)
             }
             _ => {
                 let lv = self.expr(env, l)?;
@@ -1244,6 +1320,97 @@ impl Interp {
         self.call_value(f, this, &args, hint)
     }
 
+    fn opt_chain(&mut self, env: u32, base: &Expr, ops: &[OptOp]) -> Result<Value, JsError> {
+        let mut cur = self.expr(env, base)?;
+        let mut parent = Value::Undef;
+        let mut method: Option<String> = None;
+        let mut short = false;
+        for op in ops {
+            if short {
+                return Ok(Value::Undef);
+            }
+            match op {
+                OptOp::Member(name, opt) => {
+                    if matches!(cur, Value::Null | Value::Undef) {
+                        if *opt {
+                            short = true;
+                            cur = Value::Undef;
+                            parent = Value::Undef;
+                            method = None;
+                            continue;
+                        }
+                        return Err(err(format!(
+                            "cannot read '{}' of {}",
+                            name,
+                            if matches!(cur, Value::Null) {
+                                "null"
+                            } else {
+                                "undefined"
+                            }
+                        )));
+                    }
+                    parent = cur;
+                    method = Some(name.clone());
+                    cur = match self.as_node(cur) {
+                        Some(n) => self.dom_get(n, name)?,
+                        None => get_prop(&self.heap, &self.protos, cur, name)?,
+                    };
+                }
+                OptOp::Index(key, opt) => {
+                    if matches!(cur, Value::Null | Value::Undef) {
+                        if *opt {
+                            short = true;
+                            cur = Value::Undef;
+                            parent = Value::Undef;
+                            method = None;
+                            continue;
+                        }
+                        return Err(err("cannot index into null/undefined"));
+                    }
+                    let k = self.expr(env, key)?;
+                    let recv = cur;
+                    parent = recv;
+                    method = match k {
+                        Value::Str(s) => Some(self.heap.get_str(s).to_string()),
+                        _ => None,
+                    };
+                    cur = match self.as_node(recv) {
+                        Some(n) => {
+                            let kk = to_str(&self.heap, k);
+                            self.dom_get(n, &kk)?
+                        }
+                        None => get_index(&mut self.heap, &self.protos, recv, k)?,
+                    };
+                }
+                OptOp::Call(arg_es, opt) => {
+                    if matches!(cur, Value::Null | Value::Undef) {
+                        if *opt {
+                            return Ok(Value::Undef);
+                        }
+                        return Err(err("is not a function"));
+                    }
+                    if let Some(n) = self.as_node(parent) {
+                        if let Some(m) = method.take() {
+                            cur = self.call_dom(n, &m, env, arg_es)?;
+                            parent = Value::Undef;
+                            continue;
+                        }
+                    }
+                    let args = self.eval_args(env, arg_es)?;
+                    let this = parent;
+                    parent = Value::Undef;
+                    method = None;
+                    cur = self.call_value(cur, this, &args, None)?;
+                }
+            }
+        }
+        if short {
+            Ok(Value::Undef)
+        } else {
+            Ok(cur)
+        }
+    }
+
     pub(crate) fn call_value(
         &mut self,
         f: Value,
@@ -1304,7 +1471,13 @@ impl Interp {
                     // named fn exprs can self-recurse via their own name
                     self.env_declare(cenv, n, f);
                 }
-                self.env_declare(cenv, "this", this);
+                // Arrows capture `this` lexically from the defining env.
+                let this_val = if def.is_arrow {
+                    self.env_get(fenv, "this").unwrap_or(Value::Undef)
+                } else {
+                    this
+                };
+                self.env_declare(cenv, "this", this_val);
                 // `await` binds to the nearest enclosing fn, so the flag
                 // is shadowed per call rather than accumulated.
                 let prev_async = self.fn_async;
@@ -3472,6 +3645,40 @@ mod tests {
 
     fn errmsg(src: &str) -> String {
         ev(src).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn for_of_arrays_strings() {
+        assert_eq!(num("var t=0;for(var x of [1,2,3])t+=x;t"), 6.0);
+        assert_eq!(disp("var s='';for(let c of 'ab')s+=c;s"), "ab");
+        assert!(errmsg("for(var x of {})x").contains("only over arrays"));
+        assert!(errmsg("for(var x in {})x").contains("for-in"));
+    }
+
+    #[test]
+    fn arrows() {
+        assert_eq!(num("(x=>x*2)(21)"), 42.0);
+        assert_eq!(num("((a,b)=>a+b)(2,3)"), 5.0);
+        assert_eq!(disp("var o={x:9,m:function(){var h=()=>this.x;return h()}};o.m()"), "9");
+        assert_eq!(out("var f=()=>1;console.log(f())"), "1\n");
+        assert!(errmsg("var f=()=>1;new f()").contains("not a constructor"));
+    }
+
+    #[test]
+    fn optional_chain_nullish() {
+        assert_eq!(disp("var a=null;a?.b"), "undefined");
+        assert_eq!(disp("var a=null;a?.b.c ?? 'short'"), "short");
+        assert_eq!(disp("var o={b:{c:42}};o?.b?.c"), "42");
+        assert_eq!(disp("var o={b:{c:42}};o?.missing?.deep ?? 'fb'"), "fb");
+        assert_eq!(disp("0 ?? 99"), "0");
+        assert_eq!(disp("'' ?? 'fb'"), "");
+        assert_eq!(disp("null ?? 'd'"), "d");
+        assert_eq!(disp("undefined ?? 'd'"), "d");
+        assert_eq!(disp("false ?? 'd'"), "false");
+        assert_eq!(out("var g={x:7,h:function(){return this.x}};console.log(g.h?.())"), "7\n");
+        assert_eq!(out("var g={x:7,h:function(){return this.x}};console.log(g?.h?.())"), "7\n");
+        assert!(errmsg("var o={b:null};o.b.c").contains("cannot read"));
+        assert!(errmsg("null.x").contains("cannot read"));
     }
 
     #[test]

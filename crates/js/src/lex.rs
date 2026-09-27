@@ -52,6 +52,8 @@ const KWS: &[&str] = &[
 ];
 
 /// Longest first: prefix order decides `>>>=` vs `>>>` vs `>>` vs `>`.
+/// `?.` and `??` are lexed manually (digit guard for `?.`) and emitted as
+/// `P("?.")` / `P("??")`.
 const PUNCTS: &[&str] = &[
     ">>>=", "===", "!==", ">>>", "<<=", ">>=", "=>", "==", "!=", "<=", ">=", "++", "--", "+=",
     "-=", "*=", "/=", "%=", "&&", "||", "<<", ">>", "&=", "|=", "^=", "=", "<", ">", "+", "-", "*",
@@ -102,6 +104,20 @@ pub fn lex(src: &str) -> Result<Vec<Token>, JsError> {
             b'.' if b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => num(b, &mut i)?,
             b'"' | b'\'' => string(b, &mut i)?,
             c if is_ident_start(c) => word(src, b, &mut i),
+            b'?' if b.get(i + 1) == Some(&b'?') => {
+                i += 2;
+                Tok::P("??")
+            }
+            b'?' if b.get(i + 1) == Some(&b'.') => {
+                // `a?.3:0` is a ternary, not an optional chain.
+                if b.get(i + 2).is_some_and(|c| c.is_ascii_digit()) {
+                    i += 1;
+                    Tok::P("?")
+                } else {
+                    i += 2;
+                    Tok::P("?.")
+                }
+            }
             _ => {
                 let hit = PUNCTS.iter().find(|p| src[i..].starts_with(**p));
                 match hit {

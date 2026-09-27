@@ -23,8 +23,19 @@ pub enum Expr {
     Call(Box<Expr>, Vec<Expr>),
     Member(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
+    /// Optional chain: base + steps. Each step carries its own `?.` flag.
+    /// `a?.b.c(d)` is Chain(a, [Member(b,true), Member(c,false), Call(d,false)]).
+    OptChain(Box<Expr>, Vec<OptOp>),
     Func(Rc<FnDef>),
     New(Box<Expr>, Vec<Expr>),
+}
+
+/// One step of an optional chain. The bool marks a `?.` step.
+#[derive(Debug)]
+pub enum OptOp {
+    Member(String, bool),
+    Index(Expr, bool),
+    Call(Vec<Expr>, bool),
 }
 
 #[derive(Debug)]
@@ -34,6 +45,9 @@ pub struct FnDef {
     pub body: Vec<Stmt>,
     /// `async function`: call wraps the result in a Promise; enables `await`.
     pub is_async: bool,
+    /// Arrow: lexical `this`, no `new`, no own `prototype` (prototype kept
+    /// as harmless stub for now).
+    pub is_arrow: bool,
 }
 
 #[derive(Debug)]
@@ -47,6 +61,9 @@ pub enum Stmt {
     While(Expr, Box<Stmt>),
     /// for(init; test; update) body
     For(Option<Box<Stmt>>, Option<Expr>, Option<Expr>, Box<Stmt>),
+    /// Strict `for-of` over arrays and strings only:
+    /// `for (var|let|const x of iter) body` (decl) or `for (x of iter) body`.
+    ForOf { name: String, is_decl: bool, iter: Expr, body: Box<Stmt> },
     Block(Vec<Stmt>),
     Break,
     Continue,

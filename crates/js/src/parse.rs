@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use crate::ast::{Expr, FnDef, Stmt};
+use crate::ast::{Expr, FnDef, OptOp, Stmt};
 use crate::eval::fmt_num;
 use crate::lex::{lex, Tok, Token};
 use crate::{err, JsError};
@@ -40,6 +40,30 @@ struct P {
 }
 
 type R<T> = Result<T, JsError>;
+
+/// Flatten `a.b[k](x)` into `a` + non-optional steps so an optional chain
+/// keeps the receiver for `this`. `a.b?.()` becomes Chain(a, [Member(b),
+/// Call?.]) instead of Chain(Member(a,b), [Call?.]).
+fn split_chain(e: Expr) -> (Expr, Vec<OptOp>) {
+    match e {
+        Expr::Member(o, n) => {
+            let (b, mut ops) = split_chain(*o);
+            ops.push(OptOp::Member(n, false));
+            (b, ops)
+        }
+        Expr::Index(o, k) => {
+            let (b, mut ops) = split_chain(*o);
+            ops.push(OptOp::Index(*k, false));
+            (b, ops)
+        }
+        Expr::Call(c, a) => {
+            let (b, mut ops) = split_chain(*c);
+            ops.push(OptOp::Call(a, false));
+            (b, ops)
+        }
+        other => (other, Vec::new()),
+    }
+}
 
 impl P {
     fn peek(&self) -> &Tok {
@@ -339,12 +363,152 @@ impl P {
             params,
             body: body?,
             is_async,
+            is_arrow: false,
+        }))
+    }
+
+    /// `x => e`, `(a,b) => e`, `(a) => { stmts }`, plus `async` variants.
+    /// Returns None without consuming when the head is not an arrow.
+    fn try_arrow(&mut self) -> R<Option<Expr>> {
+        let save = self.i;
+        let save_fn = self.in_fn;
+        let is_async = if matches!(self.peek(), Tok::Kw("async")) {
+            // `async function` is not an arrow.
+            if matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(Tok::Kw("function"))) {
+                return Ok(None);
+            }
+            self.i += 1;
+            // `async` newline `x =>` still counts; `async` alone does not.
+            if matches!(self.peek(), Tok::Eof) {
+                self.i = save;
+                return Ok(None);
+            }
+            true
+        } else {
+            false
+        };
+        let params = if matches!(self.peek(), Tok::Ident(_)) {
+            let n = self.ident()?;
+            // `x =>` only: `x + 1` must fall back to normal assign.
+            if !self.at_p("=>") {
+                self.i = save;
+                return Ok(None);
+            }
+            vec![n]
+        } else if self.at_p("(") {
+            self.i += 1;
+            let mut ps = Vec::new();
+            if !self.at_p(")") {
+                loop {
+                    // Empty `()` is valid; anything non-ident aborts.
+                    match self.peek().clone() {
+                        Tok::Ident(s) => {
+                            self.i += 1;
+                            ps.push(s);
+                        }
+                        _ => {
+                            self.i = save;
+                            return Ok(None);
+                        }
+                    }
+                    if !self.eat_p(",") {
+                        break;
+                    }
+                    if self.at_p(")") {
+                        break;
+                    }
+                }
+            }
+            if !self.eat_p(")") || !self.at_p("=>") {
+                self.i = save;
+                return Ok(None);
+            }
+            ps
+        } else {
+            self.i = save;
+            return Ok(None);
+        };
+        // Consume `=>`.
+        self.i += 1;
+        self.in_fn += 1;
+        let body = if self.at_p("{") {
+            self.i += 1;
+            let b = self.block_body()?;
+            self.in_fn -= 1;
+            b
+        } else {
+            // Expression body: implicit return. A nested arrow stays
+            // right-assoc because expr body parses via assign().
+            let e = self.assign()?;
+            self.in_fn = save_fn;
+            return Ok(Some(Expr::Func(Rc::new(FnDef {
+                name: None,
+                params,
+                body: vec![Stmt::Return(Some(e))],
+                is_async,
+                is_arrow: true,
+            }))));
+        };
+        Ok(Some(Expr::Func(Rc::new(FnDef {
+            name: None,
+            params,
+            body,
+            is_async,
+            is_arrow: true,
+        }))))
+    }
+
+    /// Strict for-of: `for (var|let|const x of iter)` or `for (x of iter)`.
+    /// Only plain identifiers. Restores position when the head is classic.
+    fn try_for_of(&mut self) -> R<Option<Stmt>> {
+        let save = self.i;
+        let is_decl = matches!(
+            self.peek(),
+            Tok::Kw("var") | Tok::Kw("let") | Tok::Kw("const")
+        );
+        if is_decl {
+            self.i += 1;
+        }
+        let name = match self.peek().clone() {
+            Tok::Ident(s) => {
+                self.i += 1;
+                s
+            }
+            _ => {
+                self.i = save;
+                return Ok(None);
+            }
+        };
+        let is_of = matches!(self.peek(), Tok::Ident(s) if s == "of");
+        let is_in = matches!(self.peek(), Tok::Kw("in"))
+            || matches!(self.peek(), Tok::Ident(s) if s == "in");
+        if is_in {
+            return Err(err("for-in unsupported, use for-of over arrays"));
+        }
+        if !is_of {
+            self.i = save;
+            return Ok(None);
+        }
+        self.i += 1; // 'of'
+        let iter = self.expr()?;
+        self.exp_p(")")?;
+        self.in_loop += 1;
+        let b = self.stmt();
+        self.in_loop -= 1;
+        Ok(Some(Stmt::ForOf {
+            name,
+            is_decl,
+            iter,
+            body: Box::new(b?),
         }))
     }
 
     fn for_stmt(&mut self) -> R<Stmt> {
         self.i += 1; // 'for'
         self.exp_p("(")?;
+        if let Some(f) = self.try_for_of()? {
+            return Ok(f);
+        }
         let init = if self.eat_p(";") {
             None
         } else if matches!(
@@ -385,6 +549,9 @@ impl P {
     }
 
     fn assign(&mut self) -> R<Expr> {
+        if let Some(a) = self.try_arrow()? {
+            return Ok(a);
+        }
         let l = self.ternary()?;
         let op = match self.peek() {
             Tok::P(p) => *p,
@@ -416,7 +583,8 @@ impl P {
     }
 
     fn lor(&mut self) -> R<Expr> {
-        self.binop(Self::land, &["||"])
+        // `??` shares this level (permissive: mixing with || is allowed).
+        self.binop(Self::land, &["||", "??"])
     }
 
     fn land(&mut self) -> R<Expr> {
@@ -561,8 +729,39 @@ impl P {
     }
 
     fn call_tail(&mut self, mut e: Expr) -> R<Expr> {
+        let mut base: Option<Expr> = None;
+        let mut ops: Vec<OptOp> = Vec::new();
         loop {
-            if self.at_p("(") {
+            if self.at_p("?.") {
+                if base.is_none() {
+                    let (b, mut prefix) = split_chain(e);
+                    e = Expr::Undef;
+                    base = Some(b);
+                    ops.append(&mut prefix);
+                }
+                self.i += 1;
+                if self.eat_p("[") {
+                    let k = self.expr()?;
+                    self.exp_p("]")?;
+                    ops.push(OptOp::Index(k, true));
+                } else if self.at_p("(") {
+                    ops.push(OptOp::Call(self.args()?, true));
+                } else {
+                    ops.push(OptOp::Member(self.prop_name()?, true));
+                }
+            } else if base.is_some() {
+                if self.at_p("(") {
+                    ops.push(OptOp::Call(self.args()?, false));
+                } else if self.eat_p(".") {
+                    ops.push(OptOp::Member(self.prop_name()?, false));
+                } else if self.eat_p("[") {
+                    let k = self.expr()?;
+                    self.exp_p("]")?;
+                    ops.push(OptOp::Index(k, false));
+                } else {
+                    break;
+                }
+            } else if self.at_p("(") {
                 e = Expr::Call(Box::new(e), self.args()?);
             } else if self.eat_p(".") {
                 e = Expr::Member(Box::new(e), self.prop_name()?);
@@ -574,7 +773,11 @@ impl P {
                 break;
             }
         }
-        Ok(e)
+        if let Some(b) = base {
+            Ok(Expr::OptChain(Box::new(b), ops))
+        } else {
+            Ok(e)
+        }
     }
 
     fn args(&mut self) -> R<Vec<Expr>> {

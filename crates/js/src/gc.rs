@@ -77,11 +77,18 @@ impl Marker {
                             self.val(*v);
                         }
                     }
-                    Obj::Arr { items, proto } => {
+                    Obj::Arr {
+                        items,
+                        proto,
+                        pairs,
+                    } => {
                         if let Some(p) = proto {
                             self.ow.push(*p);
                         }
                         for v in items {
+                            self.val(*v);
+                        }
+                        for (_, v) in pairs {
                             self.val(*v);
                         }
                     }
@@ -418,12 +425,12 @@ mod tests {
 
     #[test]
     fn timers_and_microtasks_are_roots() {
-        // Cap 1200 (~840 threshold over a ~110 baseline): the top-level
+        // Cap 1400 (~980 threshold over a ~119 baseline): the top-level
         // churn forces a collection while the promise handler sits queued
         // in microtasks; cb1's garbage then triggers another collection
         // at the drain safepoint between timer callbacks. Order:
         // microtasks first, then timers by deadline.
-        let mut it = Interp::with_cap(1200);
+        let mut it = Interp::with_cap(1400);
         it.run(
             "var out=[];\
              Promise.resolve(9).then(function(v){out.push(v)});\

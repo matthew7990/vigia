@@ -61,6 +61,14 @@ enum Node {
         idx: usize,
         child: Box<Node>,
     },
+    /// Reference to group `idx` (1-based): re-matches its captured text
+    /// (empty when the group didn't participate). Invalid indices never
+    /// survive parsing (resolved to octal or rejected in `compile`).
+    Backref(usize),
+    /// Unresolved `\N` (single digit 1-9): backref when N <= group count
+    /// at end of parse, octal char otherwise (Annex-B-lite; `\8`/`\9`
+    /// stay literal; multi-digit `\12` reads as backref-1 + literal 2).
+    BackrefOrOctal(String),
     /// Zero-width lookahead: child must match (positive) or not match
     /// (negative) at the current position, consuming nothing.
     Lookahead {
@@ -84,16 +92,46 @@ pub fn compile(source: &str, flags: &str) -> Result<Compiled, String> {
         i: 0,
         groups: 0,
     };
-    let root = p.alt(false)?;
+    let mut root = p.alt(false)?;
     if p.i != p.c.len() {
         return Err(format!("trailing characters at {}", p.i));
     }
+    let groups = p.groups;
+    resolve_backrefs(&mut root, groups)?;
     Ok(Compiled {
         root,
-        groups: p.groups,
+        groups,
         flags: fl,
         source: source.to_string(),
     })
+}
+
+/// `\N` becomes a backref when the pattern has that many groups,
+/// else the octal char (Annex-B-lite). Runs after the whole parse so
+/// forward references resolve correctly (they never match).
+fn resolve_backrefs(n: &mut Node, groups: usize) -> Result<(), String> {
+    match n {
+        Node::BackrefOrOctal(ds) => {
+            let v: usize = ds.parse().map_err(|_| "bad backreference".to_string())?;
+            if v >= 1 && v <= groups {
+                *n = Node::Backref(v);
+            } else {
+                let o = u32::from_str_radix(ds, 8).unwrap_or(0);
+                *n = Node::Lit(char::from_u32(o).unwrap_or('\u{FFFD}'));
+            }
+            Ok(())
+        }
+        Node::Concat(ps) | Node::Alt(ps) => {
+            for p in ps {
+                resolve_backrefs(p, groups)?;
+            }
+            Ok(())
+        }
+        Node::Quant { child, .. } | Node::Group { child, .. } | Node::Lookahead { child, .. } => {
+            resolve_backrefs(child, groups)
+        }
+        _ => Ok(()),
+    }
 }
 
 struct P {
@@ -335,7 +373,25 @@ impl P {
             'r' => Ok(Node::Lit('\r')),
             'f' => Ok(Node::Lit('\u{c}')),
             'v' => Ok(Node::Lit('\u{b}')),
-            '0' => Ok(Node::Lit('\0')),
+            '0' => {
+                // `\0` + octal digits (Annex B); bare `\0` is NUL.
+                let mut ds = String::new();
+                while ds.len() < 3 {
+                    match self.peek() {
+                        Some(c) if ('0'..='7').contains(&c) => {
+                            ds.push(c);
+                            self.i += 1;
+                        }
+                        _ => break,
+                    }
+                }
+                if ds.is_empty() {
+                    Ok(Node::Lit('\0'))
+                } else {
+                    let v = u32::from_str_radix(&ds, 8).unwrap_or(0);
+                    Ok(Node::Lit(char::from_u32(v).unwrap_or('\u{FFFD}')))
+                }
+            }
             'x' => {
                 let h = self.hex(2)?;
                 Ok(Node::Lit(char::from_u32(h).unwrap_or('\u{FFFD}')))
@@ -344,7 +400,12 @@ impl P {
                 let h = self.hex(4)?;
                 Ok(Node::Lit(char::from_u32(h).unwrap_or('\u{FFFD}')))
             }
-            c if c.is_ascii_digit() => Err("backreferences are unsupported".into()),
+            c if ('1'..='7').contains(&c) => Ok(Node::BackrefOrOctal(std::iter::once(c).collect())),
+            // `\8`/`\9` are always literal (Annex B); real backrefs
+            // resolve in `compile` once the group count is known.
+            '8' => Ok(Node::Lit('8')),
+            '9' => Ok(Node::Lit('9')),
+            c if c.is_ascii_digit() => Ok(Node::Lit(c)),
             c => Ok(Node::Lit(c)),
         }
     }
@@ -430,6 +491,11 @@ impl P {
             Some('\\') => match self.escape(true)? {
                 Node::Lit(c) => Ok(Atom::Char(c)),
                 Node::Class { ranges, .. } => Ok(Atom::Class(ranges)),
+                // Backrefs don't work in classes: octal value instead.
+                Node::BackrefOrOctal(ds) => {
+                    let o = u32::from_str_radix(&ds, 8).unwrap_or(0);
+                    Ok(Atom::Char(char::from_u32(o).unwrap_or('\u{FFFD}')))
+                }
                 _ => Err("bad class escape".into()),
             },
             Some(c) => {
@@ -623,6 +689,30 @@ fn mt(n: &Node, s: &[char], pos: usize, caps: Caps, run: &mut Run) -> Outs {
             }
             out
         }
+        Node::Backref(idx) => {
+            // Re-match the captured text (unmatched group = empty).
+            // Case folds with /i, like V8.
+            match caps.get(*idx).copied().flatten() {
+                None => vec![(pos, caps)],
+                Some((a, b)) => {
+                    let len = b - a;
+                    let same = s.len() >= pos + len
+                        && (0..len).all(|k| {
+                            let (x, y) = (s[pos + k], s[a + k]);
+                            x == y || (run.fl.ignore_case && eq_ci(x, y))
+                        });
+                    if same {
+                        vec![(pos + len, caps)]
+                    } else {
+                        vec![]
+                    }
+                }
+            }
+        }
+        Node::BackrefOrOctal(_) => {
+            // Resolved in `compile`; reaching here means a bug.
+            vec![]
+        }
         Node::Lookahead { positive, child } => {
             let hits = mt(child, s, pos, caps.clone(), run);
             // Positive lookahead keeps the child's captures (spec);
@@ -812,6 +902,18 @@ mod tests {
     }
 
     #[test]
+    fn backrefs() {
+        assert_eq!(m(r"(a)\1", "", "aa"), Some((0, 2)));
+        assert_eq!(m(r"(a)\1", "", "ab"), None);
+        assert_eq!(m(r"<([a-z]+)>.*?</\1>", "", "<b>x</b>"), Some((0, 8)));
+        assert_eq!(m(r"(.)\1{1}", "", "aab"), Some((0, 2)));
+        assert_eq!(m(r"(a)|(b)\2", "", "ab"), Some((0, 1)));
+        assert_eq!(m(r"(a)\1", "i", "AA"), Some((0, 2)));
+        assert_eq!(m(r"\8", "", "8"), Some((0, 1)));
+        assert_eq!(m(r"\0", "", "\u{0}x"), Some((0, 1)));
+    }
+
+    #[test]
     fn lookahead() {
         assert_eq!(m(r"a(?=b)", "", "ab"), Some((0, 1)));
         assert_eq!(m(r"a(?=b)", "", "ac"), None);
@@ -868,7 +970,8 @@ mod tests {
         assert!(compile(r"(a", "").is_err());
         assert!(compile(r"[a", "").is_err());
         assert!(compile(r"a{2,1}", "").is_err());
-        assert!(compile(r"\1", "").is_err());
+        // Lone `\1` is octal \x01 (Annex B), not an error.
+        assert_eq!(m(r"\1", "", "\u{1}x"), Some((0, 1)));
         assert!(compile(r"(?a)", "").is_err());
         assert!(compile(r"a", "y").is_err());
     }

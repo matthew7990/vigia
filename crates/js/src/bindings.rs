@@ -1430,7 +1430,10 @@ mod tests {
             "a"
         );
         // parentNode (unlike parentElement) sees non-element parents.
-        assert_eq!(ev(&mut it, "document.documentElement.parentNode.nodeType"), "9");
+        assert_eq!(
+            ev(&mut it, "document.documentElement.parentNode.nodeType"),
+            "9"
+        );
         assert_eq!(ev(&mut it, "document.parentNode"), "null");
     }
 

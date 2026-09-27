@@ -25,7 +25,7 @@ pub(crate) enum Flow {
 }
 
 /// Pending class constructor parts: params, rest name, body.
-type CtorParts = (Vec<(String, Option<Expr>)>, Option<String>, Vec<Stmt>);
+type CtorParts = (Vec<(Pat, Option<Expr>)>, Option<String>, Vec<Stmt>);
 
 // ---- coercions ---------------------------------------------------------
 
@@ -210,14 +210,16 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
         Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
             pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
         }
-        Obj::Arr { items, .. } => {
+        Obj::Arr { items, pairs, .. } => {
             if key == "length" {
                 return Some(Value::Num(items.len() as f64));
             }
-            key.parse::<usize>()
-                .ok()
-                .and_then(|i| items.get(i))
-                .copied()
+            if let Ok(i) = key.parse::<usize>() {
+                if let Some(v) = items.get(i) {
+                    return Some(*v);
+                }
+            }
+            pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
         }
         Obj::RegExp {
             pat,
@@ -418,6 +420,22 @@ pub(crate) fn get_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> Result
 pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<(), JsError> {
     // Computed before the mutable borrow below.
     let last_num = to_num(&*h, val);
+    let kind = match v {
+        Value::Obj(id) => match h.obj(id) {
+            Obj::Arr { .. } => "array",
+            Obj::RegExp { .. } => "regexp",
+            Obj::Promise(_) => "promise",
+            Obj::Dom(_) => "node",
+            Obj::Style { .. } => "style",
+            Obj::Accessor { .. } => "accessor",
+            Obj::Symbol { .. } => "symbol",
+            Obj::Map { .. } => "map",
+            Obj::Set { .. } => "set",
+            Obj::WeakMap { .. } => "weakmap",
+            _ => "object",
+        },
+        _ => "value",
+    };
     match v {
         Value::Obj(id) => match h.obj_mut(id) {
             Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
@@ -427,11 +445,44 @@ pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<
                 }
                 Ok(())
             }
+            // Arrays take `length` (truncate/extend-with-undefined, holes
+            // read undefined here) and canonical indices (growing the
+            // array); anything else lands in expando pairs.
+            Obj::Arr { items, pairs, .. } => {
+                if key == "length" {
+                    let n = last_num;
+                    if n.is_nan() || n < 0.0 || n.fract() != 0.0 {
+                        return Err(err("bad array length"));
+                    }
+                    let n = (n as usize).min(1 << 28);
+                    items.resize(n, Value::Undef);
+                    return Ok(());
+                }
+                match key.parse::<usize>() {
+                    Ok(i) if i < (1 << 28) => {
+                        if i >= items.len() {
+                            items.resize(i + 1, Value::Undef);
+                        }
+                        items[i] = val;
+                        Ok(())
+                    }
+                    _ => match pairs.iter_mut().find(|(k, _)| k == key) {
+                        Some(slot) => {
+                            slot.1 = val;
+                            Ok(())
+                        }
+                        None => {
+                            pairs.push((key.to_string(), val));
+                            Ok(())
+                        }
+                    },
+                }
+            }
             Obj::RegExp { last_index, .. } if key == "lastIndex" => {
                 *last_index = last_num;
                 Ok(())
             }
-            _ => Err(err("cannot set property on this object")),
+            _ => Err(err(format!("cannot set '{key}' on {kind}"))),
         },
         Value::Undef | Value::Null => Err(err("cannot set property of null/undefined")),
         _ => Ok(()), // primitives: sloppy no-op like real JS
@@ -524,7 +575,11 @@ impl Interp {
     /// Fresh Arr under Array.prototype.
     pub(crate) fn arr_obj(&mut self, items: Vec<Value>) -> Result<u32, JsError> {
         let proto = po(self.protos.array);
-        self.heap.alloc_obj(Obj::Arr { items, proto })
+        self.heap.alloc_obj(Obj::Arr {
+            items,
+            proto,
+            pairs: Vec::new(),
+        })
     }
 
     /// Fresh Func under Function.prototype, with an own "prototype" object
@@ -621,6 +676,48 @@ impl Interp {
                         static_inits.push((nm.clone(), init.clone()));
                     } else {
                         fields.push((nm.clone(), init.clone()));
+                    }
+                }
+                MemberKind::ComputedMethod { key, def } => {
+                    let kv = self.expr(env, key)?;
+                    let nm = to_str(&self.heap, kv);
+                    let mid = self.func_obj(def.clone(), env)?;
+                    if sup_val.is_some() {
+                        self.stash_super(mid, sup_val)?;
+                    }
+                    if m.statik {
+                        statics.push((nm, Value::Obj(mid)));
+                    } else {
+                        proto_pairs.push((nm, Value::Obj(mid)));
+                    }
+                }
+                MemberKind::ComputedGet { key, def } => {
+                    let kv = self.expr(env, key)?;
+                    let nm = to_str(&self.heap, kv);
+                    let d = Some(def.clone());
+                    if m.statik {
+                        self.obj_accessor(env, &mut statics, &nm, &d, &None)?;
+                    } else {
+                        self.obj_accessor(env, &mut proto_pairs, &nm, &d, &None)?;
+                    }
+                }
+                MemberKind::ComputedSet { key, def } => {
+                    let kv = self.expr(env, key)?;
+                    let nm = to_str(&self.heap, kv);
+                    let d = Some(def.clone());
+                    if m.statik {
+                        self.obj_accessor(env, &mut statics, &nm, &None, &d)?;
+                    } else {
+                        self.obj_accessor(env, &mut proto_pairs, &nm, &None, &d)?;
+                    }
+                }
+                MemberKind::ComputedField { key, init } => {
+                    let kv = self.expr(env, key)?;
+                    let nm = to_str(&self.heap, kv);
+                    if m.statik {
+                        static_inits.push((nm, init.clone()));
+                    } else {
+                        fields.push((nm, init.clone()));
                     }
                 }
             }
@@ -819,7 +916,11 @@ impl Interp {
         self.put(object, "hasOwnProperty", n_has_own);
         self.put(object, "toString", n_obj_to_string);
 
-        self.protos.function_ = self.proto_bag(&[("call", n_fn_call), ("apply", n_fn_apply)]);
+        self.protos.function_ = self.proto_bag(&[
+            ("call", n_fn_call),
+            ("apply", n_fn_apply),
+            ("bind", n_fn_bind),
+        ]);
         self.protos.array = self.proto_bag(&[
             ("push", n_arr_push),
             ("pop", n_arr_pop),
@@ -978,6 +1079,14 @@ impl Interp {
                 ("freeze", n_obj_freeze),
                 ("defineProperty", n_obj_define_property),
                 ("defineProperties", n_obj_define_properties),
+                ("getOwnPropertyNames", n_obj_own_names),
+                ("getOwnPropertySymbols", n_obj_own_symbols),
+                ("getOwnPropertyDescriptor", n_obj_get_desc),
+                ("getOwnPropertyDescriptors", n_obj_get_descs),
+                ("getPrototypeOf", n_obj_get_proto),
+                ("setPrototypeOf", n_obj_set_proto),
+                ("fromEntries", n_obj_from_entries),
+                ("is", n_obj_is),
             ],
         );
         self.ctor(
@@ -1189,7 +1298,7 @@ impl Interp {
                         }
                         VarDecl::Pat(pat, init) => {
                             let v = self.expr(env, init)?;
-                            self.destructure(env, pat, v)?;
+                            self.destructure(env, pat, v, false)?;
                         }
                     }
                 }
@@ -1270,22 +1379,22 @@ impl Interp {
             }
             Stmt::For(init, test, upd, body) => self.stmt_for(env, init, test, upd, body),
             Stmt::ForOf {
-                name,
+                pat,
                 is_decl,
                 iter,
                 body,
             } => {
                 let items = self.for_of_items(env, iter)?;
-                self.stmt_each(env, name, *is_decl, &items, body)
+                self.stmt_each(env, pat, *is_decl, &items, body)
             }
             Stmt::ForIn {
-                name,
+                pat,
                 is_decl,
                 obj,
                 body,
             } => {
                 let keys = self.for_in_keys(env, obj)?;
-                self.stmt_each(env, name, *is_decl, &keys, body)
+                self.stmt_each(env, pat, *is_decl, &keys, body)
             }
             Stmt::Switch { disc, cases } => {
                 let v = self.expr(env, disc)?;
@@ -1512,8 +1621,9 @@ impl Interp {
                 | Obj::Native { pairs, .. } => {
                     keys.extend(pairs.iter().map(|(k, _)| k.clone()));
                 }
-                Obj::Arr { items, .. } => {
+                Obj::Arr { items, pairs, .. } => {
                     keys.extend((0..items.len()).map(|i| i.to_string()));
+                    keys.extend(pairs.iter().map(|(k, _)| k.clone()));
                 }
                 Obj::RegExp { .. }
                 | Obj::Promise(_)
@@ -1541,14 +1651,14 @@ impl Interp {
     fn stmt_each(
         &mut self,
         env: u32,
-        name: &str,
+        pat: &Pat,
         is_decl: bool,
         items: &[Value],
         body: &Stmt,
     ) -> Result<Flow, JsError> {
         let fenv = self.new_env(env)?;
         self.env_stack.push(fenv);
-        let r = self.stmt_each_loop(fenv, name, is_decl, items, body);
+        let r = self.stmt_each_loop(fenv, pat, is_decl, items, body);
         self.env_stack.pop();
         r
     }
@@ -1556,7 +1666,7 @@ impl Interp {
     fn stmt_each_loop(
         &mut self,
         fenv: u32,
-        name: &str,
+        pat: &Pat,
         is_decl: bool,
         items: &[Value],
         body: &Stmt,
@@ -1565,10 +1675,15 @@ impl Interp {
         for &item in items {
             self.tick()?;
             self.maybe_gc();
-            if is_decl {
-                self.env_declare(fenv, name, item);
-            } else if !self.env_set(fenv, name, item) {
-                self.env_declare(0, name, item);
+            match (pat, is_decl) {
+                // Bare `for (x of ...)` assigns (possibly to a global).
+                (Pat::Ident(n), false) => {
+                    if !self.env_set(fenv, n, item) {
+                        self.env_declare(0, n, item);
+                    }
+                }
+                // Declarations and patterns always bind fresh.
+                _ => self.destructure(fenv, pat, item, !is_decl)?,
             }
             match self.stmt(fenv, body)? {
                 Flow::Normal => {}
@@ -1646,6 +1761,11 @@ impl Interp {
                 }
             }
             Expr::Assign(op, l, r) => self.assign(env, op, l, r),
+            Expr::Destructure(pat, rhs) => {
+                let v = self.expr(env, rhs)?;
+                self.destructure(env, pat, v, true)?;
+                Ok(v)
+            }
             Expr::Call(c, args) => self.call(env, c, args),
             Expr::Member(o, name) => {
                 let v = self.expr(env, o)?;
@@ -1746,6 +1866,12 @@ impl Interp {
                 self.expr(env, e)?;
                 Ok(Value::Undef)
             }
+            // No lazy suspension in this engine: generators run as
+            // plain functions, `yield v` evaluates v and reads undefined.
+            "yield" => {
+                self.expr(env, e)?;
+                Ok(Value::Undef)
+            }
             "delete" => self.delete_op(env, e),
             "++" | "--" => self.bump(env, e, if op == "++" { 1.0 } else { -1.0 }, false),
             "await" => {
@@ -1823,6 +1949,7 @@ impl Interp {
                 }
                 Obj::Arr { .. } => {
                     // Canonical index blanks the slot, length kept.
+                    // Named keys drop from expando pairs instead.
                     if let Some(Value::Num(n)) = kval {
                         if n >= 0.0 && n.fract() == 0.0 {
                             if let Obj::Arr { items, .. } = self.heap.obj_mut(id) {
@@ -1830,14 +1957,18 @@ impl Interp {
                                     *slot = Value::Undef;
                                 }
                             }
+                            return Ok(Value::Bool(true));
                         }
-                    } else if key.parse::<usize>().is_ok() {
+                    }
+                    if key.parse::<usize>().is_ok() {
                         let n: usize = key.parse().unwrap_or(usize::MAX);
                         if let Obj::Arr { items, .. } = self.heap.obj_mut(id) {
                             if let Some(slot) = items.get_mut(n) {
                                 *slot = Value::Undef;
                             }
                         }
+                    } else if let Obj::Arr { pairs, .. } = self.heap.obj_mut(id) {
+                        pairs.retain(|(k, _)| k != key);
                     }
                     Ok(Value::Bool(true))
                 }
@@ -1928,6 +2059,7 @@ impl Interp {
             "*" => Value::Num(to_num(h, l) * to_num(h, r)),
             "/" => Value::Num(to_num(h, l) / to_num(h, r)),
             "%" => Value::Num(to_num(h, l) % to_num(h, r)),
+            "**" => Value::Num(to_num(h, l).powf(to_num(h, r))),
             "==" => Value::Bool(loose_eq(h, l, r)),
             "!=" => Value::Bool(!loose_eq(h, l, r)),
             "===" => Value::Bool(strict_eq(h, l, r)),
@@ -2035,12 +2167,27 @@ impl Interp {
         }
     }
 
-    /// Pattern binding for `var [a,b] = e` / `var {x} = e`. Sequential:
-    /// later defaults see earlier names. Only declaration position.
-    fn destructure(&mut self, env: u32, pat: &Pat, v: Value) -> Result<(), JsError> {
+    /// Pattern binding for `var [a,b] = e` / `var {x} = e`, for loop
+    /// targets, and plain params. Sequential: later defaults see earlier
+    /// names. `assign` selects assignment semantics (scope-chain set,
+    /// sloppy-global fallback) over declaration - used by plain
+    /// destructuring assignment (`[a] = e`) and undeclared for-targets.
+    /// Declare `n = v`, or assign through the scope chain (sloppy
+    /// global fallback) when `assign` is set.
+    fn bind_name(&mut self, env: u32, n: &str, v: Value, assign: bool) {
+        if assign {
+            if !self.env_set(env, n, v) {
+                self.env_declare(0, n, v);
+            }
+        } else {
+            self.env_declare(env, n, v);
+        }
+    }
+
+    fn destructure(&mut self, env: u32, pat: &Pat, v: Value, assign: bool) -> Result<(), JsError> {
         match pat {
             Pat::Ident(n) => {
-                self.env_declare(env, n, v);
+                self.bind_name(env, n, v, assign);
                 Ok(())
             }
             Pat::Arr(els, rest) => {
@@ -2067,12 +2214,12 @@ impl Interp {
                             item = self.expr(env, d)?;
                         }
                     }
-                    self.destructure(env, p, item)?;
+                    self.destructure(env, p, item, assign)?;
                 }
                 if let Some(r) = rest {
                     let extra = items.get(els.len()..).unwrap_or(&[]).to_vec();
                     let arr = self.arr_obj(extra)?;
-                    self.env_declare(env, r, Value::Obj(arr));
+                    self.bind_name(env, r, Value::Obj(arr), assign);
                 }
                 Ok(())
             }
@@ -2093,7 +2240,7 @@ impl Interp {
                             item = self.expr(env, d)?;
                         }
                     }
-                    self.destructure(env, &f.pat, item)?;
+                    self.destructure(env, &f.pat, item, assign)?;
                 }
                 if let Some(r) = rest {
                     // Own props minus the consumed keys.
@@ -2114,7 +2261,7 @@ impl Interp {
                     };
                     pairs.retain(|(k, _)| !taken.contains(k));
                     let obj = self.obj_pairs(pairs)?;
-                    self.env_declare(env, r, Value::Obj(obj));
+                    self.bind_name(env, r, Value::Obj(obj), assign);
                 }
                 Ok(())
             }
@@ -2214,12 +2361,16 @@ impl Interp {
                 Ok(out)
             }
             Value::Obj(id) => match self.heap.obj(id) {
-                Obj::Arr { items, .. } => Ok(items
-                    .clone()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(i, v)| (i.to_string(), v))
-                    .collect()),
+                Obj::Arr { items, pairs, .. } => {
+                    let mut out: Vec<(String, Value)> = items
+                        .clone()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| (i.to_string(), v))
+                        .collect();
+                    out.extend(pairs.clone());
+                    Ok(out)
+                }
                 Obj::Ordinary { pairs, .. }
                 | Obj::Func { pairs, .. }
                 | Obj::Native { pairs, .. } => Ok(pairs.clone()),
@@ -2453,11 +2604,16 @@ impl Interp {
                 // leak it; every exit below restores it.
                 let sup = self.func_super(id);
                 for (i, (p, d)) in def.params.iter().enumerate() {
-                    let v = match args.get(i).copied().unwrap_or(Value::Undef) {
-                        Value::Undef if d.is_some() => self.expr(cenv, d.as_ref().unwrap())?,
-                        v => v,
-                    };
-                    self.env_declare(cenv, p, v);
+                    let mut v = args.get(i).copied().unwrap_or(Value::Undef);
+                    if matches!(v, Value::Undef) {
+                        if let Some(d) = d {
+                            v = self.expr(cenv, d)?;
+                        }
+                    }
+                    match p {
+                        Pat::Ident(n) => self.env_declare(cenv, n, v),
+                        _ => self.destructure(cenv, p, v, false)?,
+                    }
                 }
                 if let Some(r) = &def.rest {
                     let extra = args.get(def.params.len()..).unwrap_or(&[]).to_vec();
@@ -2945,11 +3101,15 @@ fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
             Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
                 pairs.clone()
             }
-            Obj::Arr { items, .. } => items
-                .iter()
-                .enumerate()
-                .map(|(i, x)| (i.to_string(), *x))
-                .collect(),
+            Obj::Arr { items, pairs, .. } => {
+                let mut out: Vec<(String, Value)> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, x)| (i.to_string(), *x))
+                    .collect();
+                out.extend(pairs.iter().cloned());
+                out
+            }
             Obj::Dom(_)
             | Obj::Promise(_)
             | Obj::RegExp { .. }
@@ -3069,6 +3229,203 @@ fn n_obj_define_properties(
         define_one(it, target, &k, d)?;
     }
     Ok(target)
+}
+
+fn n_obj_own_names(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    // String keys only (length excluded: non-enumerable, like for-in).
+    let keys: Vec<String> = match arg(args, 0) {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
+                pairs.iter().map(|(k, _)| k.clone()).collect()
+            }
+            Obj::Arr { items, pairs, .. } => (0..items.len())
+                .map(|i| i.to_string())
+                .chain(pairs.iter().map(|(k, _)| k.clone()))
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    let mut out = Vec::with_capacity(keys.len());
+    for k in keys {
+        out.push(Value::Str(it.heap.alloc_str(k)?));
+    }
+    Ok(Value::Obj(it.arr_obj(out)?))
+}
+
+fn n_obj_own_symbols(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    // Always empty: symbol keys coerce to strings on write here, so no
+    // object ever holds one (documented model gap).
+    Ok(Value::Obj(it.arr_obj(Vec::new())?))
+}
+
+/// `{value,writable,enumerable,configurable}` or the accessor triple.
+/// All props report mutable + enumerable, except array `length`.
+fn describe_own(it: &mut Interp, target: Value, key: &str) -> Result<Value, JsError> {
+    let mut desc: Vec<(String, Value)> = vec![
+        ("enumerable".into(), Value::Bool(true)),
+        ("configurable".into(), Value::Bool(true)),
+    ];
+    let found = match target {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
+                pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+            }
+            Obj::Arr { items, pairs, .. } => {
+                if key == "length" {
+                    desc = vec![
+                        ("value".into(), Value::Num(items.len() as f64)),
+                        ("writable".into(), Value::Bool(true)),
+                        ("enumerable".into(), Value::Bool(false)),
+                        ("configurable".into(), Value::Bool(false)),
+                    ];
+                    return Ok(Value::Obj(it.obj_pairs(desc)?));
+                }
+                if let Ok(i) = key.parse::<usize>() {
+                    items.get(i).copied()
+                } else {
+                    pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(v) = found else {
+        return Ok(Value::Undef);
+    };
+    match v {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Accessor { get, set, .. } => {
+                let g = get.map(Value::Obj).unwrap_or(Value::Undef);
+                let s = set.map(Value::Obj).unwrap_or(Value::Undef);
+                desc.push(("get".into(), g));
+                desc.push(("set".into(), s));
+            }
+            _ => {
+                desc.push(("value".into(), v));
+                desc.push(("writable".into(), Value::Bool(true)));
+            }
+        },
+        _ => {
+            desc.push(("value".into(), v));
+            desc.push(("writable".into(), Value::Bool(true)));
+        }
+    }
+    Ok(Value::Obj(it.obj_pairs(desc)?))
+}
+
+fn n_obj_get_desc(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let key = to_str(&it.heap, arg(args, 1));
+    describe_own(it, arg(args, 0), &key)
+}
+
+fn n_obj_get_descs(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let mut out = Vec::new();
+    if let Value::Obj(id) = arg(args, 0) {
+        let keys: Vec<String> = match it.heap.obj(id) {
+            Obj::Ordinary { pairs, .. }
+            | Obj::Func { pairs, .. }
+            | Obj::Native { pairs, .. } => pairs.iter().map(|(k, _)| k.clone()).collect(),
+            Obj::Arr { items, pairs, .. } => (0..items.len())
+                .map(|i| i.to_string())
+                .chain(pairs.iter().map(|(k, _)| k.clone()))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for k in keys {
+            out.push((k.clone(), describe_own(it, Value::Obj(id), &k)?));
+        }
+    }
+    Ok(Value::Obj(it.obj_pairs(out)?))
+}
+
+fn n_obj_get_proto(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    // Heap-cap edge: an uninstalled proto bag reads as null.
+    let bag = |p: u32| {
+        if p == u32::MAX {
+            Value::Null
+        } else {
+            Value::Obj(p)
+        }
+    };
+    Ok(match arg(args, 0) {
+        Value::Obj(id) => match proto_of(&it.heap, &it.protos, id) {
+            Some(p) => Value::Obj(p),
+            None => Value::Null,
+        },
+        Value::Str(_) => bag(it.protos.string),
+        Value::Num(_) => bag(it.protos.number),
+        // No boolean proto bag exists (booleans expose no methods here).
+        Value::Bool(_) => Value::Null,
+        Value::Undef | Value::Null => {
+            return Err(err("getPrototypeOf of null/undefined"));
+        }
+    })
+}
+
+fn n_obj_set_proto(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let target = arg(args, 0);
+    let proto = match arg(args, 1) {
+        Value::Obj(id) => Some(id),
+        Value::Null => None,
+        _ => return Err(err("setPrototypeOf: proto must be an object or null")),
+    };
+    let Value::Obj(id) = target else {
+        return Err(err("setPrototypeOf: target must be an object"));
+    };
+    match it.heap.obj_mut(id) {
+        Obj::Ordinary { proto: slot, .. }
+        | Obj::Arr { proto: slot, .. }
+        | Obj::Func { proto: slot, .. } => {
+            *slot = proto;
+        }
+        // No proto slot (natives use a virtual one, the rest have none):
+        // sloppy no-op, still returns the target.
+        _ => {}
+    }
+    Ok(target)
+}
+
+fn n_obj_from_entries(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let pairs = match arg(args, 0) {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Arr { items, .. } => items.clone(),
+            _ => return Err(err("fromEntries takes an array of pairs")),
+        },
+        _ => return Err(err("fromEntries takes an array of pairs")),
+    };
+    let mut out = Vec::with_capacity(pairs.len());
+    for p in pairs {
+        let (k, v) = match p {
+            Value::Obj(id) => match it.heap.obj(id) {
+                Obj::Arr { items, .. } => (
+                    items.first().copied().unwrap_or(Value::Undef),
+                    items.get(1).copied().unwrap_or(Value::Undef),
+                ),
+                _ => return Err(err("fromEntries takes an array of pairs")),
+            },
+            _ => return Err(err("fromEntries takes an array of pairs")),
+        };
+        out.push((to_str(&it.heap, k), v));
+    }
+    Ok(Value::Obj(it.obj_pairs(out)?))
+}
+
+/// SameValue: strict plus NaN-equals-NaN, but +0 and -0 differ.
+fn n_obj_is(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (l, r) = (arg(args, 0), arg(args, 1));
+    let eq = match (l, r) {
+        (Value::Num(a), Value::Num(b)) => {
+            if a == b {
+                a != 0.0 || (1.0 / a) == (1.0 / b)
+            } else {
+                a.is_nan() && b.is_nan()
+            }
+        }
+        _ => strict_eq(&it.heap, l, r),
+    };
+    Ok(Value::Bool(eq))
 }
 
 // -- Array ctor + statics --------------------------------------------------------
@@ -3228,6 +3585,35 @@ fn n_fn_apply(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsE
         _ => return Err(err("apply: arg list must be an array")),
     };
     it.call_value(this, t, &argv, None)
+}
+
+/// `f.bind(thisArg, ...bound)`: a Native carrying target/this/args in
+/// its own pairs (the bound-state pattern). `new` on it ignores the
+/// fresh object, like sloppy reality is not worth modeling.
+fn n_fn_bind(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    match this {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Func { .. } | Obj::Native { .. }) => {}
+        _ => return Err(err("bind on a non-function")),
+    }
+    let bound_this = arg(args, 0);
+    let arr = it.arr_obj(args.get(1.min(args.len())..).unwrap_or(&[]).to_vec())?;
+    let b = it.heap.alloc_obj(nat("bound", n_bound_call))?;
+    set_prop(&mut it.heap, Value::Obj(b), "__t", this)?;
+    set_prop(&mut it.heap, Value::Obj(b), "__this", bound_this)?;
+    set_prop(&mut it.heap, Value::Obj(b), "__a", Value::Obj(arr))?;
+    Ok(Value::Obj(b))
+}
+
+fn n_bound_call(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let me = it.cur_native;
+    let t = get_prop(&it.heap, &it.protos, me, "__t")?;
+    let bt = get_prop(&it.heap, &it.protos, me, "__this")?;
+    let mut full = match get_prop(&it.heap, &it.protos, me, "__a")? {
+        Value::Obj(id) => arr_items(it, id),
+        _ => Vec::new(),
+    };
+    full.extend_from_slice(args);
+    it.call_value(t, bt, &full, None)
 }
 
 // -- Array.prototype -------------------------------------------------------------
@@ -5733,6 +6119,68 @@ mod tests {
         }
     }
 
+    /// Elisions read as undefined (holes have no observable slot here;
+    /// length still counts them, like real arrays).
+    #[test]
+    fn array_expando() {
+        // Webpack's chunk trick: overriding push on the instance.
+        assert_eq!(
+            disp("var a=[1];a.push=function(x){return 'w'+x};a.push(2)"),
+            "w2"
+        );
+        assert_eq!(disp("var a=[1];a.foo=7;a.foo"), "7");
+        assert_eq!(disp("var a=[1];a.foo=7;delete a.foo;a.foo"), "undefined");
+        assert_eq!(
+            disp("var a=[1,2];var k='';for(var x in a)k+=x+',';k"),
+            "0,1,"
+        );
+        assert_eq!(disp("var a=[1];a.foo=7;Object.keys(a).join()"), "0,foo");
+    }
+
+    #[test]
+    fn array_length_write() {
+        assert_eq!(disp("var a=[1,2,3];a.length=1;a.length"), "1");
+        assert_eq!(disp("var a=[1,2,3];a.length=1;a.join()"), "1");
+        assert_eq!(disp("var a=[1];a[3]='x';a.length"), "4");
+        assert_eq!(disp("var a=[1];a[3]='x';a[1]"), "undefined");
+        assert!(errmsg("var a=[];a.length=-1").contains("bad array length"));
+    }
+
+    #[test]
+    fn array_holes() {
+        assert_eq!(disp("[5,7,,8].length"), "4");
+        assert_eq!(disp("[5,7,,8][2]"), "undefined");
+        assert_eq!(disp("[,]"), "[null]");
+        assert_eq!(disp("[1,].length"), "1");
+    }
+
+    #[test]
+    fn generators_stubbed() {
+        // Parses and runs; yield reads undefined (no suspension).
+        assert_eq!(disp("function*g(){yield 1;yield 2;return 9}g()"), "9");
+        assert_eq!(disp("var o={*m(){yield 7;return 8}};o.m()"), "8");
+        assert_eq!(disp("class C{*m(){yield}}new C().m()"), "undefined");
+        // `yield` stays an identifier outside generators.
+        assert_eq!(disp("var yield=5;yield+1"), "6");
+        assert!(errmsg("class C{*constructor(){}}").contains("may not be a generator"));
+        assert!(errmsg("var o={*get x(){return 1}}").contains("accessor"));
+    }
+
+    #[test]
+    fn async_object_methods() {
+        assert_eq!(
+            disp("var o={async m(){return 7}};o.m() instanceof Promise"),
+            "true"
+        );
+        assert_eq!(
+            out("var o={async m(){return 7}};o.m().then(function(v){console.log(v)})"),
+            "7\n"
+        );
+        // `async` stays a plain key when not a modifier.
+        assert_eq!(disp("var o={async:1};o.async"), "1");
+        assert_eq!(disp("var o={async(){return 2}};o.async()"), "2");
+    }
+
     #[test]
     fn delete_operator() {
         assert_eq!(disp("var o={a:1,b:2};delete o.a"), "true");
@@ -5760,6 +6208,17 @@ mod tests {
         assert_eq!(disp("var k='b';var o={[k]:2,[k+'c']:3};o.b+o.bc"), "5");
         assert!(errmsg("break nope").contains("no such label"));
         assert!(errmsg("a:{continue a}").contains("not a loop"));
+    }
+
+    #[test]
+    fn destructuring_assignment() {
+        assert_eq!(disp("var K;var a=[1,2];[K]=a.sort();K"), "1");
+        assert_eq!(disp("var a=0,b=0;[a,b]=[b=1,a=2];a+b"), "3");
+        assert_eq!(disp("var t;({x:t}={x:9});t"), "9");
+        assert_eq!(disp("var a=[1,2,3];var r;[r]=a;r"), "1");
+        assert_eq!(disp("var t='';[t]=['x'];t"), "x");
+        assert!(errmsg("var a;[a.b]=[1]").contains("identifiers"));
+        assert!(errmsg("var a;[a]+= [1]").contains("bad assignment"));
     }
 
     #[test]
@@ -5835,6 +6294,47 @@ mod tests {
         assert!(errmsg("function f(){super.x}").contains("unexpected super"));
         assert!(errmsg("super.x").contains("unexpected super"));
         assert!(errmsg("class A extends B{}").contains("not defined"));
+    }
+
+    #[test]
+    fn computed_class_members() {
+        assert_eq!(disp("var K='k';var o={[K]:1};o.k"), "1");
+        assert_eq!(
+            disp("var K='k';class C{[K](){return 7}[K+'2']=8}var c=new C();c.k()+c.k2"),
+            "15"
+        );
+        assert_eq!(
+            disp("var s=Symbol('s');class C{[s](){return 3}}new C()[s]()"),
+            "3"
+        );
+        assert_eq!(disp("class C{static ['s']=4}C.s"), "4");
+    }
+
+    #[test]
+    fn destructuring_params() {
+        assert_eq!(disp("function f({a,b}){return a+b}f({a:1,b:2})"), "3");
+        assert_eq!(disp("function f([x,,z]){return x+z}f([1,2,3])"), "4");
+        assert_eq!(disp("function f({a=5}={}){return a}f()"), "5");
+        assert_eq!(disp("var g=({x})=>x*2;g({x:21})"), "42");
+        assert_eq!(disp("function f({a:{b}}){return b}f({a:{b:7}})"), "7");
+        assert!(errmsg("function f({a}){};f(null)").contains("cannot read"));
+    }
+
+    #[test]
+    fn bound_functions() {
+        assert_eq!(
+            disp("function f(a,b){return this.x+a+b}var g=f.bind({x:1},2);g(3)"),
+            "6"
+        );
+        assert_eq!(
+            disp("var o={n:4};function f(){return this.n}var g=f.bind(o);g()"),
+            "4"
+        );
+        assert_eq!(
+            disp("[1,2].map(function(x){return x*2}.bind(null)).join()"),
+            "2,4"
+        );
+        assert!(errmsg("var f=function(){};f.bind.call({}, 1)").contains("non-function"));
     }
 
     #[test]
@@ -5969,6 +6469,14 @@ mod tests {
     }
 
     #[test]
+    fn for_pattern_targets() {
+        assert_eq!(disp("var s='';for(var {a} of [{a:1},{a:2}])s+=a;s"), "12");
+        assert_eq!(disp("var s='';for(var [x] of [[1],[2]])s+=x;s"), "12");
+        assert_eq!(disp("var s='';for({a} of [{a:1},{a:2}])s+=a;s"), "12");
+        assert_eq!(disp("var t=0;for(var k in {a:1,b:2})t++;t"), "2");
+    }
+
+    #[test]
     fn for_in_keys() {
         assert_eq!(disp("var o={a:1,b:2};var k='';for(var x in o)k+=x;k"), "ab");
         assert_eq!(disp("var s='';for(var i in ['x','y'])s+=i;s"), "01");
@@ -6028,6 +6536,10 @@ mod tests {
         assert_eq!(num("1<<4"), 16.0);
         assert_eq!(num("16>>2"), 4.0);
         assert_eq!(num("-1>>>0"), 4294967295.0);
+        assert_eq!(num("2**10"), 1024.0);
+        assert_eq!(num("2**3**2"), 512.0);
+        assert_eq!(num("2**-2"), 0.25);
+        assert_eq!(num("var x=3;x**=2;x"), 9.0);
     }
 
     #[test]
@@ -6469,8 +6981,9 @@ mod tests {
             1.0
         );
         // tight heap: proto/builtin installs hit the cap and skip; plain
-        // own-prop objects still work
-        let mut it = Interp::with_cap(128);
+        // own-prop objects still work. The cap tracks the install
+        // footprint - every new builtin moves it, update deliberately.
+        let mut it = Interp::with_cap(192);
         assert_eq!(it.run("var o={a:1};o.a").unwrap(), Value::Num(1.0));
     }
 

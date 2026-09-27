@@ -175,6 +175,9 @@ pub enum Obj {
     Arr {
         items: Vec<Value>,
         proto: Option<u32>,
+        /// Expando props (`arr.foo = 1`, webpack's `arr.push = ...`).
+        /// Indices and `length` live in items, never here.
+        pairs: Vec<(String, Value)>,
     },
     /// def carries params+body shared via Rc; env is the captured EnvId.
     /// pairs holds own props ("prototype" is populated at creation).

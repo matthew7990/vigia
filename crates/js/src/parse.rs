@@ -29,6 +29,7 @@ pub fn parse_program(src: &str) -> Result<Vec<Stmt>, JsError> {
         in_label: 0,
         labels: Vec::new(),
         super_ok: false,
+        gen_ok: false,
     };
     let mut stmts = Vec::new();
     while !p.at_eof() {
@@ -51,12 +52,18 @@ struct P {
     /// `super` parses only inside a derived class body (methods and
     /// field inits inherit it; plain functions reset it, arrows keep it).
     super_ok: bool,
+    /// `yield` parses as an operator only inside a `function*` body
+    /// (plain functions reset it, arrows keep it). Generators run as
+    /// plain functions; yield evaluates to undefined.
+    gen_ok: bool,
 }
 
 type R<T> = Result<T, JsError>;
 
-/// `(params, rest)` of a function or arrow head.
-type Params = (Vec<(String, Option<Expr>)>, Option<String>);
+/// `(params, rest)` of a function or arrow head. Each param is a
+/// pattern: plain names are `Pat::Ident`, so `function f({a}, [b])`
+/// reuses the destructuring machinery.
+type Params = (Vec<(Pat, Option<Expr>)>, Option<String>);
 
 /// Flatten `a.b[k](x)` into `a` + non-optional steps so an optional chain
 /// keeps the receiver for `this`. `a.b?.()` becomes Chain(a, [Member(b),
@@ -239,20 +246,22 @@ impl P {
             }
             Tok::Kw("function") => {
                 self.i += 1;
+                let is_gen = self.eat_p("*");
                 let n = self
                     .ident()
                     .map_err(|_| err("function declaration needs a name"))?;
-                Ok(Stmt::FnDecl(self.fn_tail(Some(n), false)?))
+                Ok(Stmt::FnDecl(self.fn_tail(Some(n), false, is_gen)?))
             }
             Tok::Kw("async") => {
                 self.i += 1;
                 if !self.eat_kw("function") {
                     return Err(err("expected 'function' after 'async'"));
                 }
+                let is_gen = self.eat_p("*");
                 let n = self
                     .ident()
                     .map_err(|_| err("async function declaration needs a name"))?;
-                Ok(Stmt::FnDecl(self.fn_tail(Some(n), true)?))
+                Ok(Stmt::FnDecl(self.fn_tail(Some(n), true, is_gen)?))
             }
             Tok::Kw("return") => {
                 if self.in_fn == 0 {
@@ -554,8 +563,9 @@ impl P {
 
     /// `(params) { body }` shared by fn declarations and fn expressions.
     /// `is_async` marks `async function` bodies (enables `await`, wraps the
-    /// return value in a promise at call time).
-    fn fn_tail(&mut self, name: Option<String>, is_async: bool) -> R<Rc<FnDef>> {
+    /// return value in a promise at call time). `is_gen` (`function*`) is
+    /// a plain function here; `yield` reads undefined inside it.
+    fn fn_tail(&mut self, name: Option<String>, is_async: bool, is_gen: bool) -> R<Rc<FnDef>> {
         self.exp_p("(")?;
         let (params, rest) = self.param_list()?;
         self.exp_p(")")?;
@@ -564,7 +574,10 @@ impl P {
         // Plain functions never see `super` (arrows inherit the flag).
         let save_super = self.super_ok;
         self.super_ok = false;
+        let save_gen = self.gen_ok;
+        self.gen_ok = is_gen;
         let body = self.block_body();
+        self.gen_ok = save_gen;
         self.super_ok = save_super;
         self.in_fn -= 1;
         Ok(Rc::new(FnDef {
@@ -588,13 +601,18 @@ impl P {
                     rest = Some(self.ident()?);
                     break;
                 }
-                let n = self.ident()?;
+                // Patterns allowed: `function f({a}, [b] = d)`.
+                let pat = if self.at_p("[") || self.at_p("{") {
+                    self.pattern()?
+                } else {
+                    Pat::Ident(self.ident()?)
+                };
                 let d = if self.eat_p("=") {
                     Some(self.assign()?)
                 } else {
                     None
                 };
-                params.push((n, d));
+                params.push((pat, d));
                 if !self.eat_p(",") {
                     break;
                 }
@@ -639,7 +657,7 @@ impl P {
                 self.i = save;
                 return Ok(None);
             }
-            (vec![(n, None)], None)
+            (vec![(Pat::Ident(n), None)], None)
         } else if self.at_p("(") {
             self.i += 1;
             let (ps, rest) = match self.param_list() {
@@ -778,7 +796,7 @@ impl P {
                 } else if self.at_p("(") {
                     // Method named `static`.
                     let (params, rest) = self.method_params()?;
-                    let body = self.method_body()?;
+                    let body = self.method_body(false)?;
                     members.push(ClassMember {
                         statik: false,
                         kind: MemberKind::Method(
@@ -818,14 +836,73 @@ impl P {
                     is_async = true;
                 }
             }
-            if self.eat_p("*") {
-                bail!("generators unsupported");
+            let is_gen = self.eat_p("*");
+            // `get [k]()` / `set [k](v)`: computed accessors.
+            if matches!(self.peek(), Tok::Ident(s) if s == "get" || s == "set")
+                && matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(Tok::P("[")))
+            {
+                if is_gen {
+                    bail!("generators cannot be accessors");
+                }
+                let is_get = matches!(self.peek(), Tok::Ident(s) if s == "get");
+                self.i += 1;
+                self.exp_p("[")?;
+                let key = self.expr()?;
+                self.exp_p("]")?;
+                self.exp_p("(")?;
+                let (params, rest) = self.param_list()?;
+                if rest.is_some() {
+                    bail!("rest in accessor params");
+                }
+                self.exp_p(")")?;
+                if is_async {
+                    bail!("async accessor unsupported");
+                }
+                let body = self.method_body(false)?;
+                let mk = |params, rest| {
+                    Rc::new(FnDef {
+                        name: None,
+                        params,
+                        body,
+                        is_async: false,
+                        is_arrow: false,
+                        rest,
+                        cls: None,
+                    })
+                };
+                if is_get {
+                    if !params.is_empty() {
+                        bail!("getter takes no params");
+                    }
+                    members.push(ClassMember {
+                        statik,
+                        kind: MemberKind::ComputedGet {
+                            key,
+                            def: mk(params, rest),
+                        },
+                    });
+                } else {
+                    if params.len() != 1 {
+                        bail!("setter takes one plain param");
+                    }
+                    members.push(ClassMember {
+                        statik,
+                        kind: MemberKind::ComputedSet {
+                            key,
+                            def: mk(params, rest),
+                        },
+                    });
+                }
+                continue;
             }
             // get/set accessors (a `(` right after means a method named
             // get/set instead).
             if matches!(self.peek(), Tok::Ident(s) if s == "get" || s == "set")
                 && !self.next_is_paren()
             {
+                if is_gen {
+                    bail!("generators cannot be accessors");
+                }
                 let is_get = matches!(self.peek(), Tok::Ident(s) if s == "get");
                 self.i += 1;
                 let prop = self.acc_name()?;
@@ -841,7 +918,7 @@ impl P {
                 if is_async {
                     bail!("async accessor unsupported");
                 }
-                let body = self.method_body()?;
+                let body = self.method_body(is_gen)?;
                 if is_get {
                     if !params.is_empty() {
                         bail!("getter takes no params");
@@ -862,7 +939,7 @@ impl P {
                         ),
                     });
                 } else {
-                    if params.len() != 1 || params[0].1.is_some() {
+                    if params.len() != 1 {
                         bail!("setter takes one plain param");
                     }
                     members.push(ClassMember {
@@ -885,8 +962,48 @@ impl P {
                 // the loop top handles `}` and the next member follows.
                 continue;
             }
-            let key = self.acc_name()?;
+            let key = if self.eat_p("[") {
+                // Computed `[k]` member: method or field (never ctor).
+                let key = self.expr()?;
+                self.exp_p("]")?;
+                if self.at_p("(") {
+                    self.exp_p("(")?;
+                    let (params, rest) = self.param_list()?;
+                    self.exp_p(")")?;
+                    let body = self.method_body(is_gen)?;
+                    members.push(ClassMember {
+                        statik,
+                        kind: MemberKind::ComputedMethod {
+                            key,
+                            def: Rc::new(FnDef {
+                                name: None,
+                                params,
+                                body,
+                                is_async,
+                                is_arrow: false,
+                                rest,
+                                cls: None,
+                            }),
+                        },
+                    });
+                    continue;
+                }
+                let init = self.field_init()?;
+                members.push(ClassMember {
+                    statik,
+                    kind: MemberKind::ComputedField { key, init },
+                });
+                continue;
+            } else {
+                self.acc_name()?
+            };
             if key == "constructor" && !statik && self.at_p("(") {
+                if is_gen {
+                    bail!("constructor may not be a generator");
+                }
+                if is_gen {
+                    bail!("constructor may not be a generator");
+                }
                 if ctor_seen {
                     bail!("duplicate constructor");
                 }
@@ -897,7 +1014,7 @@ impl P {
                 self.exp_p("(")?;
                 let (params, rest) = self.param_list()?;
                 self.exp_p(")")?;
-                let body = self.method_body()?;
+                let body = self.method_body(false)?;
                 members.push(ClassMember {
                     statik: false,
                     kind: MemberKind::Ctor { params, rest, body },
@@ -911,7 +1028,7 @@ impl P {
                 self.exp_p("(")?;
                 let (params, rest) = self.param_list()?;
                 self.exp_p(")")?;
-                let body = self.method_body()?;
+                let body = self.method_body(is_gen)?;
                 members.push(ClassMember {
                     statik,
                     kind: MemberKind::Method(
@@ -952,11 +1069,15 @@ impl P {
         Ok((params, rest))
     }
 
-    /// `{ stmts }` of a class method or constructor.
-    fn method_body(&mut self) -> R<Vec<Stmt>> {
+    /// `{ stmts }` of a class method or constructor. Generator
+    /// methods run plain; `yield` reads undefined inside them.
+    fn method_body(&mut self, is_gen: bool) -> R<Vec<Stmt>> {
         self.exp_p("{")?;
         self.in_fn += 1;
+        let save_gen = self.gen_ok;
+        self.gen_ok = is_gen;
         let body = self.block_body();
+        self.gen_ok = save_gen;
         self.in_fn -= 1;
         body
     }
@@ -980,6 +1101,107 @@ impl P {
             Ok(())
         } else {
             Err(self.unexp("expected ';'"))
+        }
+    }
+
+    /// Convert an array/object literal into a destructuring pattern for
+    /// plain assignment (`[a, [b]] = e`). Leaves must be identifiers or
+    /// nested patterns (member targets like `[a.b] = c` stay unsupported);
+    /// elisions (parsed as `Undef`) become holes.
+    fn expr_to_pat(e: Expr) -> R<Pat> {
+        match e {
+            Expr::Ident(n) => Ok(Pat::Ident(n)),
+            Expr::Arr(items) => {
+                if let Some(pos) = items.iter().position(|it| matches!(it, Expr::Spread(_))) {
+                    if pos != items.len() - 1 {
+                        return Err(err("rest must be last"));
+                    }
+                }
+                let mut els = Vec::new();
+                let mut rest = None;
+                for it in items {
+                    match it {
+                        Expr::Spread(inner) => match *inner {
+                            Expr::Ident(n) => {
+                                if rest.is_some() {
+                                    return Err(err("rest must be last"));
+                                }
+                                rest = Some(n);
+                            }
+                            _ => {
+                                return Err(err("destructuring rest must be an identifier"));
+                            }
+                        },
+                        Expr::Undef => els.push(None),
+                        Expr::Assign(op, l, r) => {
+                            if op != "=" {
+                                return Err(err("compound assignment in pattern"));
+                            }
+                            els.push(Some((Self::expr_to_pat(*l)?, Some(*r))));
+                        }
+                        other => els.push(Some((Self::expr_to_pat(other)?, None))),
+                    }
+                }
+                Ok(Pat::Arr(els, rest))
+            }
+            Expr::ObjLit(entries) => {
+                if let Some(pos) = entries
+                    .iter()
+                    .position(|en| matches!(en, ObjEntry::Spread(_)))
+                {
+                    if pos != entries.len() - 1 {
+                        return Err(err("rest must be last"));
+                    }
+                }
+                let mut fields = Vec::new();
+                let mut rest = None;
+                for en in entries {
+                    match en {
+                        ObjEntry::Pair(k, v) => match v {
+                            Expr::Ident(n) if n == k => {
+                                fields.push(ObjField {
+                                    key: k,
+                                    pat: Pat::Ident(n),
+                                    default: None,
+                                });
+                            }
+                            Expr::Assign(op, l, r) => {
+                            if op != "=" {
+                                return Err(err("compound assignment in pattern"));
+                            }
+                                fields.push(ObjField {
+                                    key: k,
+                                    pat: Self::expr_to_pat(*l)?,
+                                    default: Some(*r),
+                                });
+                            }
+                            v => fields.push(ObjField {
+                                key: k.clone(),
+                                pat: Self::expr_to_pat(v)?,
+                                default: None,
+                            }),
+                        },
+                        ObjEntry::Spread(e) => match e {
+                            Expr::Ident(n) => {
+                                if rest.is_some() {
+                                    return Err(err("rest must be last"));
+                                }
+                                rest = Some(n);
+                            }
+                            _ => {
+                                return Err(err("destructuring rest must be an identifier"));
+                            }
+                        },
+                        _ => {
+                            return Err(err(
+                                "getters and computed keys need identifiers in destructuring assignment",
+                            ))
+                        }
+                    }
+                }
+                Ok(Pat::Obj(fields, rest))
+            }
+            _ => Err(err("destructuring assignment needs identifiers")),
         }
     }
 
@@ -1010,14 +1232,19 @@ impl P {
         if is_decl {
             self.i += 1;
         }
-        let name = match self.peek().clone() {
-            Tok::Ident(s) => {
-                self.i += 1;
-                s
-            }
-            _ => {
-                self.i = save;
-                return Ok(None);
+        // Loop targets take patterns too: `for (var {k} of xs)`.
+        let pat = if self.at_p("[") || self.at_p("{") {
+            self.pattern()?
+        } else {
+            match self.peek().clone() {
+                Tok::Ident(s) => {
+                    self.i += 1;
+                    Pat::Ident(s)
+                }
+                _ => {
+                    self.i = save;
+                    return Ok(None);
+                }
             }
         };
         let is_of = matches!(self.peek(), Tok::Ident(s) if s == "of");
@@ -1035,14 +1262,14 @@ impl P {
         self.in_loop -= 1;
         Ok(Some(if is_of {
             Stmt::ForOf {
-                name,
+                pat,
                 is_decl,
                 iter: target,
                 body: Box::new(b?),
             }
         } else {
             Stmt::ForIn {
-                name,
+                pat,
                 is_decl,
                 obj: target,
                 body: Box::new(b?),
@@ -1114,12 +1341,32 @@ impl P {
         };
         if !matches!(
             op,
-            "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>=" | ">>>="
+            "=" | "+="
+                | "-="
+                | "*="
+                | "/="
+                | "%="
+                | "**="
+                | "&="
+                | "|="
+                | "^="
+                | "<<="
+                | ">>="
+                | ">>>="
         ) {
             return Ok(l);
         }
+        // Pattern assignment (plain `=` only): `[a] = e`, `{x} = e`.
+        if op == "=" {
+            if let Expr::Arr(_) | Expr::ObjLit(_) = l {
+                let pat = Self::expr_to_pat(l)?;
+                self.i += 1; // consume `=`
+                let r = self.assign()?;
+                return Ok(Expr::Destructure(pat, Box::new(r)));
+            }
+        }
         if !matches!(l, Expr::Ident(_) | Expr::Member(..) | Expr::Index(..)) {
-            return Err(err("bad assignment target"));
+            return Err(err(format!("bad assignment target at byte {}", self.pos())));
         }
         self.i += 1;
         let r = self.assign()?;
@@ -1177,7 +1424,19 @@ impl P {
     }
 
     fn mul(&mut self) -> R<Expr> {
-        self.binop(Self::unary, &["*", "/", "%"])
+        self.binop(Self::pow, &["*", "/", "%"])
+    }
+
+    /// `**` is right-assoc and binds tighter than `*`: `2**3**2` is
+    /// `2**(3**2)`. Both sides parse as unary (`2**-2` works); a unary
+    /// directly left (`-2**2`, a SyntaxError in V8) reads as (-2)**2.
+    fn pow(&mut self) -> R<Expr> {
+        let l = self.unary()?;
+        if !self.eat_p("**") {
+            return Ok(l);
+        }
+        let r = self.pow()?;
+        Ok(Expr::Bin("**", Box::new(l), Box::new(r)))
     }
 
     fn binop(&mut self, sub: fn(&mut Self) -> R<Expr>, ops: &[&'static str]) -> R<Expr> {
@@ -1213,6 +1472,9 @@ impl P {
             Tok::Kw("await") => "await",
             Tok::Kw("void") => "void",
             Tok::Kw("delete") => "delete",
+            // `yield` is only an operator inside `function*` (gen_ok);
+            // elsewhere it stays a plain identifier.
+            Tok::Ident(s) if s == "yield" && self.gen_ok => "yield",
             Tok::Kw("new") => "new",
             _ => "",
         };
@@ -1229,8 +1491,22 @@ impl P {
                 }
                 Ok(Expr::Unary(op, Box::new(e)))
             }
-            "typeof" | "await" | "void" | "delete" => {
+            "typeof" | "await" | "void" | "delete" | "yield" => {
                 self.i += 1;
+                // `yield* v` delegates; same stub either way. Bare `yield`
+                // (before `;`, `}`, `,` or `)`) yields undefined.
+                if op == "yield" {
+                    self.eat_p("*");
+                    if self.at_p(";")
+                        || self.at_p("}")
+                        || self.at_p(",")
+                        || self.at_p(")")
+                        || self.at_eof()
+                        || self.nl()
+                    {
+                        return Ok(Expr::Unary(op, Box::new(Expr::Undef)));
+                    }
+                }
                 Ok(Expr::Unary(op, Box::new(self.unary()?)))
             }
             "new" => {
@@ -1401,12 +1677,13 @@ impl P {
                 }
             }
             Tok::Kw("function") => {
+                let is_gen = self.eat_p("*");
                 let name = if matches!(self.peek(), Tok::Ident(_)) {
                     Some(self.ident()?)
                 } else {
                     None
                 };
-                Ok(Expr::Func(self.fn_tail(name, false)?))
+                Ok(Expr::Func(self.fn_tail(name, false, is_gen)?))
             }
             Tok::Kw("async") => {
                 // async function expression; `async` alone is not a primary
@@ -1415,12 +1692,13 @@ impl P {
                         "expected 'function' after 'async' at byte {pos}"
                     )));
                 }
+                let is_gen = self.eat_p("*");
                 let name = if matches!(self.peek(), Tok::Ident(_)) {
                     Some(self.ident()?)
                 } else {
                     None
                 };
-                Ok(Expr::Func(self.fn_tail(name, true)?))
+                Ok(Expr::Func(self.fn_tail(name, true, is_gen)?))
             }
             Tok::Kw("class") => {
                 let name = if matches!(self.peek(), Tok::Ident(_)) {
@@ -1455,6 +1733,15 @@ impl P {
                 let mut v = Vec::new();
                 if !self.eat_p("]") {
                     loop {
+                        // Elision: `[,,]` holes read as undefined (real
+                        // holes are skipped by forEach etc. - documented).
+                        if self.eat_p(",") {
+                            v.push(Expr::Undef);
+                            if self.eat_p("]") {
+                                break;
+                            }
+                            continue;
+                        }
                         if self.eat_p("...") {
                             v.push(Expr::Spread(Box::new(self.assign()?)));
                         } else {
@@ -1502,6 +1789,21 @@ impl P {
                             }
                             continue;
                         }
+                        // Async and generator prefixes: `async m()`,
+                        // `*m()`, `async *m()`. A bare `async` followed by
+                        // `(`, `,`, `}`, `:` or `=` is the key itself.
+                        let mut is_async = false;
+                        if matches!(self.peek(), Tok::Kw("async"))
+                            && !matches!(
+                                self.t.get(self.i + 1).map(|t| &t.t),
+                                Some(Tok::P("(" | "," | "}" | ":" | "=")) | Some(Tok::Eof) | None
+                            )
+                        {
+                            self.i += 1;
+                            is_async = true;
+                        }
+                        // Generator method `*m()`: the star precedes the key.
+                        let is_gen = self.eat_p("*");
                         let key = match self.bump() {
                             Tok::Ident(s) => s,
                             Tok::Kw(k) => k.to_string(),
@@ -1516,6 +1818,9 @@ impl P {
                         // `get x() {}` / `set x(v) {}` (not `get: v`, and not
                         // a method literally named `get`/`set`).
                         if (key == "get" || key == "set") && !self.at_p(":") && !self.at_p("(") {
+                            if is_async || is_gen {
+                                return Err(err("async/generator accessor unsupported"));
+                            }
                             let prop = self.acc_name()?;
                             self.exp_p("(")?;
                             let (params, rest) = self.param_list()?;
@@ -1525,7 +1830,10 @@ impl P {
                             self.exp_p(")")?;
                             self.exp_p("{")?;
                             self.in_fn += 1;
+                            let save_gen = self.gen_ok;
+                            self.gen_ok = is_gen;
                             let body = self.block_body();
+                            self.gen_ok = save_gen;
                             self.in_fn -= 1;
                             let def = Rc::new(FnDef {
                                 name: Some(prop.clone()),
@@ -1564,20 +1872,24 @@ impl P {
                             }
                             continue;
                         }
-                        // `m() {}` method shorthand.
+                        // `m() {}` method shorthand (`*m()` runs plain;
+                        // `yield` reads undefined inside).
                         if self.at_p("(") {
                             self.exp_p("(")?;
                             let (params, rest) = self.param_list()?;
                             self.exp_p(")")?;
                             self.exp_p("{")?;
                             self.in_fn += 1;
+                            let save_gen = self.gen_ok;
+                            self.gen_ok = is_gen;
                             let body = self.block_body();
+                            self.gen_ok = save_gen;
                             self.in_fn -= 1;
                             let def = Rc::new(FnDef {
                                 name: Some(key.clone()),
                                 params,
                                 body: body?,
-                                is_async: false,
+                                is_async,
                                 is_arrow: false,
                                 rest,
                                 cls: None,

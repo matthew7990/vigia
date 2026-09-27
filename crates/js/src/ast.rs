@@ -22,6 +22,8 @@ pub enum Expr {
     Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
     /// op: "=" or a compound op ("+=", ...). lhs: Ident | Member | Index.
     Assign(&'static str, Box<Expr>, Box<Expr>),
+    /// `[a, [b]] = e` / `{x} = e`: pattern assignment (plain `=` only).
+    Destructure(Pat, Box<Expr>),
     Call(Box<Expr>, Vec<Expr>),
     Member(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
@@ -98,7 +100,7 @@ pub struct ClassMember {
 #[derive(Debug, Clone)]
 pub enum MemberKind {
     Ctor {
-        params: Vec<(String, Option<Expr>)>,
+        params: Vec<(Pat, Option<Expr>)>,
         rest: Option<String>,
         body: Vec<Stmt>,
     },
@@ -106,6 +108,25 @@ pub enum MemberKind {
     Get(String, Rc<FnDef>),
     Set(String, Rc<FnDef>),
     Field(String, Option<Expr>),
+    /// Computed `[kexpr]` members; the key stringifies at eval (symbols
+    /// included, same rule as computed object keys - the iteration
+    /// protocols themselves stay unimplemented).
+    ComputedMethod {
+        key: Expr,
+        def: Rc<FnDef>,
+    },
+    ComputedGet {
+        key: Expr,
+        def: Rc<FnDef>,
+    },
+    ComputedSet {
+        key: Expr,
+        def: Rc<FnDef>,
+    },
+    ComputedField {
+        key: Expr,
+        init: Option<Expr>,
+    },
 }
 
 /// Constructor closure data: instance field initializers. `derived` is
@@ -126,7 +147,7 @@ pub enum OptOp {
 #[derive(Debug, Clone)]
 pub struct FnDef {
     pub name: Option<String>,
-    pub params: Vec<(String, Option<Expr>)>,
+    pub params: Vec<(Pat, Option<Expr>)>,
     pub body: Vec<Stmt>,
     /// `async function`: call wraps the result in a Promise; enables `await`.
     pub is_async: bool,
@@ -155,8 +176,9 @@ pub enum Stmt {
     For(Option<Box<Stmt>>, Option<Expr>, Option<Expr>, Box<Stmt>),
     /// Strict `for-of` over arrays and strings only:
     /// `for (var|let|const x of iter) body` (decl) or `for (x of iter) body`.
+    /// Targets take patterns: `for (var {k} of xs)`.
     ForOf {
-        name: String,
+        pat: Pat,
         is_decl: bool,
         iter: Expr,
         body: Box<Stmt>,
@@ -164,7 +186,7 @@ pub enum Stmt {
     /// Strict `for-in` over own enumerable keys (objects, array/string
     /// indices). Anything else iterates zero times.
     ForIn {
-        name: String,
+        pat: Pat,
         is_decl: bool,
         obj: Expr,
         body: Box<Stmt>,

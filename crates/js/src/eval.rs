@@ -1763,6 +1763,16 @@ impl Interp {
         self.protos.biguint64array = self.proto_bag(&[("fill", n_b64_fill)]);
         self.protos.textencoder = self.proto_bag(&[("encode", n_te_encode)]);
         self.protos.textdecoder = self.proto_bag(&[("decode", n_td_decode)]);
+        self.protos.intl_plural = self.proto_bag(&[
+            ("select", n_intl_plural_select),
+            ("resolvedOptions", n_intl_plural_resolved),
+        ]);
+        self.protos.intl_locale =
+            self.proto_bag(&[("toString", n_intl_locale_str)]);
+        self.protos.intl_number = self.proto_bag(&[
+            ("format", n_intl_number_format),
+            ("resolvedOptions", n_intl_number_resolved),
+        ]);
         self.protos.resizeobserver = self.proto_bag(&[
             ("observe", n_resize_observe),
             ("unobserve", n_resize_observe),
@@ -2530,6 +2540,24 @@ impl Interp {
         }
         if let Ok(r) = self.obj_pairs(rp) {
             self.env_declare(0, "Reflect", Value::Obj(r));
+        }
+        // Intl subset for Maps/i18next boot probes: a plain namespace
+        // object, so `new Intl()` reads "not a constructor" like V8; the
+        // three ctors hang off it instead of the globals.
+        {
+            let mut ip: Vec<(String, Value)> = Vec::new();
+            for (n, f, bag) in [
+                ("PluralRules", n_intl_plural as NativeFn, self.protos.intl_plural),
+                ("Locale", n_intl_locale, self.protos.intl_locale),
+                ("NumberFormat", n_intl_number, self.protos.intl_number),
+            ] {
+                if let Some(c) = intl_ctor(self, n, f, bag) {
+                    ip.push((n.into(), c));
+                }
+            }
+            if let Ok(o) = self.obj_pairs(ip) {
+                self.env_declare(0, "Intl", Value::Obj(o));
+            }
         }
         self.env_declare(0, "this", Value::Undef);
     }
@@ -6429,19 +6457,19 @@ fn n_number_cast(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value,
 
 /// Number.isFinite/isInteger/isNaN/isSafeInteger: no coercion (unlike
 /// the globals) - non-Numbers are false.
-fn n_number_is_finite(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+fn n_number_is_finite(_it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.is_finite())))
 }
 
-fn n_number_is_integer(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+fn n_number_is_integer(_it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.fract() == 0.0)))
 }
 
-fn n_number_is_nan(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+fn n_number_is_nan(_it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.is_nan())))
 }
 
-fn n_number_is_safe(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+fn n_number_is_safe(_it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0)))
 }
 
@@ -11374,6 +11402,297 @@ fn n_td_decode(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Js
     Ok(Value::Str(it.heap.alloc_str(s)?))
 }
 
+// -- Intl subset ---------------------------------------------------------------
+// Persona-grade, not CLDR: enough for Maps/i18next boot probes
+// (PluralRules.select, currency display, Locale tags). Currency renders
+// as `<CODE> <grouped-2-decimals>` - placement/symbols are approximate.
+
+/// `,` thousands grouping over ASCII digits; anything else (sign-only,
+/// exponents from huge f64s) passes through untouched.
+fn intl_group(s: &str) -> String {
+    let digits = s.strip_prefix('-').unwrap_or(s);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    if s.len() != digits.len() {
+        out.push('-');
+    }
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Plain decimal grouping over the engine's own number rendering, so
+/// NaN/Infinity spellings stay consistent with String(x).
+fn intl_decimal(n: f64) -> String {
+    if n.is_nan() {
+        return "NaN".into();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "∞".into() } else { "-∞".into() };
+    }
+    match fmt_num(n).split_once('.') {
+        Some((ip, fp)) => format!("{}.{}", intl_group(ip), fp),
+        None => intl_group(&fmt_num(n)),
+    }
+}
+
+fn intl_currency(n: f64, code: &str) -> String {
+    if n.is_nan() {
+        return "NaN".into();
+    }
+    if n.is_infinite() {
+        return if n > 0.0 { "∞".into() } else { "-∞".into() };
+    }
+    let s = format!("{:.2}", n);
+    let (ip, fp) = s.split_once('.').unwrap_or((&s, "00"));
+    let body = format!("{}.{}", intl_group(ip), fp);
+    match body.strip_prefix('-') {
+        Some(rest) => format!("-{code} {rest}"),
+        None => format!("{code} {body}"),
+    }
+}
+
+/// en/ordinal follows CLDR (1/2/3 + 21/22/23 minus teens); every other
+/// locale falls back to "other" for all inputs.
+fn intl_plural_kind(lang: &str, ty: &str, n: f64) -> &'static str {
+    if !n.is_finite() {
+        return "other";
+    }
+    match (lang, ty) {
+        ("en", "ordinal") => {
+            if n.fract() != 0.0 {
+                return "other";
+            }
+            let (m10, m100) = (
+                n.trunc().rem_euclid(10.0),
+                n.trunc().rem_euclid(100.0),
+            );
+            if m10 == 1.0 && m100 != 11.0 {
+                "one"
+            } else if m10 == 2.0 && m100 != 12.0 {
+                "two"
+            } else if m10 == 3.0 && m100 != 13.0 {
+                "few"
+            } else {
+                "other"
+            }
+        }
+        ("en", "cardinal") | ("es", "cardinal") => {
+            if n == 1.0 {
+                "one"
+            } else {
+                "other"
+            }
+        }
+        _ => "other",
+    }
+}
+
+/// Primary language subtag, lowercased, for rule selection.
+fn intl_lang(locale: &str) -> String {
+    locale
+        .split(|c| c == '-' || c == '_')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+/// "es-AR" -> ("es", Some("AR")); None on empty/non-tag input.
+fn intl_parse_tag(tag: &str) -> Option<(String, Option<String>)> {
+    let mut parts = tag.split(|c| c == '-' || c == '_');
+    let lang = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    if lang.is_empty() || !lang.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let region = parts
+        .next()
+        .map(|r| r.trim().to_ascii_uppercase())
+        .filter(|r| !r.is_empty());
+    Some((lang, region))
+}
+
+/// Plain-object options read: non-objects (or absent) mean defaults.
+fn intl_opt(it: &Interp, opts: Value, key: &str) -> Value {
+    match opts {
+        Value::Obj(_) => get_prop(&it.heap, &it.protos, opts, key).unwrap_or(Value::Undef),
+        _ => Value::Undef,
+    }
+}
+
+/// Fresh instance under its proto bag (n_td_ctor shape); state rides
+/// `__`-prefixed own props.
+fn intl_inst(it: &mut Interp, bag: u32) -> Result<Value, JsError> {
+    let proto = po(bag);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Ordinary {
+        pairs: Vec::new(),
+        proto,
+    })?))
+}
+
+fn intl_set_str(it: &mut Interp, inst: Value, key: &str, val: &str) -> Result<(), JsError> {
+    let id = it.heap.alloc_str(val.to_string())?;
+    set_prop(&mut it.heap, inst, key, Value::Str(id))
+}
+
+fn n_intl_plural(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let locale = match arg(args, 0) {
+        Value::Undef => "en".to_string(),
+        v => to_str(&it.heap, v),
+    };
+    let opts = arg(args, 1);
+    let mut ty = "cardinal".to_string();
+    if !matches!(intl_opt(it, opts, "type"), Value::Undef) {
+        let t = to_str(&it.heap, intl_opt(it, opts, "type"));
+        if t != "cardinal" && t != "ordinal" {
+            return Err(err(format!(
+                "RangeError: Value {t} out of range for Intl.PluralRules options property type"
+            )));
+        }
+        ty = t;
+    }
+    let mfd = match intl_opt(it, opts, "minimumFractionDigits") {
+        Value::Undef => Value::Undef,
+        v => Value::Num(to_num(&it.heap, v)),
+    };
+    let lang = intl_lang(&locale);
+    let inst = intl_inst(it, it.protos.intl_plural)?;
+    intl_set_str(it, inst, "__locale", &locale)?;
+    intl_set_str(it, inst, "__lang", &lang)?;
+    intl_set_str(it, inst, "__type", &ty)?;
+    set_prop(&mut it.heap, inst, "__mfd", mfd)?;
+    Ok(inst)
+}
+
+fn n_intl_plural_select(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = to_num(&it.heap, arg(args, 0));
+    let lang = to_str(&it.heap, intl_opt(it, this, "__lang"));
+    let ty = to_str(&it.heap, intl_opt(it, this, "__type"));
+    let kind = intl_plural_kind(&lang, &ty, n);
+    Ok(Value::Str(it.heap.alloc_str(kind.to_string())?))
+}
+
+fn n_intl_plural_resolved(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let mut pairs = vec![
+        (
+            "locale".to_string(),
+            Value::Str(it.heap.alloc_str(to_str(&it.heap, intl_opt(it, this, "__locale")))?),
+        ),
+        (
+            "type".to_string(),
+            Value::Str(it.heap.alloc_str(to_str(&it.heap, intl_opt(it, this, "__type")))?),
+        ),
+    ];
+    if !matches!(intl_opt(it, this, "__mfd"), Value::Undef) {
+        pairs.push(("minimumFractionDigits".into(), intl_opt(it, this, "__mfd")));
+    }
+    Ok(Value::Obj(it.obj_pairs(pairs)?))
+}
+
+fn n_intl_locale(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Value::Str(id) = arg(args, 0) else {
+        return Err(err("RangeError: Incorrect locale information provided"));
+    };
+    let tag = it.heap.get_str(id).to_string();
+    let Some((lang, mut region)) = intl_parse_tag(&tag) else {
+        return Err(err("RangeError: Incorrect locale information provided"));
+    };
+    if !matches!(intl_opt(it, arg(args, 1), "region"), Value::Undef) {
+        let r = to_str(&it.heap, intl_opt(it, arg(args, 1), "region"))
+            .trim()
+            .to_ascii_uppercase();
+        if !r.is_empty() {
+            region = Some(r);
+        }
+    }
+    let base = match &region {
+        Some(r) => format!("{lang}-{r}"),
+        None => lang.clone(),
+    };
+    let inst = intl_inst(it, it.protos.intl_locale)?;
+    intl_set_str(it, inst, "language", &lang)?;
+    match region {
+        Some(r) => intl_set_str(it, inst, "region", &r)?,
+        None => set_prop(&mut it.heap, inst, "region", Value::Undef)?,
+    }
+    intl_set_str(it, inst, "baseName", &base)?;
+    Ok(inst)
+}
+
+fn n_intl_locale_str(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    match intl_opt(it, this, "baseName") {
+        v @ Value::Str(_) => Ok(v),
+        _ => Ok(Value::Undef),
+    }
+}
+
+fn n_intl_number(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let locale = match arg(args, 0) {
+        Value::Undef => "en".to_string(),
+        v => to_str(&it.heap, v),
+    };
+    let opts = arg(args, 1);
+    let style = match intl_opt(it, opts, "style") {
+        Value::Undef => "decimal".to_string(),
+        v => to_str(&it.heap, v),
+    };
+    let currency = match intl_opt(it, opts, "currency") {
+        Value::Undef => Value::Undef,
+        v => Value::Str(it.heap.alloc_str(to_str(&it.heap, v).to_ascii_uppercase())?),
+    };
+    let inst = intl_inst(it, it.protos.intl_number)?;
+    intl_set_str(it, inst, "__locale", &locale)?;
+    intl_set_str(it, inst, "__style", &style)?;
+    set_prop(&mut it.heap, inst, "__currency", currency)?;
+    Ok(inst)
+}
+
+fn n_intl_number_format(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = to_num(&it.heap, arg(args, 0));
+    let out = match to_str(&it.heap, intl_opt(it, this, "__style")).as_str() {
+        "currency" => match intl_opt(it, this, "__currency") {
+            Value::Str(id) => intl_currency(n, &it.heap.get_str(id).to_string()),
+            _ => intl_decimal(n),
+        },
+        _ => intl_decimal(n),
+    };
+    Ok(Value::Str(it.heap.alloc_str(out)?))
+}
+
+fn n_intl_number_resolved(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let mut pairs = vec![
+        (
+            "locale".to_string(),
+            Value::Str(it.heap.alloc_str(to_str(&it.heap, intl_opt(it, this, "__locale")))?),
+        ),
+        (
+            "style".to_string(),
+            Value::Str(it.heap.alloc_str(to_str(&it.heap, intl_opt(it, this, "__style")))?),
+        ),
+    ];
+    if let Value::Str(_) = intl_opt(it, this, "__currency") {
+        pairs.push(("currency".into(), intl_opt(it, this, "__currency")));
+    }
+    Ok(Value::Obj(it.obj_pairs(pairs)?))
+}
+
+/// Intl sub-ctor value: Native with a "prototype" pair, mounted on the
+/// namespace instead of the globals.
+fn intl_ctor(it: &mut Interp, name: &'static str, f: NativeFn, bag: u32) -> Option<Value> {
+    let id = it.heap.alloc_obj(nat(name, f)).ok()?;
+    if let Obj::Native { pairs, .. } = it.heap.obj_mut(id) {
+        if let Some(p) = po(bag) {
+            pairs.push(("prototype".into(), Value::Obj(p)));
+        }
+    }
+    Some(Value::Obj(id))
+}
+
 // -- Proxy / Reflect -----------------------------------------------------------
 
 /// `new Proxy(target, handler)`: both must be objects (V8 throws
@@ -14992,6 +15311,54 @@ mod tests {
         assert_eq!(disp("URL.createObjectURL(0).slice(0,5)"), "blob:");
         assert_eq!(disp("URL.revokeObjectURL('blob:x')"), "undefined");
         assert!(errmsg("new URL(':::')").contains("invalid URL"));
+    }
+
+    #[test]
+    fn intl_subset() {
+        assert_eq!(
+            disp("var p=new Intl.PluralRules('en',{type:'ordinal'});[p.select(1),p.select(2),p.select(3),p.select(4)].join()"),
+            "one,two,few,other"
+        );
+        assert_eq!(disp("new Intl.PluralRules('en',{type:'ordinal'}).select(11)"), "other");
+        assert_eq!(disp("new Intl.PluralRules('en',{type:'ordinal'}).select(21)"), "one");
+        assert_eq!(disp("new Intl.PluralRules('en').select(1)"), "one");
+        assert_eq!(disp("new Intl.PluralRules('en').select(0)"), "other");
+        assert_eq!(disp("new Intl.PluralRules('en').select(2)"), "other");
+        assert_eq!(disp("new Intl.PluralRules('en').select('1')"), "one");
+        assert_eq!(disp("new Intl.PluralRules('es').select(1)"), "one");
+        assert_eq!(disp("new Intl.PluralRules('es').select(2)"), "other");
+        assert_eq!(disp("new Intl.PluralRules('es').select(1.5)"), "other");
+        assert_eq!(disp("new Intl.PluralRules('es',{type:'ordinal'}).select(1)"), "other");
+        assert_eq!(disp("new Intl.PluralRules('xx').select(1)"), "other");
+        assert_eq!(disp("new Intl.PluralRules('en-US').select(1)"), "one");
+        assert!(errmsg("new Intl.PluralRules('en',{type:'many'})").contains("RangeError"));
+        assert_eq!(disp("new Intl.PluralRules('en',{type:'ordinal'}).resolvedOptions().type"), "ordinal");
+        assert_eq!(disp("new Intl.PluralRules().resolvedOptions().locale"), "en");
+        assert_eq!(
+            disp("new Intl.PluralRules('en',{minimumFractionDigits:2}).resolvedOptions().minimumFractionDigits"),
+            "2"
+        );
+        assert_eq!(disp("new Intl.Locale('es-AR').region"), "AR");
+        assert_eq!(disp("new Intl.Locale('es-AR').language"), "es");
+        assert_eq!(disp("new Intl.Locale('es-AR').baseName"), "es-AR");
+        assert_eq!(disp("new Intl.Locale('es-AR').toString()"), "es-AR");
+        assert_eq!(disp("new Intl.Locale('en-US',{region:'GB'}).region"), "GB");
+        assert_eq!(disp("new Intl.Locale('es').region"), "undefined");
+        assert!(errmsg("new Intl.Locale('')").contains("RangeError"));
+        assert!(errmsg("new Intl.Locale(5)").contains("RangeError"));
+        assert_eq!(
+            disp("new Intl.NumberFormat('en',{style:'currency',currency:'USD'}).format(1234.5)"),
+            "USD 1,234.50"
+        );
+        assert_eq!(disp("new Intl.NumberFormat('en').format(1234567.891)"), "1,234,567.891");
+        assert_eq!(disp("new Intl.NumberFormat('en').format(Infinity)"), "∞");
+        assert_eq!(disp("new Intl.NumberFormat('en').format(NaN)"), "NaN");
+        assert_eq!(
+            disp("new Intl.NumberFormat('en',{style:'currency',currency:'USD'}).resolvedOptions().currency"),
+            "USD"
+        );
+        assert_eq!(disp("new Intl.NumberFormat('en').resolvedOptions().style"), "decimal");
+        assert!(errmsg("new Intl()").contains("not a constructor"));
     }
 
     #[test]

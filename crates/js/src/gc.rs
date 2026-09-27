@@ -345,6 +345,7 @@ impl Interp {
             self.protos.textdecoder,
             self.protos.storage,
             self.protos.resizeobserver,
+            self.protos.intersectionobserver,
             self.protos.event,
             self.protos.custom_event,
             self.protos.mouse_event,

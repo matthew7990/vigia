@@ -2272,7 +2272,30 @@ fn event_fill(
         };
         set_prop(&mut it.heap, target, key, v)?;
     }
+    if kind == "MouseEvent" || kind == "KeyboardEvent" {
+        let m = Value::Obj(it.heap.alloc_obj(nat("getModifierState", n_event_mod_state))?);
+        set_prop(&mut it.heap, target, "getModifierState", m)?;
+    }
     Ok(())
+}
+
+/// getModifierState on mouse/keyboard events: modifier keys read live
+/// off the event, every other key false; never throws.
+fn n_event_mod_state(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Value::Str(id) = arg(args, 0) else {
+        return Ok(Value::Bool(false));
+    };
+    let prop = match it.heap.get_str(id) {
+        "Control" => "ctrlKey",
+        "Alt" => "altKey",
+        "Shift" => "shiftKey",
+        "Meta" => "metaKey",
+        _ => return Ok(Value::Bool(false)),
+    };
+    match get_prop(&it.heap, &it.protos, this, prop) {
+        Ok(v) => Ok(Value::Bool(truthy(&it.heap, v))),
+        Err(_) => Ok(Value::Bool(false)),
+    }
 }
 
 /// `new Event/CustomEvent/MouseEvent/KeyboardEvent(type, init?)`: one
@@ -2629,7 +2652,7 @@ fn tokens_node(it: &Interp) -> Result<NodeId, JsError> {
 }
 
 /// Zero DOMRect: no layout engine, so geometry is all zeros.
-fn zero_rect(it: &mut Interp) -> Result<u32, JsError> {
+pub(crate) fn zero_rect(it: &mut Interp) -> Result<u32, JsError> {
     it.obj_pairs(vec![
         ("x".into(), Value::Num(0.0)),
         ("y".into(), Value::Num(0.0)),
@@ -3861,6 +3884,90 @@ mod tests {
         );
         // unknown createEvent name throws
         assert!(errmsg(&mut it, "document.createEvent('Nope')").contains("unknown"));
+    }
+
+    #[test]
+    fn intersection_observer_visible() {
+        let mut it = interp(PAGE);
+        assert_eq!(ev(&mut it, "typeof IntersectionObserver"), "function");
+        assert!(errmsg(&mut it, "new IntersectionObserver(1)").contains("callback"));
+        assert_eq!(
+            ev(&mut it, "typeof new IntersectionObserver(function(){},{threshold:0.5}).observe"),
+            "function"
+        );
+        // observe fires one all-visible entry per target; the zero timer
+        // drains after the completion value, so read back in a second run.
+        it.run(
+            "var got=null;var seen=null;var el=document.getElementById('a');\
+             var o=new IntersectionObserver(function(e,obs){got=e;seen=obs});\
+             o.observe(el)",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "got.length"), "1");
+        assert_eq!(ev(&mut it, "got[0].isIntersecting"), "true");
+        assert_eq!(ev(&mut it, "got[0].intersectionRatio"), "1");
+        assert_eq!(ev(&mut it, "got[0].target === el"), "true");
+        assert_eq!(ev(&mut it, "seen === o"), "true");
+        assert_eq!(ev(&mut it, "got[0].rootBounds"), "null");
+        assert_eq!(ev(&mut it, "typeof got[0].time"), "number");
+        assert_eq!(ev(&mut it, "typeof got[0].boundingClientRect"), "object");
+        // non-node target throws; re-observing dedupes to one entry.
+        assert!(errmsg(&mut it, "o.observe({})").contains("node"));
+        it.run("var g2=null;var o3=new IntersectionObserver(function(e){g2=e});o3.observe(el);o3.observe(el)")
+            .unwrap();
+        assert_eq!(ev(&mut it, "g2.length"), "1");
+        // takeRecords already drained empty.
+        assert_eq!(ev(&mut it, "Array.isArray(o.takeRecords())"), "true");
+        assert_eq!(ev(&mut it, "o.takeRecords().length"), "0");
+    }
+
+    #[test]
+    fn intersection_observer_cancel() {
+        let mut it = interp(PAGE);
+        // disconnect before the drain means the callback never fires.
+        it.run(
+            "var fired=false;var el=document.getElementById('a');\
+             var o=new IntersectionObserver(function(){fired=true});\
+             o.observe(el);o.disconnect();",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "fired"), "false");
+        // unobserve drops one target while the other still fires.
+        it.run(
+            "var n=0;var b=document.body;\
+             var o2=new IntersectionObserver(function(e){n=e.length});\
+             o2.observe(el);o2.observe(b);o2.unobserve(el);",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "n"), "1");
+    }
+
+    #[test]
+    fn event_modifier_state() {
+        let mut it = interp(PAGE);
+        assert_eq!(
+            ev(&mut it, "new KeyboardEvent('d',{ctrlKey:true}).getModifierState('Control')"),
+            "true"
+        );
+        assert_eq!(
+            ev(&mut it, "new KeyboardEvent('d',{ctrlKey:true}).getModifierState('Alt')"),
+            "false"
+        );
+        assert_eq!(
+            ev(&mut it, "new KeyboardEvent('d',{ctrlKey:true}).getModifierState('CapsLock')"),
+            "false"
+        );
+        assert_eq!(
+            ev(&mut it, "new MouseEvent('c',{shiftKey:true}).getModifierState('Shift')"),
+            "true"
+        );
+        assert_eq!(ev(&mut it, "new MouseEvent('c').getModifierState('Meta')"), "false");
+        assert_eq!(ev(&mut it, "new MouseEvent('c').getModifierState(5)"), "false");
+        assert_eq!(ev(&mut it, "new MouseEvent('c').getModifierState()"), "false");
+        assert_eq!(
+            ev(&mut it, "document.createEvent('MouseEvents').getModifierState('Alt')"),
+            "false"
+        );
     }
 
     #[test]

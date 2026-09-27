@@ -13,7 +13,7 @@ use crate::ast::{
 use crate::{
     bindings::{
         WIN_EVENTS, n_dom_method, n_event_ctor, n_get_computed_style, n_image_ctor,
-        n_win_add_event_listener, n_win_dispatch_event, n_win_remove_event_listener,
+        n_win_add_event_listener, n_win_dispatch_event, n_win_remove_event_listener, zero_rect,
     },
     err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
     Protos, ThenHandler, Timer, TypedKind, Value,
@@ -1420,6 +1420,12 @@ impl Interp {
             ("unobserve", n_resize_observe),
             ("disconnect", n_resize_observe),
         ]);
+        self.protos.intersectionobserver = self.proto_bag(&[
+            ("observe", n_io_observe),
+            ("unobserve", n_io_unobserve),
+            ("disconnect", n_io_disconnect),
+            ("takeRecords", n_io_records),
+        ]);
         self.protos.storage = self.proto_bag(&[
             ("getItem", n_storage_get),
             ("setItem", n_storage_set),
@@ -1839,6 +1845,12 @@ impl Interp {
         self.ctor("TextEncoder", n_te_ctor, pr.textencoder, &[]);
         self.ctor("TextDecoder", n_td_ctor, pr.textdecoder, &[]);
         self.ctor("ResizeObserver", n_resize_observer_ctor, pr.resizeobserver, &[]);
+        self.ctor(
+            "IntersectionObserver",
+            n_io_ctor,
+            pr.intersectionobserver,
+            &[],
+        );
         // IndexedDB interface guards (bare references must not throw
         // ReferenceError where V8 has the classes; open() lives on the
         // navigator.indexedDB object above).
@@ -8982,6 +8994,126 @@ fn n_resize_observer_ctor(
 
 fn n_resize_observe(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
     let _ = it;
+    Ok(Value::Undef)
+}
+
+/// IntersectionObserver: the scraping viewport has no fold, so every
+/// observed target reads as visible (lazy content loads instead of
+/// taking the headless fallback). observe() records the target and
+/// fires one all-visible entry for it on a zero timer; unobserve /
+/// disconnect drop targets so pending entries never fire.
+fn n_io_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(cb) = callable(it, arg(args, 0)) else {
+        return Err(err("IntersectionObserver needs a callback"));
+    };
+    let proto = po(it.protos.intersectionobserver);
+    let targets = Value::Obj(it.arr_obj(Vec::new())?);
+    let id = it.heap.alloc_obj(Obj::Ordinary {
+        pairs: vec![
+            ("__cb".into(), cb),
+            ("__targets".into(), targets),
+            ("__gen".into(), Value::Num(0.0)),
+        ],
+        proto,
+    })?;
+    Ok(Value::Obj(id))
+}
+
+/// Live (callback, targets array id, targets, generation) on an
+/// observer instance; None when `this` is detached or clobbered.
+fn io_state(it: &Interp, obs: Value) -> Option<(Value, u32, Vec<Value>, f64)> {
+    let cb = get_prop(&it.heap, &it.protos, obs, "__cb").ok()?;
+    let arr = match get_prop(&it.heap, &it.protos, obs, "__targets").ok()? {
+        Value::Obj(a) => a,
+        _ => return None,
+    };
+    let items = match it.heap.obj(arr) {
+        Obj::Arr { items, .. } => items.clone(),
+        _ => return None,
+    };
+    let gen = to_num(&it.heap, get_prop(&it.heap, &it.protos, obs, "__gen").ok()?);
+    Some((cb, arr, items, gen))
+}
+
+fn n_io_observe(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let target = arg(args, 0);
+    if it.as_node(target).is_none() {
+        return Err(err("IntersectionObserver.observe needs a node"));
+    }
+    let Some((_, arr, items, gen)) = io_state(it, this) else {
+        return Err(err("IntersectionObserver.observe needs an observer"));
+    };
+    if items.contains(&target) {
+        return Ok(Value::Undef);
+    }
+    if let Obj::Arr { items, .. } = it.heap.obj_mut(arr) {
+        items.push(target);
+    }
+    // Zero-timer entry for this target; the fire fn carries observer +
+    // target + generation so removals win over scheduling.
+    let fire = Value::Obj(it.heap.alloc_obj(nat("fireIo", n_io_fire))?);
+    let st = Value::Obj(it.heap.alloc_obj(nat("setTimeout", n_set_timeout))?);
+    let _ = it.call_value(st, Value::Undef, &[fire, Value::Num(0.0)], None);
+    let _ = set_prop(&mut it.heap, fire, "__obs", this);
+    let _ = set_prop(&mut it.heap, fire, "__target", target);
+    let _ = set_prop(&mut it.heap, fire, "__gen", Value::Num(gen));
+    Ok(Value::Undef)
+}
+
+fn n_io_unobserve(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let target = arg(args, 0);
+    if it.as_node(target).is_none() {
+        return Err(err("IntersectionObserver.unobserve needs a node"));
+    }
+    if let Some((_, arr, _, _)) = io_state(it, this) {
+        if let Obj::Arr { items, .. } = it.heap.obj_mut(arr) {
+            items.retain(|t| *t != target);
+        }
+    }
+    Ok(Value::Undef)
+}
+
+fn n_io_disconnect(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    if let Some((_, arr, _, gen)) = io_state(it, this) {
+        if let Obj::Arr { items, .. } = it.heap.obj_mut(arr) {
+            items.clear();
+        }
+        let _ = set_prop(&mut it.heap, this, "__gen", Value::Num(gen + 1.0));
+    }
+    Ok(Value::Undef)
+}
+
+fn n_io_records(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Obj(it.arr_obj(Vec::new())?))
+}
+
+fn n_io_fire(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let me = it.cur_native;
+    let obs = get_prop(&it.heap, &it.protos, me, "__obs")?;
+    let target = get_prop(&it.heap, &it.protos, me, "__target")?;
+    let gen_at = to_num(&it.heap, get_prop(&it.heap, &it.protos, me, "__gen")?);
+    let Some((cb, _, items, gen)) = io_state(it, obs) else {
+        return Ok(Value::Undef);
+    };
+    if gen != gen_at || !items.contains(&target) {
+        return Ok(Value::Undef);
+    }
+    let Some(cb) = callable(it, cb) else {
+        return Ok(Value::Undef);
+    };
+    let brect = Value::Obj(zero_rect(it)?);
+    let irect = Value::Obj(zero_rect(it)?);
+    let entry = it.obj_pairs(vec![
+        ("target".into(), target),
+        ("isIntersecting".into(), Value::Bool(true)),
+        ("intersectionRatio".into(), Value::Num(1.0)),
+        ("boundingClientRect".into(), brect),
+        ("intersectionRect".into(), irect),
+        ("rootBounds".into(), Value::Null),
+        ("time".into(), Value::Num(it.perf_elapsed())),
+    ])?;
+    let entries = Value::Obj(it.arr_obj(vec![Value::Obj(entry)])?);
+    let _ = it.call_value(cb, obs, &[entries, obs], None);
     Ok(Value::Undef)
 }
 

@@ -1581,6 +1581,20 @@ impl P {
             }
             "new" => {
                 self.i += 1;
+                // `new.target` meta-property. Gaps (`new . target`) are
+                // accepted here though V8 rejects them; `new .` was always
+                // an error before, so this is a harmless superset.
+                if self.at_p(".") {
+                    self.i += 1;
+                    match self.bump() {
+                        Tok::Ident(s) if s == "target" => return self.call_tail(Expr::NewTarget),
+                        t => {
+                            return Err(err(format!(
+                                "expected `target` after `new.`, got {t:?}"
+                            )))
+                        }
+                    }
+                }
                 let e = self.new_expr()?;
                 self.call_tail(e)
             }

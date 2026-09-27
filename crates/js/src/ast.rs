@@ -51,6 +51,9 @@ pub enum Expr {
     },
     /// `super(args)` in a derived constructor.
     SuperCall(Vec<Expr>),
+    /// `new.target`: the constructor `new` (or Reflect.construct's
+    /// newTarget) dispatched to. Reads undefined outside construction.
+    NewTarget,
     /// `super.name` / `super[key]`: method lookup on the parent prototype.
     SuperProp(Box<Expr>),
     /// Optional chain: base + steps. Each step carries its own `?.` flag.

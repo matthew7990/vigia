@@ -684,6 +684,11 @@ pub struct Interp {
     /// `super()` / `super.m` resolve against the top. Pushed by
     /// call_value for Funcs carrying `__super`, popped on return.
     pub(crate) super_stack: Vec<Value>,
+    /// Handoff slot: the construct dispatch (or `super()`) sets the
+    /// newTarget just before call_value; the callee frame takes it on
+    /// entry (None between calls). Natives clear it so sync callbacks
+    /// they invoke see undefined, like plain calls.
+    pub(crate) pending_new_target: Option<Value>,
     /// In-flight call chain (func obj ids, innermost last) for error
     /// context ("x is not defined (in S > ?)"). Pushed next to the
     /// super_stack push so `?`s cannot leak it.
@@ -782,6 +787,7 @@ impl Interp {
             fn_async: false,
             func_env: 0,
             super_stack: Vec::new(),
+            pending_new_target: None,
             js_stack: Vec::new(),
             throw_chain: None,
             blob_next: 0,

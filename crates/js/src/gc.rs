@@ -315,6 +315,9 @@ impl Interp {
         for &v in &self.super_stack {
             m.val(v);
         }
+        if let Some(v) = self.pending_new_target {
+            m.val(v);
+        }
         for p in [
             self.protos.object,
             self.protos.array,

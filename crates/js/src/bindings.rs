@@ -11,7 +11,8 @@ use vigia_session::CookieJar;
 
 use crate::ast::{Expr, Stmt};
 use crate::eval::{
-    arg, get_prop, nat, n_const_false, n_const_true, set_prop, to_num, to_str, truthy,
+    arg, get_prop, nat, n_connection, n_const_false, n_geolocation, n_indexed_db, n_send_beacon,
+    n_user_agent_data, set_prop, to_num, to_str, truthy,
 };
 use crate::{err, po, Interp, JsError, NativeFn, NetCtx, Obj, PendingSubmit, Value};
 
@@ -259,12 +260,30 @@ impl Interp {
                     "javaEnabled".into(),
                     Value::Obj(heap.alloc_obj(nat("javaEnabled", n_const_false))?),
                 ),
+                (
+                    "sendBeacon".into(),
+                    Value::Obj(heap.alloc_obj(nat("sendBeacon", n_send_beacon))?),
+                ),
             ];
             if let Some(l) = langs {
                 v.push(("languages".into(), Value::Obj(l)));
             }
             Ok(v)
         })();
+        // Object-valued navigator members (built via their natives so
+        // shapes stay in one place).
+        let mut nav_extra: Vec<(String, Value)> = Vec::new();
+        for (k, mk) in [
+            ("connection", n_connection as NativeFn),
+            ("geolocation", n_geolocation),
+            ("userAgentData", n_user_agent_data),
+            ("indexedDB", n_indexed_db),
+        ] {
+            match mk(self, Value::Undef, &[]) {
+                Ok(v) => nav_extra.push((k.into(), v)),
+                Err(_) => break,
+            }
+        }
         let (Ok(nav_pairs), Ok(loc)) = (
             nav_pairs,
             self.obj_pairs(vec![("href".into(), Value::Str(href))]),
@@ -274,6 +293,9 @@ impl Interp {
         let Ok(nav) = self.obj_pairs(nav_pairs) else {
             return;
         };
+        for (k, v) in nav_extra {
+            let _ = set_prop(&mut self.heap, Value::Obj(nav), &k, v);
+        }
         self.env_declare(0, "navigator", Value::Obj(nav));
         self.env_declare(0, "location", Value::Obj(loc));
         // Populate href + derived parts (routers read pathname at boot).
@@ -2409,6 +2431,23 @@ mod tests {
         assert_eq!(ev(&mut it, "navigator.userAgent.indexOf('Chrome/126') !== -1"), "true");
         assert_eq!(ev(&mut it, "navigator.vendor"), "Google Inc.");
         assert_eq!(ev(&mut it, "window.navigator === navigator"), "true");
+    }
+
+    #[test]
+    fn navigator_extras() {
+        let mut it = interp(PAGE);
+        assert_eq!(ev(&mut it, "navigator.sendBeacon('/x')"), "true");
+        assert_eq!(ev(&mut it, "navigator.connection.effectiveType"), "4g");
+        assert_eq!(ev(&mut it, "navigator.geolocation.toString()"), "[object Geolocation]");
+        assert_eq!(ev(&mut it, "navigator.userAgentData.platform"), "Linux");
+        assert_eq!(ev(&mut it, "navigator.userAgentData.brands.length"), "3");
+        assert_eq!(ev(&mut it, "typeof navigator.indexedDB.open"), "function");
+        assert_eq!(ev(&mut it, "typeof IDBRequest"), "function");
+        // getHighEntropyValues resolves the static dict.
+        assert_eq!(
+            ev(&mut it, "var r='';navigator.userAgentData.getHighEntropyValues().then(function(d){r=d.platform});r"),
+            ""
+        );
     }
 
     #[test]

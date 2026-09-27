@@ -1302,6 +1302,7 @@ impl Interp {
             ("call", n_fn_call),
             ("apply", n_fn_apply),
             ("bind", n_fn_bind),
+            ("toString", n_fn_to_string),
         ]);
         self.protos.array = self.proto_bag(&[
             ("push", n_arr_push),
@@ -1785,6 +1786,16 @@ impl Interp {
         self.ctor("TextEncoder", n_te_ctor, pr.textencoder, &[]);
         self.ctor("TextDecoder", n_td_ctor, pr.textdecoder, &[]);
         self.ctor("ResizeObserver", n_resize_observer_ctor, pr.resizeobserver, &[]);
+        // IndexedDB interface guards (bare references must not throw
+        // ReferenceError where V8 has the classes; open() lives on the
+        // navigator.indexedDB object above).
+        self.ctor("IDBRequest", n_dom_illegal, pr.object, &[]);
+        self.ctor("IDBDatabase", n_dom_illegal, pr.object, &[]);
+        self.ctor("IDBObjectStore", n_dom_illegal, pr.object, &[]);
+        self.ctor("IDBIndex", n_dom_illegal, pr.object, &[]);
+        self.ctor("IDBCursor", n_dom_illegal, pr.object, &[]);
+        self.ctor("IDBTransaction", n_dom_illegal, pr.object, &[]);
+        self.ctor("IDBKeyRange", n_dom_illegal, pr.object, &[]);
         self.ctor("Function", n_function_ctor, pr.function_, &[]);
         // Numeric statics the bundle reads (BYTES_PER_ELEMENT per view).
         for (name, bpe) in [
@@ -2029,6 +2040,16 @@ impl Interp {
                 }
             }
             pp.push(("timeOrigin".into(), Value::Num(self.perf_t0 as f64)));
+            // Chrome-only memory counters (stable persona values;
+            // absence reads Firefox/Safari-like, mismatched under a
+            // Chrome UA).
+            if let Ok(mem) = self.obj_pairs(vec![
+                ("jsHeapSizeLimit".into(), Value::Num(4294967296.0)),
+                ("totalJSHeapSize".into(), Value::Num(32000000.0)),
+                ("usedJSHeapSize".into(), Value::Num(19000000.0)),
+            ]) {
+                pp.push(("memory".into(), Value::Obj(mem)));
+            }
             if let Ok(p) = self.obj_pairs(pp) {
                 self.env_declare(0, "performance", Value::Obj(p));
             }
@@ -5447,6 +5468,21 @@ fn n_fn_apply(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsE
     it.call_value(this, t, &argv, None)
 }
 
+/// Function.prototype.toString: natives render `function n() {
+/// [native code] }`, user functions their shape tag. Bot-agent
+/// monkey-patch detectors key on exactly this distinction. Non-callable
+/// receivers throw like V8.
+fn n_fn_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    match this {
+        Value::Obj(id)
+            if matches!(
+                it.heap.obj(id),
+                Obj::Func { .. } | Obj::Native { .. }
+            ) => Ok(Value::Str(it.heap.alloc_str(to_str(&it.heap, this))?)),
+        _ => Err(err("Function.prototype.toString needs a function")),
+    }
+}
+
 /// `f.bind(thisArg, ...bound)`: a Native carrying target/this/args in
 /// its own pairs (the bound-state pattern). `new` on it ignores the
 /// fresh object, like sloppy reality is not worth modeling.
@@ -8859,11 +8895,6 @@ pub(crate) fn n_const_false(it: &mut Interp, _this: Value, _args: &[Value]) -> R
     Ok(Value::Bool(false))
 }
 
-pub(crate) fn n_const_true(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
-    let _ = it;
-    Ok(Value::Bool(true))
-}
-
 /// ResizeObserver: records observations, never fires (no layout engine
 /// to observe - poppers just never reposition). Enough for sidebar code
 /// that constructs + observes + disconnects at boot.
@@ -8925,6 +8956,199 @@ fn n_perf_empty_arr(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Va
 
 fn n_perf_noop(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
     let _ = it;
+    Ok(Value::Undef)
+}
+
+/// navigator.sendBeacon(url, data?): best-effort sync POST through the
+/// page jar (traced like fetch), always true like V8 - failures never
+/// surface to the caller.
+pub(crate) fn n_send_beacon(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let raw = to_str(&it.heap, arg(args, 0));
+    let data = arg(args, 1);
+    if it.net.is_none() {
+        return Ok(Value::Bool(true));
+    }
+    let bytes: Vec<u8> = match data {
+        Value::Str(id) => it.heap.get_str(id).as_bytes().to_vec(),
+        Value::Obj(bid) => match it.heap.obj(bid) {
+            Obj::Arr { items, .. } => items
+                .iter()
+                .map(|x| to_u8(&it.heap, *x))
+                .collect(),
+            Obj::Bytes { bytes, .. } => bytes.clone(),
+            Obj::Typed { elems, kind, .. } => {
+                elems.iter().map(|e| to_u8_num(t_write(*kind, *e))).collect()
+            }
+            _ => to_str(&it.heap, data).into_bytes(),
+        },
+        Value::Undef | Value::Null => Vec::new(),
+        _ => to_str(&it.heap, data).into_bytes(),
+    };
+    let ctx = it.net.as_mut().unwrap();
+    if let Ok(url) = ctx.base.join(&raw) {
+        let res = vigia_net::req(
+            &url.to_string(),
+            "POST",
+            &[],
+            if bytes.is_empty() { None } else { Some(&bytes) },
+            &mut ctx.jar,
+        );
+        if let Some(trace) = &ctx.trace {
+            let mut ev = NetEvent {
+                method: "POST".into(),
+                url: url.to_string(),
+                status: 0,
+                req_body: (!bytes.is_empty()).then(|| trunc_body(&String::from_utf8_lossy(&bytes))),
+                resp_body: None,
+                error: None,
+            };
+            match &res {
+                Ok(r) => {
+                    ev.status = r.status;
+                }
+                Err(e) => ev.error = Some(format!("{e:?}")),
+            }
+            trace.borrow_mut().push(ev);
+        }
+    }
+    Ok(Value::Bool(true))
+}
+
+/// navigator.connection persona: steady desktop wifi (stormcaster
+/// reads effectiveType/downlink/rtt when present, else a constant).
+pub(crate) fn n_connection(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let et = Value::Str(it.heap.alloc_str("4g".into())?);
+    Ok(Value::Obj(it.obj_pairs(vec![
+        ("effectiveType".into(), et),
+        ("downlink".into(), Value::Num(10.0)),
+        ("rtt".into(), Value::Num(50.0)),
+        ("saveData".into(), Value::Bool(false)),
+    ])?))
+}
+
+/// navigator.geolocation: presence + V8-shaped toString. No position
+/// fix is ever produced here (getCurrentPosition never fires its
+/// callback - documented gap); existence is what the collectors probe.
+pub(crate) fn n_geolocation(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let mut ids = Vec::new();
+    for (n, f) in [
+        ("getCurrentPosition", n_geolocation_noop as NativeFn),
+        ("watchPosition", n_geolocation_noop),
+        ("clearWatch", n_geolocation_noop),
+        ("toString", n_geo_to_string),
+    ] {
+        ids.push((n.into(), Value::Obj(it.heap.alloc_obj(nat(n, f))?)));
+    }
+    Ok(Value::Obj(it.obj_pairs(ids)?))
+}
+
+fn n_geolocation_noop(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(Value::Undef)
+}
+
+/// Geolocation.prototype.toString: "[object Geolocation]" (the
+/// collector matches /object Geolocation/ against it explicitly).
+fn n_geo_to_string(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Str(it.heap.alloc_str("[object Geolocation]".into())?))
+}
+
+/// navigator.userAgentData (Client Hints): Chrome 126 brand set +
+/// getHighEntropyValues resolving the static dict.
+pub(crate) fn n_user_agent_data(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let s_chromium = Value::Str(it.heap.alloc_str("Chromium".into())?);
+    let s_gc = Value::Str(it.heap.alloc_str("Google Chrome".into())?);
+    let s_nab = Value::Str(it.heap.alloc_str("Not-A.Brand".into())?);
+    let v126 = Value::Str(it.heap.alloc_str("126".into())?);
+    let v99 = Value::Str(it.heap.alloc_str("99".into())?);
+    let s_linux = Value::Str(it.heap.alloc_str("Linux".into())?);
+    let b1 = Value::Obj(it.obj_pairs(vec![
+        ("brand".into(), s_chromium),
+        ("version".into(), v126),
+    ])?);
+    let b2 = Value::Obj(it.obj_pairs(vec![("brand".into(), s_gc), ("version".into(), v126)])?);
+    let b3 = Value::Obj(it.obj_pairs(vec![("brand".into(), s_nab), ("version".into(), v99)])?);
+    let brands = Value::Obj(it.arr_obj(vec![b1, b2, b3])?);
+    let ghe = Value::Obj(it.heap.alloc_obj(nat("getHighEntropyValues", n_ua_entropy))?);
+    Ok(Value::Obj(it.obj_pairs(vec![
+        ("brands".into(), brands),
+        ("mobile".into(), Value::Bool(false)),
+        ("platform".into(), s_linux),
+        ("getHighEntropyValues".into(), ghe),
+    ])?))
+}
+
+fn n_ua_entropy(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let dict = [
+        ("architecture", "x86"),
+        ("bitness", "64"),
+        ("model", ""),
+        ("platform", "Linux"),
+        ("platformVersion", ""),
+        ("uaFullVersion", "126.0.0.0"),
+    ];
+    let mut pairs = Vec::with_capacity(dict.len() + 2);
+    for (k, v) in dict {
+        pairs.push((k.into(), Value::Str(it.heap.alloc_str(v.to_string())?)));
+    }
+    let gc_brand = Value::Str(it.heap.alloc_str("Google Chrome".into())?);
+    let full_ver = Value::Str(it.heap.alloc_str("126.0.0.0".into())?);
+    let bfull = Value::Obj(it.obj_pairs(vec![
+        ("brand".into(), gc_brand),
+        ("version".into(), full_ver),
+    ])?);
+    let full = Value::Obj(it.arr_obj(vec![bfull])?);
+    pairs.push(("fullVersionList".into(), full));
+    pairs.push(("mobile".into(), Value::Bool(false)));
+    let p = promise_new(it)?;
+    let dict = Value::Obj(it.obj_pairs(pairs)?);
+    it.promise_settle(p, false, dict);
+    Ok(Value::Obj(p))
+}
+
+/// navigator.indexedDB: presence plus an open() that fails the V8 way
+/// (async error event, never a sync throw). Offline-first libs degrade
+/// through this path instead of crashing on a missing global.
+pub(crate) fn n_indexed_db(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let _ = args;
+    let open = Value::Obj(it.heap.alloc_obj(nat("open", n_idb_open))?);
+    Ok(Value::Obj(it.obj_pairs(vec![("open".into(), open)] )?))
+}
+
+/// IDBRequest stub: {result, error, readyState} + onsuccess/onerror
+/// expandos; the error event fires on a zero timer (denied backend).
+fn n_idb_open(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let pending = Value::Str(it.heap.alloc_str("pending".into())?);
+    let req = it.obj_pairs(vec![
+        ("result".into(), Value::Undef),
+        ("error".into(), Value::Undef),
+        ("readyState".into(), pending),
+        ("onsuccess".into(), Value::Null),
+        ("onerror".into(), Value::Null),
+    ])?;
+    let req_v = Value::Obj(req);
+    // Async denial: setTimeout fires the onerror expando, if any.
+    let fire = Value::Obj(it.heap.alloc_obj(nat("fireDeny", n_idb_fire_deny))?);
+    let st = Value::Obj(it.heap.alloc_obj(nat("setTimeout", n_set_timeout))?);
+    let _ = it.call_value(st, Value::Undef, &[fire, Value::Num(0.0)], None);
+    // Stash the request where the denial can find it (own expando).
+    let _ = set_prop(&mut it.heap, fire, "__req", req_v);
+    let _ = args;
+    Ok(req_v)
+}
+
+fn n_idb_fire_deny(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let me = it.cur_native;
+    let req = get_prop(&it.heap, &it.protos, me, "__req")?;
+    let err = it.error_obj("IDB denied")?;
+    let done = Value::Str(it.heap.alloc_str("done".into())?);
+    let _ = set_prop(&mut it.heap, req, "error", err);
+    let _ = set_prop(&mut it.heap, req, "readyState", done);
+    if let Ok(Value::Obj(cb)) = get_prop(&it.heap, &it.protos, req, "onerror") {
+        if matches!(it.heap.obj(cb), Obj::Func { .. } | Obj::Native { .. }) {
+            let _ = it.call_value(Value::Obj(cb), req, &[err], None);
+        }
+    }
     Ok(Value::Undef)
 }
 
@@ -10348,6 +10572,16 @@ mod tests {
     fn persona_surface() {
         // Timezone is engine-level (no DOM needed).
         assert_eq!(disp("new Date(0).getTimezoneOffset()"), "-180");
+    }
+
+    #[test]
+    fn function_prototype_to_string() {
+        // Monkey-patch detectors key on the native/non-native split.
+        assert_eq!(disp("Function.prototype.toString.call(Array.isArray).indexOf('[native code]') !== -1"), "true");
+        assert_eq!(disp("function f(){};f.toString().indexOf('[native code]')"), "-1");
+        assert_eq!(disp("Object.prototype.toString.call(Array.isArray)"), "[object Function]");
+        assert_eq!(disp("typeof Function.prototype.toString"), "function");
+        assert!(errmsg("Function.prototype.toString.call({})").contains("needs a function"));
     }
 
     #[test]

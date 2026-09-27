@@ -467,15 +467,19 @@ mod tests {
     #[test]
     fn churn_stays_bounded() {
         // 500 iterations x ~2 slots against a cap with modest headroom:
-        // GC must run and keep live slots under the cap.
-        let mut it = Interp::with_cap(600);
+        // GC must run and keep live slots under the cap. Self-calibrated
+        // above install like its siblings (absolute values kept flaking
+        // as builtins were added).
+        let mut it = Interp::with_cap(1_000_000);
+        it.run("0").unwrap();
+        it.heap.cap = it.heap.live() + 1200;
         let v = it
             .run("var keep=[];for(var i=0;i<500;i++){var t={a:i,b:'x'+i};if(i%7==0){keep.push(t)}}keep.length")
             .unwrap();
         assert_eq!(v, Value::Num(72.0));
         assert!(it.gc_runs > 0, "gc never ran");
         let (o, s) = it.heap.stats();
-        assert!(o + s <= 600, "live {o}+{s} over cap 600");
+        assert!(o + s <= it.heap.cap, "live {o}+{s} over cap {}", it.heap.cap);
     }
 
     #[test]

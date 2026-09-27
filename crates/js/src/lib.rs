@@ -139,10 +139,12 @@ pub enum Value {
     Obj(u32),
 }
 
-/// Element kind of a Typed view (everything but Uint8Array, which has
-/// its own byte-packed variant).
+/// Element kind of a numeric view. U8 is the live-view kind for
+/// Uint8Array (owned U8 stays in Bytes); I64/U64 are the live-view
+/// kinds for the 64-bit arrays (owned stays in Big64).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypedKind {
+    U8,
     I8,
     U8C,
     U16,
@@ -151,6 +153,8 @@ pub enum TypedKind {
     I32,
     F32,
     F64,
+    I64,
+    U64,
 }
 
 /// Builtin function signature: interpreter access, the receiver (`this`),
@@ -286,26 +290,41 @@ pub enum Obj {
         st: PromiseState,
         pairs: Vec<(String, Value)>,
     },
-    /// Uint8Array bytes (+ expando pairs); no shared memory - views over
-    /// buffers and subarray()/slice() copy (documented gap).
+    /// Uint8Array bytes (+ expando pairs). Owned only: live views over
+    /// a Buf are BufView (kind U8). `.buffer` materializes a Buf once
+    /// then rewires this slot live, so later parent writes propagate.
     Bytes {
         bytes: Vec<u8>,
         pairs: Vec<(String, Value)>,
         proto: Option<u32>,
     },
-    /// Other numeric views (elements pre-coerced to f64, so reads are
-    /// exact; f32 coerces through `as f32` on write). Copies like Bytes.
+    /// Other numeric views, owned only (elements pre-coerced to f64).
+    /// Live views over a Buf are BufView; `.buffer` rewires live.
     Typed {
         kind: TypedKind,
         elems: Vec<f64>,
         pairs: Vec<(String, Value)>,
         proto: Option<u32>,
     },
-    /// DataView over a buffer copy (+ base byteOffset for the offset
-    /// form); multi-byte accessors honor the littleEndian flag.
-    DView {
-        bytes: Vec<u8>,
+    /// Live view onto a Buf: all multi-byte codec is little-endian via
+    /// to/from_le_bytes (deterministic on any host). off/len are bytes;
+    /// length = len / bpe. A facade over the whole Buf (proto = buffer)
+    /// serves as the `.buffer` value.
+    BufView {
+        buf: u32,
         off: usize,
+        len: usize,
+        kind: TypedKind,
+        pairs: Vec<(String, Value)>,
+        proto: Option<u32>,
+    },
+    /// DataView as a live window onto a Buf (buf id + byte off/len);
+    /// accessors translate per access, so views sharing the Buf see
+    /// each other's writes. From owned sources the Buf is a copy.
+    DView {
+        buf: u32,
+        off: usize,
+        len: usize,
         proto: Option<u32>,
     },
     /// ArrayBuffer backing store (non-extensible: writes to named props

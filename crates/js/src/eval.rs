@@ -150,6 +150,41 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(","),
+            Obj::BufView { buf, off, len, kind, .. } => match kind {
+                TypedKind::I64 => {
+                    let n = view_count(*kind, *len);
+                    let mut parts = Vec::with_capacity(n);
+                    for i in 0..n {
+                        match view_read_u64(h, *buf, off + i * 8) {
+                            Some(b) => parts.push((b as i64).to_string()),
+                            None => parts.push("0".into()),
+                        }
+                    }
+                    parts.join(",")
+                }
+                TypedKind::U64 => {
+                    let n = view_count(*kind, *len);
+                    let mut parts = Vec::with_capacity(n);
+                    for i in 0..n {
+                        match view_read_u64(h, *buf, off + i * 8) {
+                            Some(b) => parts.push(b.to_string()),
+                            None => parts.push("0".into()),
+                        }
+                    }
+                    parts.join(",")
+                }
+                k => {
+                    let n = view_count(*k, *len);
+                    let mut parts = Vec::with_capacity(n);
+                    for i in 0..n {
+                        match view_read_num(h, *buf, off + i * t_bpe(*k), *k) {
+                            Some(e) => parts.push(to_str(h, Value::Num(e))),
+                            None => parts.push("0".into()),
+                        }
+                    }
+                    parts.join(",")
+                }
+            },
             Obj::DView { .. } => "[object DataView]".into(),
             Obj::Buf { .. } => "[object ArrayBuffer]".into(),
             Obj::Proxy { target, .. } => to_str(h, Value::Obj(*target)),
@@ -314,6 +349,9 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
             if key == "length" || key == "byteLength" {
                 return Some(Value::Num(bytes.len() as f64));
             }
+            if key == "byteOffset" {
+                return Some(Value::Num(0.0));
+            }
             if let Ok(i) = key.parse::<usize>() {
                 if let Some(b) = bytes.get(i) {
                     return Some(Value::Num(*b as f64));
@@ -337,6 +375,9 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
             if key == "byteLength" {
                 return Some(Value::Num((elems.len() * t_bpe(*kind)) as f64));
             }
+            if key == "byteOffset" {
+                return Some(Value::Num(0.0));
+            }
             if let Ok(i) = key.parse::<usize>() {
                 if let Some(e) = elems.get(i) {
                     return Some(Value::Num(*e));
@@ -344,8 +385,35 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
             }
             pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
         }
-        Obj::DView { bytes, off, .. } => match key {
-            "byteLength" => Some(Value::Num(bytes.len() as f64)),
+        Obj::BufView { buf, off, len, kind, pairs, .. } => {
+            let n = view_count(*kind, *len);
+            if key == "length" {
+                return Some(Value::Num(n as f64));
+            }
+            if key == "byteLength" {
+                return Some(Value::Num(*len as f64));
+            }
+            if key == "byteOffset" {
+                return Some(Value::Num(*off as f64));
+            }
+            if let Ok(i) = key.parse::<usize>() {
+                if i >= n {
+                    return pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v);
+                }
+                let bpe = t_bpe(*kind);
+                match kind {
+                    TypedKind::I64 | TypedKind::U64 => {}
+                    k => {
+                        if let Some(e) = view_read_num(h, *buf, off + i * bpe, *k) {
+                            return Some(Value::Num(e));
+                        }
+                    }
+                }
+            }
+            pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+        }
+        Obj::DView { len, off, .. } => match key {
+            "byteLength" => Some(Value::Num(*len as f64)),
             "byteOffset" => Some(Value::Num(*off as f64)),
             _ => None,
         },
@@ -362,6 +430,9 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
             }
             if key == "byteLength" {
                 return Some(Value::Num((elems.len() * 8) as f64));
+            }
+            if key == "byteOffset" {
+                return Some(Value::Num(0.0));
             }
             pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
         }
@@ -406,6 +477,7 @@ pub(crate) fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
         | Obj::Bytes { proto, .. }
         | Obj::Buf { proto, .. }
         | Obj::Typed { proto, .. }
+        | Obj::BufView { proto, .. }
         | Obj::BigInt { proto, .. }
         | Obj::Big64 { proto, .. }
         | Obj::DView { proto, .. } => *proto,
@@ -448,6 +520,13 @@ fn has_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> bool {
         if let Obj::Big64 { elems, .. } = h.obj(id) {
             if key.parse::<usize>().is_ok_and(|i| i < elems.len()) {
                 return true;
+            }
+        }
+        if let Obj::BufView { len, kind, .. } = h.obj(id) {
+            if matches!(kind, TypedKind::I64 | TypedKind::U64) {
+                if key.parse::<usize>().is_ok_and(|i| i < view_count(*kind, *len)) {
+                    return true;
+                }
             }
         }
     }
@@ -504,6 +583,23 @@ impl Interp {
         if let Some(n) = self.as_style(v) {
             return self.style_get(n, key);
         }
+        // `.buffer` materializes a facade (needs &mut for the alloc +
+        // parent rewire); own_prop/get_prop stay allocation-free.
+        if key == "buffer" {
+            if let Value::Obj(id) = v {
+                match self.heap.obj(id) {
+                    Obj::Bytes { .. }
+                    | Obj::Typed { .. }
+                    | Obj::Big64 { .. }
+                    | Obj::DView { .. }
+                    | Obj::BufView { .. } => {
+                        let b = buffer_of(self, id)?;
+                        return self.invoke_getter(b, v, key);
+                    }
+                    _ => {}
+                }
+            }
+        }
         let val = get_prop(&self.heap, &self.protos, v, key)?;
         self.invoke_getter(val, v, key)
     }
@@ -533,6 +629,23 @@ impl Interp {
         if let Some(n) = self.as_style(v) {
             let key = to_str(&self.heap, k);
             return self.style_get(n, &key);
+        }
+        // `v["buffer"]` serves the same facade as `v.buffer`.
+        if let Value::Obj(id) = v {
+            let key = to_str(&self.heap, k);
+            if key == "buffer" {
+                match self.heap.obj(id) {
+                    Obj::Bytes { .. }
+                    | Obj::Typed { .. }
+                    | Obj::Big64 { .. }
+                    | Obj::DView { .. }
+                    | Obj::BufView { .. } => {
+                        let b = buffer_of(self, id)?;
+                        return self.invoke_getter(b, v, &key);
+                    }
+                    _ => {}
+                }
+            }
         }
         let val = get_index(&mut self.heap, &self.protos, v, k)?;
         let key = to_str(&self.heap, k);
@@ -726,10 +839,10 @@ pub(crate) fn get_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> Result
 }
 
 /// Typed-array store: canonical indices clamp in range and drop
-/// out-of-range writes (sloppy); `length`/`byteLength` are read-only
-/// no-ops; anything else is an expando pair.
+/// out-of-range writes (sloppy); `length`/`byteLength`/`byteOffset` are
+/// read-only no-ops; anything else is an expando pair.
 fn bytes_set(h: &mut Heap, id: u32, key: &str, val: Value) -> Result<(), JsError> {
-    if key == "length" || key == "byteLength" {
+    if key == "length" || key == "byteLength" || key == "byteOffset" {
         return Ok(());
     }
     let nb = to_u8(&*h, val);
@@ -751,10 +864,10 @@ fn bytes_set(h: &mut Heap, id: u32, key: &str, val: Value) -> Result<(), JsError
 }
 
 /// Typed-view store (non-u8): canonical indices coerce in range and
-/// drop out-of-range writes (sloppy); `length`/`byteLength` are
-/// read-only no-ops; anything else is an expando pair.
+/// drop out-of-range writes (sloppy); `length`/`byteLength`/`byteOffset`
+/// are read-only no-ops; anything else is an expando pair.
 fn typed_set(h: &mut Heap, id: u32, kind: TypedKind, key: &str, val: Value) -> Result<(), JsError> {
-    if key == "length" || key == "byteLength" {
+    if key == "length" || key == "byteLength" || key == "byteOffset" {
         return Ok(());
     }
     let ne = t_write(kind, to_num(&*h, val));
@@ -767,6 +880,39 @@ fn typed_set(h: &mut Heap, id: u32, kind: TypedKind, key: &str, val: Value) -> R
         return Ok(());
     }
     if let Obj::Typed { pairs, .. } = h.obj_mut(id) {
+        match pairs.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = val,
+            None => pairs.push((key.to_string(), val)),
+        }
+    }
+    Ok(())
+}
+
+/// Live-view store: indices translate per access through the backing Buf
+/// (writes visible via all aliases); length-likes are no-ops; the rest
+/// lands in expando pairs.
+fn bufview_set(h: &mut Heap, id: u32, key: &str, val: Value) -> Result<(), JsError> {
+    if key == "length" || key == "byteLength" || key == "byteOffset" {
+        return Ok(());
+    }
+    if let Ok(i) = key.parse::<usize>() {
+        let num = to_num(&*h, val);
+        let w = b64_wrap(&*h, val);
+        let (buf, off, len, kind) = match h.obj(id) {
+            Obj::BufView { buf, off, len, kind, .. } => (*buf, *off, *len, *kind),
+            _ => return Ok(()),
+        };
+        let bpe = t_bpe(kind);
+        if i < view_count(kind, len) {
+            let at = off + i * bpe;
+            match kind {
+                TypedKind::I64 | TypedKind::U64 => view_write_u64(h, buf, at, w),
+                k => view_write_num(h, buf, at, k, num),
+            }
+        }
+        return Ok(());
+    }
+    if let Obj::BufView { pairs, .. } = h.obj_mut(id) {
         match pairs.iter_mut().find(|(k, _)| k == key) {
             Some(slot) => slot.1 = val,
             None => pairs.push((key.to_string(), val)),
@@ -792,7 +938,8 @@ pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<
             Obj::WeakMap { .. } => "weakmap",
             Obj::Bytes { .. } => "uint8array",
             Obj::Buf { .. } => "arraybuffer",
-            Obj::Typed { kind, .. } => match kind {
+            Obj::Typed { kind, .. } | Obj::BufView { kind, .. } => match kind {
+                TypedKind::U8 => "uint8array",
                 TypedKind::I8 => "int8array",
                 TypedKind::U8C => "uint8clampedarray",
                 TypedKind::U16 => "uint16array",
@@ -801,6 +948,8 @@ pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<
                 TypedKind::I32 => "int32array",
                 TypedKind::F32 => "float32array",
                 TypedKind::F64 => "float64array",
+                TypedKind::I64 => "bigint64array",
+                TypedKind::U64 => "biguint64array",
             },
             Obj::DView { .. } => "dataview",
             _ => "object",
@@ -823,6 +972,9 @@ pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<
             // Big64 named/element stores (wrap mod 2^64, like typed_set).
             if matches!(h.obj(rid), Obj::Big64 { .. }) {
                 return b64_set(h, rid, key, val);
+            }
+            if matches!(h.obj(rid), Obj::BufView { .. }) {
+                return bufview_set(h, rid, key, val);
             }
             match h.obj_mut(rid) {
             Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
@@ -911,6 +1063,45 @@ fn get_index(h: &mut Heap, protos: &Protos, v: Value, k: Value) -> Result<Value,
                     }
                 }
             }
+            // Live views translate per access through the backing Buf;
+            // 64-bit lanes box like Big64 above. Swept backing reads Undef.
+            if let Obj::BufView { buf, off, len, kind, .. } = h.obj(id) {
+                let (buf, off, len, kind) = (*buf, *off, *len, *kind);
+                if n >= 0.0 && n.fract() == 0.0 {
+                    let i = n as usize;
+                    if i < view_count(kind, len) {
+                        let bpe = t_bpe(kind);
+                        let at = off + i * bpe;
+                        match kind {
+                            TypedKind::I64 => {
+                                return match view_read_u64(h, buf, at) {
+                                    Some(b) => {
+                                        let (neg, mag) = bi_from_i64(b as i64);
+                                        Ok(bi_alloc_hp(h, protos, neg, mag)?)
+                                    }
+                                    None => Ok(Value::Undef),
+                                };
+                            }
+                            TypedKind::U64 => {
+                                return match view_read_u64(h, buf, at) {
+                                    Some(b) => {
+                                        let (neg, mag) = bi_from_u64(b);
+                                        Ok(bi_alloc_hp(h, protos, neg, mag)?)
+                                    }
+                                    None => Ok(Value::Undef),
+                                };
+                            }
+                            kk => {
+                                return Ok(match view_read_num(h, buf, at, kk) {
+                                    Some(e) => Value::Num(e),
+                                    None => Value::Undef,
+                                });
+                            }
+                        }
+                    }
+                    return Ok(Value::Undef);
+                }
+            }
             match h.obj(id) {
                 Obj::Arr { items, .. } if n >= 0.0 && n.fract() == 0.0 => {
                     Ok(items.get(n as usize).copied().unwrap_or(Value::Undef))
@@ -996,6 +1187,29 @@ fn set_index(h: &mut Heap, v: Value, k: Value, val: Value) -> Result<(), JsError
                     if let Obj::Big64 { elems, .. } = h.obj_mut(id) {
                         if let Some(slot) = elems.get_mut(n as usize) {
                             *slot = w;
+                        }
+                    }
+                    return Ok(());
+                }
+                let key = to_str(h, k);
+                return set_prop(h, v, &key, val);
+            }
+            // Live views translate per access; OOB drops sloppily.
+            if let Obj::BufView { buf, off, len, kind, .. } = *h.obj(id) {
+                let n = to_num(h, k);
+                if n >= 0.0 && n.fract() == 0.0 {
+                    let i = n as usize;
+                    if i < view_count(kind, len) {
+                        let at = off + i * t_bpe(kind);
+                        match kind {
+                            TypedKind::I64 | TypedKind::U64 => {
+                                let w = b64_wrap(h, val);
+                                view_write_u64(h, buf, at, w);
+                            }
+                            kk => {
+                                let num = to_num(h, val);
+                                view_write_num(h, buf, at, kk, num);
+                            }
                         }
                     }
                     return Ok(());
@@ -2949,6 +3163,33 @@ impl Interp {
                     Ok(bytes.iter().map(|b| Value::Num(*b as f64)).collect())
                 }
                 Obj::Typed { elems, .. } => Ok(elems.iter().map(|e| Value::Num(*e)).collect()),
+                Obj::BufView { buf, off, len, kind, .. } => {
+                    let (buf, off, len, kind) = (*buf, *off, *len, *kind);
+                    let n = view_count(kind, len);
+                    let bpe = t_bpe(kind);
+                    let mut out = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let at = off + i * bpe;
+                        match kind {
+                            TypedKind::I64 => {
+                                let b = view_read_u64(&self.heap, buf, at).unwrap_or(0);
+                                let (neg, mag) = bi_from_i64(b as i64);
+                                out.push(bi_alloc(self, neg, mag)?);
+                            }
+                            TypedKind::U64 => {
+                                let b = view_read_u64(&self.heap, buf, at).unwrap_or(0);
+                                let (neg, mag) = bi_from_u64(b);
+                                out.push(bi_alloc(self, neg, mag)?);
+                            }
+                            kk => {
+                                out.push(Value::Num(
+                                    view_read_num(&self.heap, buf, at, kk).unwrap_or(0.0),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(out)
+                }
                 Obj::Big64 { signed, elems, .. } => {
                     let signed = *signed;
                     let mut out = Vec::with_capacity(elems.len());
@@ -3015,6 +3256,10 @@ impl Interp {
                 }
                 Obj::Big64 { elems, pairs, .. } => {
                     keys.extend((0..elems.len()).map(|i| i.to_string()));
+                    keys.extend(pairs.iter().map(|(k, _)| k.clone()));
+                }
+                Obj::BufView { len, kind, pairs, .. } => {
+                    keys.extend((0..view_count(*kind, *len)).map(|i| i.to_string()));
                     keys.extend(pairs.iter().map(|(k, _)| k.clone()));
                 }
                 Obj::Promise { pairs, .. } => {
@@ -3554,6 +3799,17 @@ impl Interp {
                     }
                     Ok(Value::Bool(true))
                 }
+                Obj::BufView { len, kind, .. } => {
+                    let n = view_count(*kind, *len);
+                    let locked = key.parse::<usize>().map(|i| i < n).unwrap_or(false);
+                    if locked {
+                        return Ok(Value::Bool(false));
+                    }
+                    if let Obj::BufView { pairs, .. } = self.heap.obj_mut(id) {
+                        pairs.retain(|(k, _)| k != key);
+                    }
+                    Ok(Value::Bool(true))
+                }
                 _ => Ok(Value::Bool(true)),
             },
             Value::Str(_) | Value::Num(_) | Value::Bool(_) => Ok(Value::Bool(true)),
@@ -3999,6 +4255,33 @@ impl Interp {
                     Ok(bytes.iter().map(|b| Value::Num(*b as f64)).collect())
                 }
                 Obj::Typed { elems, .. } => Ok(elems.iter().map(|e| Value::Num(*e)).collect()),
+                Obj::BufView { buf, off, len, kind, .. } => {
+                    let (buf, off, len, kind) = (*buf, *off, *len, *kind);
+                    let n = view_count(kind, len);
+                    let bpe = t_bpe(kind);
+                    let mut out = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let at = off + i * bpe;
+                        match kind {
+                            TypedKind::I64 => {
+                                let b = view_read_u64(&self.heap, buf, at).unwrap_or(0);
+                                let (neg, mag) = bi_from_i64(b as i64);
+                                out.push(bi_alloc(self, neg, mag)?);
+                            }
+                            TypedKind::U64 => {
+                                let b = view_read_u64(&self.heap, buf, at).unwrap_or(0);
+                                let (neg, mag) = bi_from_u64(b);
+                                out.push(bi_alloc(self, neg, mag)?);
+                            }
+                            kk => {
+                                out.push(Value::Num(
+                                    view_read_num(&self.heap, buf, at, kk).unwrap_or(0.0),
+                                ));
+                            }
+                        }
+                    }
+                    Ok(out)
+                }
                 Obj::Big64 { signed, elems, .. } => {
                     let signed = *signed;
                     let mut out = Vec::with_capacity(elems.len());
@@ -4150,6 +4433,33 @@ impl Interp {
                             bi_from_u64(*bits)
                         };
                         out.push((i.to_string(), bi_alloc(self, neg, mag)?));
+                    }
+                    out.extend(pairs);
+                    Ok(out)
+                }
+                Obj::BufView { buf, off, len, kind, pairs, .. } => {
+                    let (buf, off, len, kind, pairs) = (*buf, *off, *len, *kind, pairs.clone());
+                    let n = view_count(kind, len);
+                    let bpe = t_bpe(kind);
+                    let mut out = Vec::with_capacity(n + pairs.len());
+                    for i in 0..n {
+                        let at = off + i * bpe;
+                        match kind {
+                            TypedKind::I64 => {
+                                let b = view_read_u64(&self.heap, buf, at).unwrap_or(0);
+                                let (neg, mag) = bi_from_i64(b as i64);
+                                out.push((i.to_string(), bi_alloc(self, neg, mag)?));
+                            }
+                            TypedKind::U64 => {
+                                let b = view_read_u64(&self.heap, buf, at).unwrap_or(0);
+                                let (neg, mag) = bi_from_u64(b);
+                                out.push((i.to_string(), bi_alloc(self, neg, mag)?));
+                            }
+                            kk => {
+                                let e = view_read_num(&self.heap, buf, at, kk).unwrap_or(0.0);
+                                out.push((i.to_string(), Value::Num(e)));
+                            }
+                        }
                     }
                     out.extend(pairs);
                     Ok(out)
@@ -4803,6 +5113,22 @@ impl Interp {
                         .collect();
                     format!("[{}]", parts.join(", "))
                 }
+                Obj::BufView { buf, off, len, kind, .. }
+                    if matches!(kind, TypedKind::I64 | TypedKind::U64) =>
+                {
+                    let n = view_count(*kind, *len);
+                    let mut parts = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let b = view_read_u64(&self.heap, *buf, off + i * 8).unwrap_or(0);
+                        let (nn, m) = if *kind == TypedKind::I64 {
+                            bi_from_i64(b as i64)
+                        } else {
+                            bi_from_u64(b)
+                        };
+                        parts.push(format!("{}n", bi_fmt(nn, &m, 10)));
+                    }
+                    format!("[{}]", parts.join(", "))
+                }
                 _ => val_to_json(&self.heap, v, 0)
                     .map(|j| j.to_string())
                     .unwrap_or_else(|_| "[object Object]".into()),
@@ -5152,6 +5478,11 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
             Obj::BigInt { .. } | Obj::Big64 { .. } => {
                 return Err(err("Do not know how to serialize a BigInt"));
             }
+            Obj::BufView { kind, .. }
+                if matches!(kind, TypedKind::I64 | TypedKind::U64) =>
+            {
+                return Err(err("Do not know how to serialize a BigInt"));
+            }
             Obj::Proxy { target, .. } => return val_to_json(h, Value::Obj(*target), depth),
             Obj::Ordinary { pairs, .. } => Json::Obj(
                 pairs
@@ -5188,6 +5519,16 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
                     .map(|(i, e)| (i.to_string(), Json::Num(*e)))
                     .collect(),
             ),
+            Obj::BufView { buf, off, len, kind, .. } => {
+                let n = view_count(*kind, *len);
+                let bpe = t_bpe(*kind);
+                let mut out = Vec::with_capacity(n);
+                for i in 0..n {
+                    let e = view_read_num(h, *buf, off + i * bpe, *kind).unwrap_or(0.0);
+                    out.push((i.to_string(), Json::Num(e)));
+                }
+                Json::Obj(out)
+            },
             Obj::DView { .. } => Json::Obj(vec![]),
             Obj::Buf { .. } => Json::Obj(vec![]),
             Obj::Style { .. } => Json::Obj(vec![]),
@@ -5223,6 +5564,18 @@ fn arr_items(it: &Interp, id: u32) -> Vec<Value> {
         Obj::Arr { items, .. } => items.clone(),
         Obj::Bytes { bytes, .. } => bytes.iter().map(|b| Value::Num(*b as f64)).collect(),
         Obj::Typed { elems, .. } => elems.iter().map(|e| Value::Num(*e)).collect(),
+        Obj::BufView { buf, off, len, kind, .. } => match kind {
+            TypedKind::I64 | TypedKind::U64 => Vec::new(),
+            k => {
+                let n = view_count(*k, *len);
+                let bpe = t_bpe(*k);
+                (0..n)
+                    .map(|i| {
+                        Value::Num(view_read_num(&it.heap, *buf, off + i * bpe, *k).unwrap_or(0.0))
+                    })
+                    .collect()
+            }
+        },
         _ => Vec::new(),
     }
 }
@@ -5241,6 +5594,12 @@ fn n_has_own(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsEr
         // boxing an element needs &mut, which it lacks).
         Value::Obj(id) => match it.heap.obj(id) {
             Obj::Big64 { elems, .. } if key.parse::<usize>().is_ok_and(|i| i < elems.len()) => {
+                true
+            }
+            Obj::BufView { len, kind, .. }
+                if matches!(kind, TypedKind::I64 | TypedKind::U64)
+                    && key.parse::<usize>().is_ok_and(|i| i < view_count(*kind, *len)) =>
+            {
                 true
             }
             _ => own_prop(&it.heap, id, &key).is_some(),
@@ -5301,6 +5660,14 @@ fn n_obj_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
             Obj::WeakMap { .. } => "[object WeakMap]",
             Obj::Bytes { .. } => "[object Uint8Array]",
             Obj::Typed { kind, .. } => t_tag(*kind),
+            Obj::BufView { kind, proto, .. } => {
+                // Facades over the buffer read as ArrayBuffers.
+                if *proto == po(it.protos.buffer) {
+                    "[object ArrayBuffer]"
+                } else {
+                    t_tag(*kind)
+                }
+            }
             Obj::BigInt { .. } => "[object BigInt]",
             Obj::Big64 { signed, .. } => {
                 if *signed {
@@ -5362,6 +5729,36 @@ fn own_pairs(it: &mut Interp, v: Value) -> Vec<(String, Value)> {
             out.extend(pairs);
             return out;
         }
+        if let Obj::BufView { buf, off, len, kind, pairs, .. } = it.heap.obj(rid) {
+            let (buf, off, len, kind, pairs) = (*buf, *off, *len, *kind, pairs.clone());
+            let n = view_count(kind, len);
+            let bpe = t_bpe(kind);
+            let mut out = Vec::with_capacity(n + pairs.len());
+            for i in 0..n {
+                let at = off + i * bpe;
+                match kind {
+                    TypedKind::I64 | TypedKind::U64 => {
+                        let b = view_read_u64(&it.heap, buf, at).unwrap_or(0);
+                        let (neg, mag) = if kind == TypedKind::I64 {
+                            bi_from_i64(b as i64)
+                        } else {
+                            bi_from_u64(b)
+                        };
+                        let proto = po(it.protos.bigint);
+                        match it.heap.alloc_obj(Obj::BigInt { neg, mag, proto }) {
+                            Ok(bid) => out.push((i.to_string(), Value::Obj(bid))),
+                            Err(_) => break,
+                        }
+                    }
+                    kk => {
+                        let e = view_read_num(&it.heap, buf, at, kk).unwrap_or(0.0);
+                        out.push((i.to_string(), Value::Num(e)));
+                    }
+                }
+            }
+            out.extend(pairs);
+            return out;
+        }
     }
     let h = &it.heap;
     match v {
@@ -5397,8 +5794,9 @@ fn own_pairs(it: &mut Interp, v: Value) -> Vec<(String, Value)> {
                 out
             }
             Obj::Promise { pairs, .. } => pairs.clone(),
-            // Big64 returns early above (indices need &mut to box).
+            // Big64/BufView return early above (indices need &mut to box).
             Obj::Big64 { .. } => unreachable!("Big64 pairs box above"),
+            Obj::BufView { .. } => unreachable!("BufView pairs box above"),
             Obj::Dom { .. }
             | Obj::RegExp { .. }
             | Obj::Style { .. }
@@ -5573,6 +5971,10 @@ fn n_obj_own_names(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Valu
                 .map(|i| i.to_string())
                 .chain(pairs.iter().map(|(k, _)| k.clone()))
                 .collect(),
+            Obj::BufView { len, kind, pairs, .. } => (0..view_count(*kind, *len))
+                .map(|i| i.to_string())
+                .chain(pairs.iter().map(|(k, _)| k.clone()))
+                .collect(),
             _ => Vec::new(),
         },
         _ => Vec::new(),
@@ -5689,6 +6091,44 @@ fn describe_own(it: &mut Interp, target: Value, key: &str) -> Result<Value, JsEr
                     pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
                 }
             }
+            Obj::BufView { buf, off, len, kind, pairs, .. } => {
+                let n = view_count(*kind, *len);
+                if key == "length" {
+                    desc = vec![
+                        ("value".into(), Value::Num(n as f64)),
+                        ("writable".into(), Value::Bool(false)),
+                        ("enumerable".into(), Value::Bool(false)),
+                        ("configurable".into(), Value::Bool(false)),
+                    ];
+                    return Ok(Value::Obj(it.obj_pairs(desc)?));
+                }
+                if let Ok(i) = key.parse::<usize>() {
+                    if i >= n {
+                        pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+                    } else {
+                        let bpe = t_bpe(*kind);
+                        let at = off + i * bpe;
+                        match kind {
+                            TypedKind::I64 | TypedKind::U64 => {
+                                match view_read_u64(&it.heap, *buf, at) {
+                                    Some(b) => {
+                                        let (neg, mag) = if *kind == TypedKind::I64 {
+                                            bi_from_i64(b as i64)
+                                        } else {
+                                            bi_from_u64(b)
+                                        };
+                                        Some(bi_alloc(it, neg, mag)?)
+                                    }
+                                    None => None,
+                                }
+                            }
+                            kk => view_read_num(&it.heap, *buf, at, *kk).map(Value::Num),
+                        }
+                    }
+                } else {
+                    pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+                }
+            }
             _ => None,
         },
         _ => None,
@@ -5743,6 +6183,10 @@ fn n_obj_get_descs(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Valu
                 .chain(pairs.iter().map(|(k, _)| k.clone()))
                 .collect(),
             Obj::Big64 { elems, pairs, .. } => (0..elems.len())
+                .map(|i| i.to_string())
+                .chain(pairs.iter().map(|(k, _)| k.clone()))
+                .collect(),
+            Obj::BufView { len, kind, pairs, .. } => (0..view_count(*kind, *len))
                 .map(|i| i.to_string())
                 .chain(pairs.iter().map(|(k, _)| k.clone()))
                 .collect(),
@@ -7956,7 +8400,11 @@ fn typed_len(h: &Heap, v: Value) -> Result<usize, JsError> {
 /// `this` as a Bytes heap id; natives below error out on other receivers.
 fn u8_this(it: &Interp, this: Value, name: &str) -> Result<u32, JsError> {
     match this {
-        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Bytes { .. }) => Ok(id),
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Bytes { .. } => Ok(id),
+            Obj::BufView { kind, .. } if *kind == TypedKind::U8 => Ok(id),
+            _ => Err(err(format!("Uint8Array.{name} needs a Uint8Array receiver"))),
+        },
         _ => Err(err(format!("Uint8Array.{name} needs a Uint8Array receiver"))),
     }
 }
@@ -7972,6 +8420,21 @@ fn u8_src_items(it: &Interp, v: Value) -> Vec<u8> {
             Obj::Buf { bytes, .. } => bytes.clone(),
             // Big64 elements feed their low byte (wrap mod 256, like u8).
             Obj::Big64 { elems, .. } => elems.iter().map(|e| *e as u8).collect(),
+            Obj::BufView { buf, off, len, kind, .. } => {
+                let n = view_count(*kind, *len);
+                let bpe = t_bpe(*kind);
+                (0..n)
+                    .map(|i| {
+                        let at = off + i * bpe;
+                        match kind {
+                            TypedKind::I64 | TypedKind::U64 => {
+                                view_read_u64(&it.heap, *buf, at).unwrap_or(0) as u8
+                            }
+                            kk => to_u8_num(view_read_num(&it.heap, *buf, at, *kk).unwrap_or(0.0)),
+                        }
+                    })
+                    .collect()
+            }
             _ => u8_len_items(it, Value::Obj(id)),
         },
         _ => u8_len_items(it, v),
@@ -8010,6 +8473,7 @@ fn t_write(kind: TypedKind, n: f64) -> f64 {
     match kind {
         TypedKind::F64 => n,
         TypedKind::F32 => (n as f32) as f64,
+        TypedKind::U8 => to_u8_num(n) as f64,
         TypedKind::U32 => {
             let n = n.trunc();
             if !n.is_finite() {
@@ -8068,22 +8532,26 @@ fn t_write(kind: TypedKind, n: f64) -> f64 {
                 f + 1.0
             }
         }
+        // I64/U64 store u64 bits, never f64: no t_write caller uses
+        // them (writes go through b64_wrap); degrade to 0 if hit.
+        TypedKind::I64 | TypedKind::U64 => 0.0,
     }
 }
 
 /// Bytes per element (BYTES_PER_ELEMENT, buffer sizing).
 fn t_bpe(kind: TypedKind) -> usize {
     match kind {
-        TypedKind::I8 | TypedKind::U8C => 1,
+        TypedKind::U8 | TypedKind::I8 | TypedKind::U8C => 1,
         TypedKind::U16 | TypedKind::I16 => 2,
         TypedKind::U32 | TypedKind::I32 | TypedKind::F32 => 4,
-        TypedKind::F64 => 8,
+        TypedKind::F64 | TypedKind::I64 | TypedKind::U64 => 8,
     }
 }
 
 /// Tag for Object.prototype.toString.
 fn t_tag(kind: TypedKind) -> &'static str {
     match kind {
+        TypedKind::U8 => "[object Uint8Array]",
         TypedKind::I8 => "[object Int8Array]",
         TypedKind::U8C => "[object Uint8ClampedArray]",
         TypedKind::U16 => "[object Uint16Array]",
@@ -8092,10 +8560,249 @@ fn t_tag(kind: TypedKind) -> &'static str {
         TypedKind::I32 => "[object Int32Array]",
         TypedKind::F32 => "[object Float32Array]",
         TypedKind::F64 => "[object Float64Array]",
+        TypedKind::I64 => "[object BigInt64Array]",
+        TypedKind::U64 => "[object BigUint64Array]",
     }
 }
 
+/// Proto bag id for a live-view kind.
+fn view_proto(it: &Interp, kind: TypedKind) -> u32 {
+    match kind {
+        TypedKind::U8 => it.protos.uint8array,
+        TypedKind::I8 => it.protos.int8array,
+        TypedKind::U8C => it.protos.uint8clampedarray,
+        TypedKind::U16 => it.protos.uint16array,
+        TypedKind::I16 => it.protos.int16array,
+        TypedKind::U32 => it.protos.uint32array,
+        TypedKind::I32 => it.protos.int32array,
+        TypedKind::F32 => it.protos.float32array,
+        TypedKind::F64 => it.protos.float64array,
+        TypedKind::I64 => it.protos.bigint64array,
+        TypedKind::U64 => it.protos.biguint64array,
+    }
+}
+
+/// Backing bytes of a Buf id, if still live (swept → None, degrade).
+fn buf_live(h: &Heap, buf: u32) -> Option<&[u8]> {
+    match h.objs.get(buf as usize)? {
+        Obj::Buf { bytes, .. } => Some(bytes),
+        _ => None,
+    }
+}
+
+/// Element count of a view window (stored byte len / bpe).
+fn view_count(kind: TypedKind, len: usize) -> usize {
+    len / t_bpe(kind).max(1)
+}
+
+/// LE-decode one numeric element at absolute byte `at` (None when the
+/// backing Buf is swept or the window is short: callers read Undef).
+fn view_read_num(h: &Heap, buf: u32, at: usize, kind: TypedKind) -> Option<f64> {
+    let bytes = buf_live(h, buf)?;
+    let bpe = t_bpe(kind);
+    let w = bytes.get(at..at + bpe)?;
+    let mut raw = [0u8; 8];
+    raw[..bpe].copy_from_slice(w);
+    let u = u64::from_le_bytes(raw);
+    Some(match kind {
+        TypedKind::U8 => w[0] as f64,
+        TypedKind::I8 => (w[0] as i8) as f64,
+        TypedKind::U8C => t_write(TypedKind::U8C, w[0] as f64),
+        TypedKind::U16 => (u as u16) as f64,
+        TypedKind::I16 => (u as u16) as i16 as f64,
+        TypedKind::U32 => (u as u32) as f64,
+        TypedKind::I32 => (u as u32) as i32 as f64,
+        TypedKind::F32 => f32::from_le_bytes([w[0], w[1], w[2], w[3]]) as f64,
+        TypedKind::F64 => f64::from_le_bytes(w.try_into().unwrap_or([0; 8])),
+        TypedKind::I64 | TypedKind::U64 => return None,
+    })
+}
+
+/// LE-decode one 64-bit element at absolute byte `at`.
+fn view_read_u64(h: &Heap, buf: u32, at: usize) -> Option<u64> {
+    let bytes = buf_live(h, buf)?;
+    let w = bytes.get(at..at + 8)?;
+    Some(u64::from_le_bytes([
+        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+    ]))
+}
+
+/// LE-encode one numeric element into the backing Buf (swept/short → no-op).
+fn view_write_num(h: &mut Heap, buf: u32, at: usize, kind: TypedKind, v: f64) {
+    let bpe = t_bpe(kind);
+    let enc: Vec<u8> = match kind {
+        TypedKind::U8 | TypedKind::U8C => vec![to_u8_num(t_write(kind, v))],
+        TypedKind::I8 => vec![t_write(kind, v) as i8 as u8],
+        TypedKind::U16 | TypedKind::I16 => (t_write(kind, v) as i32 as u16).to_le_bytes().to_vec(),
+        TypedKind::U32 | TypedKind::I32 => (t_write(kind, v) as i64 as u32).to_le_bytes().to_vec(),
+        TypedKind::F32 => (t_write(kind, v) as f32).to_le_bytes().to_vec(),
+        TypedKind::F64 => t_write(kind, v).to_le_bytes().to_vec(),
+        TypedKind::I64 | TypedKind::U64 => return,
+    };
+    if let Some(Obj::Buf { bytes, .. }) = h.objs.get_mut(buf as usize) {
+        if at + bpe <= bytes.len() {
+            bytes[at..at + bpe].copy_from_slice(&enc);
+        }
+    }
+}
+
+/// LE-encode one 64-bit element into the backing Buf.
+fn view_write_u64(h: &mut Heap, buf: u32, at: usize, v: u64) {
+    if let Some(Obj::Buf { bytes, .. }) = h.objs.get_mut(buf as usize) {
+        if at + 8 <= bytes.len() {
+            bytes[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+/// LE-encode owned numeric elems into fresh bytes (for `.buffer` snapshots).
+fn encode_owned(kind: TypedKind, elems: &[f64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(elems.len() * t_bpe(kind));
+    for e in elems {
+        match kind {
+            TypedKind::U8 | TypedKind::U8C => out.push(to_u8_num(t_write(kind, *e))),
+            TypedKind::I8 => out.push(t_write(kind, *e) as i8 as u8),
+            TypedKind::U16 | TypedKind::I16 => {
+                out.extend_from_slice(&(t_write(kind, *e) as i32 as u16).to_le_bytes())
+            }
+            TypedKind::U32 | TypedKind::I32 => {
+                out.extend_from_slice(&(t_write(kind, *e) as i64 as u32).to_le_bytes())
+            }
+            TypedKind::F32 => out.extend_from_slice(&(t_write(kind, *e) as f32).to_le_bytes()),
+            TypedKind::F64 => out.extend_from_slice(&t_write(kind, *e).to_le_bytes()),
+            TypedKind::I64 | TypedKind::U64 => out.extend_from_slice(&0u64.to_le_bytes()),
+        }
+    }
+    out
+}
+
+/// View window (buf, abs off, byte len, kind) for ctors: Buf or BufView
+/// source with byteOffset/length forms. byteOffset is relative to the
+/// source window; length is an element count defaulting to the rest.
+fn view_window(
+    it: &Interp,
+    src: u32,
+    kind: TypedKind,
+    args: &[Value],
+) -> Result<Option<(u32, usize, usize)>, JsError> {
+    let (buf, base, avail) = match it.heap.obj(src) {
+        Obj::Buf { bytes, .. } => (src, 0, bytes.len()),
+        Obj::BufView { buf, off, len, .. } => (*buf, *off, *len),
+        _ => return Ok(None),
+    };
+    let bpe = t_bpe(kind);
+    let off = match arg(args, 1) {
+        Value::Undef => 0,
+        v => {
+            let n = to_num(&it.heap, v).trunc();
+            if n < 0.0 || n.fract() != 0.0 || !(n as usize).is_multiple_of(bpe) {
+                return Err(err("typed array buffer offset misaligned"));
+            }
+            n as usize
+        }
+    };
+    if off > avail {
+        return Err(err("typed array buffer offset misaligned"));
+    }
+    let rest = avail - off;
+    if rest % bpe != 0 {
+        return Err(err("typed array buffer length mismatch"));
+    }
+    let mut count = rest / bpe;
+    if !matches!(arg(args, 2), Value::Undef) {
+        let want = typed_len(&it.heap, arg(args, 2))?;
+        if want > count {
+            return Err(err("typed array length out of range"));
+        }
+        count = want;
+    }
+    Ok(Some((buf, base + off, count * bpe)))
+}
+
+/// `.buffer` value: a BufView facade over the whole backing Buf. Owned
+/// parents snapshot once (LE-encode current elems) then rewire live onto
+/// the new Buf, so later writes propagate; V8 aliases from birth, the
+/// only gap is the pre-buffer snapshot instant, which is exact.
+fn buffer_of(it: &mut Interp, id: u32) -> Result<Value, JsError> {
+    let bproto = po(it.protos.buffer);
+    match it.heap.obj(id) {
+        Obj::Bytes { .. } | Obj::Typed { .. } | Obj::Big64 { .. } => {}
+        Obj::DView { buf, .. } => {
+            let buf = *buf;
+            let blen = buf_live(&it.heap, buf).map(|b| b.len()).unwrap_or(0);
+            return Ok(Value::Obj(it.heap.alloc_obj(Obj::BufView {
+                buf,
+                off: 0,
+                len: blen,
+                kind: TypedKind::U8,
+                pairs: Vec::new(),
+                proto: bproto,
+            })?));
+        }
+        Obj::BufView { buf, .. } => {
+            let buf = *buf;
+            let blen = buf_live(&it.heap, buf).map(|b| b.len()).unwrap_or(0);
+            return Ok(Value::Obj(it.heap.alloc_obj(Obj::BufView {
+                buf,
+                off: 0,
+                len: blen,
+                kind: TypedKind::U8,
+                pairs: Vec::new(),
+                proto: bproto,
+            })?));
+        }
+        _ => return Ok(Value::Undef),
+    }
+    let (bytes, kind, pairs, proto) = match it.heap.obj(id) {
+        Obj::Bytes { bytes, pairs, proto, .. } => (bytes.clone(), TypedKind::U8, pairs.clone(), *proto),
+        Obj::Typed { kind, elems, pairs, proto, .. } => {
+            (encode_owned(*kind, elems), *kind, pairs.clone(), *proto)
+        }
+        Obj::Big64 { signed, elems, pairs, proto, .. } => {
+            let mut out = Vec::with_capacity(elems.len() * 8);
+            for e in elems {
+                out.extend_from_slice(&e.to_le_bytes());
+            }
+            let kind = if *signed { TypedKind::I64 } else { TypedKind::U64 };
+            (out, kind, pairs.clone(), *proto)
+        }
+        _ => unreachable!(),
+    };
+    let blen = bytes.len();
+    let buf = it.heap.alloc_obj(Obj::Buf { bytes, proto: bproto })?;
+    let fac = Value::Obj(it.heap.alloc_obj(Obj::BufView {
+        buf,
+        off: 0,
+        len: blen,
+        kind: TypedKind::U8,
+        pairs: Vec::new(),
+        proto: bproto,
+    })?);
+    it.heap.objs[id as usize] = Obj::BufView {
+        buf,
+        off: 0,
+        len: blen,
+        kind,
+        pairs,
+        proto,
+    };
+    Ok(fac)
+}
+
 fn n_u8_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    if let Value::Obj(src) = arg(args, 0) {
+        if let Ok(Some((buf, off, len))) = view_window(it, src, TypedKind::U8, args) {
+            let proto = po(view_proto(it, TypedKind::U8));
+            return Ok(Value::Obj(it.heap.alloc_obj(Obj::BufView {
+                buf,
+                off,
+                len,
+                kind: TypedKind::U8,
+                pairs: Vec::new(),
+                proto,
+            })?));
+        }
+    }
     let bytes = match arg(args, 0) {
         Value::Undef => Vec::new(),
         v @ (Value::Num(_) | Value::Str(_) | Value::Bool(_) | Value::Null) => {
@@ -8112,13 +8819,14 @@ fn n_u8_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsE
 }
 
 /// ArrayBuffer.isView(v): typed views and DataViews (not plain
-/// arrays, buffers, or objects).
+/// arrays, buffers, or objects; buffer facades read as buffers).
 fn n_buf_is_view(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     let hit = match arg(args, 0) {
-        Value::Obj(id) => matches!(
-            it.heap.obj(id),
-            Obj::Bytes { .. } | Obj::Typed { .. } | Obj::DView { .. } | Obj::Big64 { .. }
-        ),
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Bytes { .. } | Obj::Typed { .. } | Obj::DView { .. } | Obj::Big64 { .. } => true,
+            Obj::BufView { proto, .. } => *proto != po(it.protos.buffer),
+            _ => false,
+        },
         _ => false,
     };
     Ok(Value::Bool(hit))
@@ -8165,10 +8873,25 @@ fn n_u8_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsErr
     };
     match it.heap.obj(id) {
         Obj::Bytes { bytes, .. } if off + src.len() <= bytes.len() => {}
+        Obj::BufView { len, kind, .. }
+            if *kind == TypedKind::U8 && off + src.len() <= view_count(*kind, *len) => {}
         _ => return Err(err("Uint8Array.set source out of bounds")),
     }
-    if let Obj::Bytes { bytes, .. } = it.heap.obj_mut(id) {
-        bytes[off..off + src.len()].copy_from_slice(&src);
+    match it.heap.obj(id) {
+        Obj::Bytes { .. } => {
+            if let Obj::Bytes { bytes, .. } = it.heap.obj_mut(id) {
+                bytes[off..off + src.len()].copy_from_slice(&src);
+            }
+        }
+        Obj::BufView { buf, off: base, .. } => {
+            let (buf, base) = (*buf, *base);
+            if let Some(Obj::Buf { bytes, .. }) = it.heap.objs.get_mut(buf as usize) {
+                if base + off + src.len() <= bytes.len() {
+                    bytes[base + off..base + off + src.len()].copy_from_slice(&src);
+                }
+            }
+        }
+        _ => unreachable!(),
     }
     Ok(this)
 }
@@ -8177,6 +8900,22 @@ fn n_u8_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsE
     let id = u8_this(it, this, "slice")?;
     let (bytes, proto) = match it.heap.obj(id) {
         Obj::Bytes { bytes, proto, .. } => (bytes.clone(), *proto),
+        Obj::BufView { buf, off, len, kind, proto, .. } => {
+            let n = view_count(*kind, *len);
+            let bpe = t_bpe(*kind);
+            let out: Vec<u8> = (0..n)
+                .map(|i| {
+                    let at = off + i * bpe;
+                    match kind {
+                        TypedKind::I64 | TypedKind::U64 => {
+                            view_read_u64(&it.heap, *buf, at).unwrap_or(0) as u8
+                        }
+                        kk => to_u8_num(view_read_num(&it.heap, *buf, at, *kk).unwrap_or(0.0)),
+                    }
+                })
+                .collect();
+            (out, *proto)
+        }
         _ => unreachable!(),
     };
     let (a, b) = match (arg(args, 0), arg(args, 1)) {
@@ -8208,6 +8947,23 @@ fn n_u8_join(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsEr
             .map(|b| b.to_string())
             .collect::<Vec<_>>()
             .join(&sep),
+        Obj::BufView { buf, off, len, kind, .. } => {
+            let n = view_count(*kind, *len);
+            let bpe = t_bpe(*kind);
+            (0..n)
+                .map(|i| {
+                    let at = off + i * bpe;
+                    match kind {
+                        TypedKind::I64 | TypedKind::U64 => {
+                            (view_read_u64(&it.heap, *buf, at).unwrap_or(0) as u8).to_string()
+                        }
+                        kk => to_u8_num(view_read_num(&it.heap, *buf, at, *kk).unwrap_or(0.0))
+                            .to_string(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(&sep)
+        }
         _ => unreachable!(),
     };
     Ok(Value::Str(it.heap.alloc_str(s)?))
@@ -8218,6 +8974,7 @@ fn n_u8_fill(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsEr
     let b = to_u8(&it.heap, arg(args, 0));
     let len = match it.heap.obj(id) {
         Obj::Bytes { bytes, .. } => bytes.len(),
+        Obj::BufView { len, kind, .. } => view_count(*kind, *len),
         _ => unreachable!(),
     };
     let (a, c) = match (arg(args, 1), arg(args, 2)) {
@@ -8225,8 +8982,32 @@ fn n_u8_fill(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsEr
         (s, Value::Undef) => typed_range(len, to_num(&it.heap, s), len as f64),
         (s, e) => typed_range(len, to_num(&it.heap, s), to_num(&it.heap, e)),
     };
-    if let Obj::Bytes { bytes, .. } = it.heap.obj_mut(id) {
-        bytes[a..c].fill(b);
+    match it.heap.obj(id) {
+        Obj::Bytes { .. } => {
+            if let Obj::Bytes { bytes, .. } = it.heap.obj_mut(id) {
+                bytes[a..c].fill(b);
+            }
+        }
+        Obj::BufView { buf, off, len, kind, .. } => {
+            let (buf, off, blen, kind) = (*buf, *off, *len, *kind);
+            let bpe = t_bpe(kind);
+            let n = view_count(kind, blen);
+            // U8 live views are byte-packed: element i is byte off+i.
+            if kind == TypedKind::U8 {
+                if let Some(Obj::Buf { bytes, .. }) = it.heap.objs.get_mut(buf as usize) {
+                    for i in a.min(n)..c.min(n) {
+                        if off + i < bytes.len() {
+                            bytes[off + i] = b;
+                        }
+                    }
+                }
+            } else {
+                for i in a.min(n)..c.min(n) {
+                    view_write_num(&mut it.heap, buf, off + i * bpe, kind, b as f64);
+                }
+            }
+        }
+        _ => unreachable!(),
     }
     Ok(this)
 }
@@ -8254,6 +9035,25 @@ fn n_u8_index_of(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, 
                 .map(|i| (from + i) as f64)
                 .unwrap_or(-1.0),
         ),
+        Obj::BufView { buf, off, len, kind, .. } => {
+            let n = view_count(*kind, *len);
+            let bpe = t_bpe(*kind);
+            let mut hit: Option<usize> = None;
+            for i in from.min(n)..n {
+                let at = off + i * bpe;
+                let cur = match kind {
+                    TypedKind::I64 | TypedKind::U64 => {
+                        view_read_u64(&it.heap, *buf, at).unwrap_or(0) as u8
+                    }
+                    kk => to_u8_num(view_read_num(&it.heap, *buf, at, *kk).unwrap_or(0.0)),
+                };
+                if cur == b {
+                    hit = Some(i);
+                    break;
+                }
+            }
+            Value::Num(hit.map(|i| i as f64).unwrap_or(-1.0))
+        }
         _ => unreachable!(),
     })
 }
@@ -8271,6 +9071,35 @@ fn from_raw(it: &mut Interp, v: Value) -> Result<Vec<Value>, JsError> {
                 Ok(bytes.iter().map(|b| Value::Num(*b as f64)).collect())
             }
             Obj::Typed { elems, .. } => Ok(elems.iter().map(|e| Value::Num(*e)).collect()),
+            Obj::BufView { buf, off, len, kind, .. } => {
+                let (buf, off, len, kind) = (*buf, *off, *len, *kind);
+                let n = view_count(kind, len);
+                let bpe = t_bpe(kind);
+                match kind {
+                    TypedKind::I64 | TypedKind::U64 => {
+                        let bits: Vec<u64> = (0..n)
+                            .map(|i| view_read_u64(&it.heap, buf, off + i * bpe).unwrap_or(0))
+                            .collect();
+                        let mut out = Vec::with_capacity(n);
+                        for b in bits {
+                            let (neg, mag) = if kind == TypedKind::I64 {
+                                bi_from_i64(b as i64)
+                            } else {
+                                bi_from_u64(b)
+                            };
+                            out.push(bi_alloc(it, neg, mag)?);
+                        }
+                        Ok(out)
+                    }
+                    kk => Ok((0..n)
+                        .map(|i| {
+                            Value::Num(
+                                view_read_num(&it.heap, buf, off + i * bpe, kk).unwrap_or(0.0),
+                            )
+                        })
+                        .collect()),
+                }
+            }
             Obj::Big64 { signed, elems, .. } => {
                 let signed = *signed;
                 let mut out = Vec::with_capacity(elems.len());
@@ -8349,6 +9178,7 @@ fn typed_from(
         Some(k) => {
             let elems = mapped.iter().map(|x| t_write(k, to_num(&it.heap, *x))).collect();
             let proto = po(match k {
+                TypedKind::U8 => it.protos.uint8array,
                 TypedKind::I8 => it.protos.int8array,
                 TypedKind::U8C => it.protos.uint8clampedarray,
                 TypedKind::U16 => it.protos.uint16array,
@@ -8357,6 +9187,8 @@ fn typed_from(
                 TypedKind::I32 => it.protos.int32array,
                 TypedKind::F32 => it.protos.float32array,
                 TypedKind::F64 => it.protos.float64array,
+                TypedKind::I64 => it.protos.bigint64array,
+                TypedKind::U64 => it.protos.biguint64array,
             });
             Ok(Value::Obj(it.heap.alloc_obj(Obj::Typed {
                 kind: k,
@@ -8386,6 +9218,7 @@ fn n_u8_from(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsE
 fn t_of(it: &mut Interp, kind: TypedKind, args: &[Value]) -> Result<Value, JsError> {
     let elems = args.iter().map(|x| t_write(kind, to_num(&it.heap, *x))).collect();
     let proto = po(match kind {
+        TypedKind::U8 => it.protos.uint8array,
         TypedKind::I8 => it.protos.int8array,
         TypedKind::U8C => it.protos.uint8clampedarray,
         TypedKind::U16 => it.protos.uint16array,
@@ -8394,6 +9227,8 @@ fn t_of(it: &mut Interp, kind: TypedKind, args: &[Value]) -> Result<Value, JsErr
         TypedKind::I32 => it.protos.int32array,
         TypedKind::F32 => it.protos.float32array,
         TypedKind::F64 => it.protos.float64array,
+        TypedKind::I64 => it.protos.bigint64array,
+        TypedKind::U64 => it.protos.biguint64array,
     });
     Ok(Value::Obj(it.heap.alloc_obj(Obj::Typed {
         kind,
@@ -8453,9 +9288,16 @@ fn n_f64_from(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError>
 }
 
 fn n_buf_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {    let (bytes, proto) = match this {
-        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Buf { .. }) => match it.heap.obj(id) {
+        Value::Obj(id) => match it.heap.obj(id) {
             Obj::Buf { bytes, proto, .. } => (bytes.clone(), *proto),
-            _ => unreachable!(),
+            // Buffer facades slice their whole backing store.
+            Obj::BufView { buf, proto, .. } if *proto == po(it.protos.buffer) => {
+                match buf_live(&it.heap, *buf) {
+                    Some(b) => (b.to_vec(), *proto),
+                    None => (Vec::new(), *proto),
+                }
+            }
+            _ => return Err(err("ArrayBuffer.slice needs an ArrayBuffer receiver")),
         },
         _ => return Err(err("ArrayBuffer.slice needs an ArrayBuffer receiver")),
     };
@@ -8474,11 +9316,16 @@ fn n_buf_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Js
 // Same copy semantics as Bytes: elements pre-coerced, one method set
 // shared across kinds (the kind rides on the instance).
 
-/// `this` as a Typed heap id with its kind.
+/// `this` as a Typed heap id with its kind (owned or live view).
 fn t_this(it: &Interp, this: Value, name: &str) -> Result<(u32, TypedKind), JsError> {
     match this {
         Value::Obj(id) => match it.heap.obj(id) {
             Obj::Typed { kind, .. } => Ok((id, *kind)),
+            Obj::BufView { kind, .. }
+                if !matches!(kind, TypedKind::U8 | TypedKind::I64 | TypedKind::U64) =>
+            {
+                Ok((id, *kind))
+            }
             _ => Err(err(format!("typed array method {name} needs a typed array"))),
         },
         _ => Err(err(format!("typed array method {name} needs a typed array"))),
@@ -8498,6 +9345,21 @@ fn t_src_items(it: &Interp, kind: TypedKind, v: Value) -> Vec<f64> {
             // same as Number(big) explicit conversion).
             Obj::Big64 { elems, .. } => elems.iter().map(|e| cv(*e as f64)).collect(),
             Obj::Buf { bytes, .. } => t_decode(kind, bytes),
+            Obj::BufView { buf, off, len, kind: sk, .. } => {
+                let n = view_count(*sk, *len);
+                let bpe = t_bpe(*sk);
+                (0..n)
+                    .map(|i| {
+                        let at = off + i * bpe;
+                        match sk {
+                            TypedKind::I64 | TypedKind::U64 => cv(
+                                view_read_u64(&it.heap, *buf, at).unwrap_or(0) as f64,
+                            ),
+                            kk => cv(view_read_num(&it.heap, *buf, at, *kk).unwrap_or(0.0)),
+                        }
+                    })
+                    .collect()
+            },
             _ => t_len_items(it, kind, Value::Obj(id)),
         },
         _ => t_len_items(it, kind, v),
@@ -8531,6 +9393,7 @@ fn t_decode(kind: TypedKind, bytes: &[u8]) -> Vec<f64> {
         raw[..bpe].copy_from_slice(w);
         let u = u64::from_le_bytes(raw);
         out.push(match kind {
+            TypedKind::U8 => w[0] as f64,
             TypedKind::I8 => (w[0] as i8) as f64,
             TypedKind::U8C => t_write(TypedKind::U8C, w[0] as f64),
             TypedKind::U16 => (u as u16) as f64,
@@ -8539,15 +9402,37 @@ fn t_decode(kind: TypedKind, bytes: &[u8]) -> Vec<f64> {
             TypedKind::I32 => (u as u32) as i32 as f64,
             TypedKind::F32 => f32::from_le_bytes([w[0], w[1], w[2], w[3]]) as f64,
             TypedKind::F64 => f64::from_le_bytes(w.try_into().unwrap_or([0; 8])),
+            // I64/U64 never decode to f64 (callers use the u64 path).
+            TypedKind::I64 | TypedKind::U64 => 0.0,
         });
     }
     out
 }
 
 /// Shared view constructor: length, source view/array, buffer (+ byte
-/// offset/length), or empty. Buffer offsets must align to the element
-/// size; odd buffer lengths throw (V8 parity).
+/// offset/length), or empty. Buffer-backed forms (Buf/BufView) are live
+/// views sharing the store; every other source copies. Buffer offsets
+/// must align to the element size; odd buffer lengths throw (V8 parity).
 fn t_ctor(it: &mut Interp, kind: TypedKind, proto: u32, args: &[Value]) -> Result<Value, JsError> {
+    if let Value::Obj(src) = arg(args, 0) {
+        if let Ok(Some((buf, off, len))) = view_window(it, src, kind, args) {
+            return Ok(Value::Obj(it.heap.alloc_obj(Obj::BufView {
+                buf,
+                off,
+                len,
+                kind,
+                pairs: Vec::new(),
+                proto: po(proto),
+            })?));
+        }
+        if matches!(
+            it.heap.obj(src),
+            Obj::Buf { .. } | Obj::BufView { .. }
+        ) {
+            // view_window errored (misaligned/OOB/mismatch): propagate.
+            view_window(it, src, kind, args)?;
+        }
+    }
     let elems = match arg(args, 0) {
         Value::Undef => Vec::new(),
         v @ (Value::Num(_) | Value::Str(_) | Value::Bool(_) | Value::Null) => {
@@ -8626,6 +9511,25 @@ fn n_t_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsErro
             Obj::Typed { elems, .. } => elems.iter().map(|e| t_write(kind, *e)).collect(),
             Obj::Big64 { elems, .. } => elems.iter().map(|e| t_write(kind, *e as f64)).collect(),
             Obj::Buf { bytes, .. } => t_decode(kind, bytes),
+            Obj::BufView { buf, off, len, kind: sk, .. } => {
+                let n = view_count(*sk, *len);
+                let bpe = t_bpe(*sk);
+                (0..n)
+                    .map(|i| {
+                        let at = off + i * bpe;
+                        match sk {
+                            TypedKind::I64 | TypedKind::U64 => t_write(
+                                kind,
+                                view_read_u64(&it.heap, *buf, at).unwrap_or(0) as f64,
+                            ),
+                            kk => t_write(
+                                kind,
+                                view_read_num(&it.heap, *buf, at, *kk).unwrap_or(0.0),
+                            ),
+                        }
+                    })
+                    .collect()
+            }
             _ => t_len_items(it, kind, Value::Obj(sid)),
         },
         v => t_len_items(it, kind, v),
@@ -8642,17 +9546,38 @@ fn n_t_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsErro
     };
     match it.heap.obj(id) {
         Obj::Typed { elems, .. } if off + src.len() <= elems.len() => {}
+        Obj::BufView { len, kind: dk, .. }
+            if off + src.len() <= view_count(*dk, *len) => {}
         _ => return Err(err("typed array set source out of bounds")),
     }
-    if let Obj::Typed { elems, .. } = it.heap.obj_mut(id) {
-        elems[off..off + src.len()].copy_from_slice(&src);
+    match it.heap.obj(id) {
+        Obj::Typed { .. } => {
+            if let Obj::Typed { elems, .. } = it.heap.obj_mut(id) {
+                elems[off..off + src.len()].copy_from_slice(&src);
+            }
+        }
+        Obj::BufView { buf, off: base, kind: dk, .. } => {
+            let (buf, base, dk) = (*buf, *base, *dk);
+            let bpe = t_bpe(dk);
+            for (i, e) in src.iter().enumerate() {
+                view_write_num(&mut it.heap, buf, base + (off + i) * bpe, dk, *e);
+            }
+        }
+        _ => unreachable!(),
     }
     Ok(this)
 }
 
 fn t_slice_vec(it: &Interp, id: u32, args: &[Value]) -> Result<Vec<f64>, JsError> {
-    let elems = match it.heap.obj(id) {
+    let elems: Vec<f64> = match it.heap.obj(id) {
         Obj::Typed { elems, .. } => elems.clone(),
+        Obj::BufView { buf, off, len, kind, .. } => {
+            let n = view_count(*kind, *len);
+            let bpe = t_bpe(*kind);
+            (0..n)
+                .map(|i| view_read_num(&it.heap, *buf, off + i * bpe, *kind).unwrap_or(0.0))
+                .collect()
+        }
         _ => unreachable!(),
     };
     let (a, b) = match (arg(args, 0), arg(args, 1)) {
@@ -8667,6 +9592,7 @@ fn n_t_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsEr
     let (id, kind) = t_this(it, this, "slice")?;
     let proto = match it.heap.obj(id) {
         Obj::Typed { proto, .. } => *proto,
+        Obj::BufView { proto, .. } => *proto,
         _ => unreachable!(),
     };
     let out = t_slice_vec(it, id, args)?;
@@ -8695,6 +9621,21 @@ fn n_t_join(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsErr
             .map(|e| to_str(&it.heap, Value::Num(*e)))
             .collect::<Vec<_>>()
             .join(&sep),
+        Obj::BufView { buf, off, len, kind, .. } => {
+            let n = view_count(*kind, *len);
+            let bpe = t_bpe(*kind);
+            (0..n)
+                .map(|i| {
+                    to_str(
+                        &it.heap,
+                        Value::Num(
+                            view_read_num(&it.heap, *buf, off + i * bpe, *kind).unwrap_or(0.0),
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(&sep)
+        }
         _ => unreachable!(),
     };
     Ok(Value::Str(it.heap.alloc_str(s)?))
@@ -8705,6 +9646,7 @@ fn n_t_fill(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsErr
     let ne = t_write(kind, to_num(&it.heap, arg(args, 0)));
     let len = match it.heap.obj(id) {
         Obj::Typed { elems, .. } => elems.len(),
+        Obj::BufView { len, kind, .. } => view_count(*kind, *len),
         _ => unreachable!(),
     };
     let (a, c) = match (arg(args, 1), arg(args, 2)) {
@@ -8712,8 +9654,20 @@ fn n_t_fill(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsErr
         (s, Value::Undef) => typed_range(len, to_num(&it.heap, s), len as f64),
         (s, e) => typed_range(len, to_num(&it.heap, s), to_num(&it.heap, e)),
     };
-    if let Obj::Typed { elems, .. } = it.heap.obj_mut(id) {
-        elems[a..c].fill(ne);
+    match it.heap.obj(id) {
+        Obj::Typed { .. } => {
+            if let Obj::Typed { elems, .. } = it.heap.obj_mut(id) {
+                elems[a..c].fill(ne);
+            }
+        }
+        Obj::BufView { buf, off, kind, .. } => {
+            let (buf, off, kind) = (*buf, *off, *kind);
+            let bpe = t_bpe(kind);
+            for i in a.min(len)..c.min(len) {
+                view_write_num(&mut it.heap, buf, off + i * bpe, kind, ne);
+            }
+        }
+        _ => unreachable!(),
     }
     Ok(this)
 }
@@ -8741,13 +9695,27 @@ fn n_t_index_of(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, J
                 .map(|i| (from + i) as f64)
                 .unwrap_or(-1.0),
         ),
+        Obj::BufView { buf, off, len, kind, .. } => {
+            let n = view_count(*kind, *len);
+            let bpe = t_bpe(*kind);
+            let mut hit: Option<usize> = None;
+            for i in from.min(n)..n {
+                let e = view_read_num(&it.heap, *buf, off + i * bpe, *kind).unwrap_or(0.0);
+                if e == ne {
+                    hit = Some(i);
+                    break;
+                }
+            }
+            Value::Num(hit.map(|i| i as f64).unwrap_or(-1.0))
+        }
         _ => unreachable!(),
     })
 }
 
 // -- DataView --------------------------------------------------------------------
-// Minimal reader/writer over a buffer copy for font/table parsing in
-// bundles. Offset form slices the copy (byteOffset reported back).
+// Live window onto a Buf (buf id + byte off/len); accessors translate per
+// access through the backing store, so views sharing one Buf see each
+// other's writes. From owned sources the Buf is a fresh copy.
 
 fn dv_this(it: &Interp, this: Value, name: &str) -> Result<u32, JsError> {
     match this {
@@ -8756,10 +9724,10 @@ fn dv_this(it: &Interp, this: Value, name: &str) -> Result<u32, JsError> {
     }
 }
 
-/// (bytes, base, little-endian) for an accessor call.
-fn dv_args(it: &Interp, id: u32, args: &[Value]) -> Result<(Vec<u8>, usize, bool), JsError> {
-    let (bytes, off) = match it.heap.obj(id) {
-        Obj::DView { bytes, off, .. } => (bytes.clone(), *off),
+/// (buf, absolute byte, view len, little-endian) for an accessor call.
+fn dv_args(it: &Interp, id: u32, args: &[Value]) -> Result<(u32, usize, usize, bool), JsError> {
+    let (buf, off, len) = match it.heap.obj(id) {
+        Obj::DView { buf, off, len, .. } => (*buf, *off, *len),
         _ => unreachable!(),
     };
     let at = match to_num(&it.heap, arg(args, 0)).trunc() {
@@ -8767,7 +9735,16 @@ fn dv_args(it: &Interp, id: u32, args: &[Value]) -> Result<(Vec<u8>, usize, bool
         n => n as usize,
     };
     let le = truthy(&it.heap, arg(args, 1));
-    Ok((bytes, off + at, le))
+    Ok((buf, off + at, len, le))
+}
+
+fn dv_rel(at_abs: usize, off: usize, len: usize, size: usize) -> Result<(), JsError> {
+    let rel = at_abs.saturating_sub(off);
+    if rel + size <= len {
+        Ok(())
+    } else {
+        Err(err("DataView offset out of bounds"))
+    }
 }
 
 fn dv_need(bytes: &[u8], at: usize, size: usize) -> Result<(), JsError> {
@@ -8779,27 +9756,57 @@ fn dv_need(bytes: &[u8], at: usize, size: usize) -> Result<(), JsError> {
 }
 
 fn n_dv_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
-    let bytes = match arg(args, 0) {
+    // Shared base when the source is already buffer-backed (live).
+    let shared: Option<(u32, usize, usize)> = match arg(args, 0) {
         Value::Obj(id) => match it.heap.obj(id) {
-            Obj::Buf { bytes, .. } => bytes.clone(),
-            Obj::Bytes { bytes, .. } => bytes.clone(),
-            Obj::Typed { elems, kind, .. } => {
-                let mut out = Vec::with_capacity(elems.len() * t_bpe(*kind));
-                for e in elems {
-                    dv_push(&mut out, *kind, *e);
-                }
-                out
-            }
-            Obj::Big64 { elems, .. } => {
-                let mut out = Vec::with_capacity(elems.len() * 8);
-                for e in elems {
-                    out.extend_from_slice(&e.to_le_bytes());
-                }
-                out
-            }
-            _ => return Err(err("DataView needs an ArrayBuffer")),
+            Obj::Buf { bytes, .. } => Some((id, 0, bytes.len())),
+            Obj::BufView { buf, off, len, .. } => Some((*buf, *off, *len)),
+            _ => None,
         },
-        _ => return Err(err("DataView needs an ArrayBuffer")),
+        _ => None,
+    };
+    let (buf, base, avail) = match shared {
+        Some(t) => t,
+        None => {
+            let bytes = match arg(args, 0) {
+                Value::Obj(id) => match it.heap.obj(id) {
+                    Obj::Bytes { bytes, .. } => bytes.clone(),
+                    Obj::Typed { elems, kind, .. } => {
+                        let mut out = Vec::with_capacity(elems.len() * t_bpe(*kind));
+                        for e in elems {
+                            dv_push(&mut out, *kind, *e);
+                        }
+                        out
+                    }
+                    Obj::Big64 { elems, .. } => {
+                        let mut out = Vec::with_capacity(elems.len() * 8);
+                        for e in elems {
+                            out.extend_from_slice(&e.to_le_bytes());
+                        }
+                        out
+                    }
+                    Obj::Buf { bytes, .. } => bytes.clone(),
+                    Obj::BufView { buf, off, len, .. } => {
+                        match buf_live(&it.heap, *buf) {
+                            Some(b) => b
+                                .get(*off..off + len)
+                                .unwrap_or(&[])
+                                .to_vec(),
+                            None => Vec::new(),
+                        }
+                    }
+                    _ => return Err(err("DataView needs an ArrayBuffer")),
+                },
+                _ => return Err(err("DataView needs an ArrayBuffer")),
+            };
+            let proto = po(it.protos.buffer);
+            let b = it.heap.alloc_obj(Obj::Buf { bytes, proto })?;
+            let blen = match it.heap.obj(b) {
+                Obj::Buf { bytes, .. } => bytes.len(),
+                _ => unreachable!(),
+            };
+            (b, 0, blen)
+        }
     };
     let off = match arg(args, 1) {
         Value::Undef => 0,
@@ -8808,21 +9815,22 @@ fn n_dv_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsE
             n => n as usize,
         },
     };
-    if off > bytes.len() {
+    if off > avail {
         return Err(err("DataView offset out of bounds"));
     }
-    let mut view = bytes[off..].to_vec();
+    let mut len = avail - off;
     if !matches!(arg(args, 2), Value::Undef) {
         let want = typed_len(&it.heap, arg(args, 2))?;
-        if want > view.len() {
+        if want > len {
             return Err(err("DataView length out of range"));
         }
-        view.truncate(want);
+        len = want;
     }
     let proto = po(it.protos.dataview);
     Ok(Value::Obj(it.heap.alloc_obj(Obj::DView {
-        bytes: view,
-        off,
+        buf,
+        off: base + off,
+        len,
         proto,
     })?))
 }
@@ -8831,19 +9839,31 @@ fn n_dv_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsE
 /// bundle path this serves).
 fn dv_push(out: &mut Vec<u8>, kind: TypedKind, e: f64) {
     match kind {
+        TypedKind::U8 => out.push(to_u8_num(e)),
         TypedKind::I8 => out.push(e as i8 as u8),
         TypedKind::U8C => out.push(e as u8),
         TypedKind::U16 | TypedKind::I16 => out.extend_from_slice(&(e as i16 as u16).to_le_bytes()),
         TypedKind::U32 | TypedKind::I32 => out.extend_from_slice(&(e as i32 as u32).to_le_bytes()),
         TypedKind::F32 => out.extend_from_slice(&(e as f32).to_le_bytes()),
         TypedKind::F64 => out.extend_from_slice(&e.to_le_bytes()),
+        // Big64 views never flow through here (u64 path in the ctor).
+        TypedKind::I64 | TypedKind::U64 => out.extend_from_slice(&0u64.to_le_bytes()),
     }
 }
 
 fn dv_get(it: &mut Interp, this: Value, args: &[Value], size: usize, name: &str) -> Result<Value, JsError> {
     let id = dv_this(it, this, name)?;
-    let (bytes, at, le) = dv_args(it, id, args)?;
-    dv_need(&bytes, at, size)?;
+    let (buf, at, vlen, le) = dv_args(it, id, args)?;
+    let (voff, _) = match it.heap.obj(id) {
+        Obj::DView { off, .. } => (*off, 0),
+        _ => unreachable!(),
+    };
+    dv_rel(at, voff, vlen, size)?;
+    let bytes = match buf_live(&it.heap, buf) {
+        Some(b) => b,
+        None => return Err(err("DataView offset out of bounds")),
+    };
+    dv_need(bytes, at, size)?;
     let w = &bytes[at..at + size];
     Ok(Value::Num(match (name, size) {
         (_, 1) => w[0] as f64,
@@ -8903,17 +9923,18 @@ fn n_dv_get_f64(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError
 
 fn dv_set(it: &mut Interp, this: Value, args: &[Value], size: usize, name: &str) -> Result<Value, JsError> {
     let id = dv_this(it, this, name)?;
-    let (bytes_len, off) = match it.heap.obj(id) {
-        Obj::DView { bytes, off, .. } => (bytes.len(), *off),
+    let (buf, vlen, off) = match it.heap.obj(id) {
+        Obj::DView { buf, len, off, .. } => (*buf, *len, *off),
         _ => unreachable!(),
     };
-    let at = match to_num(&it.heap, arg(args, 0)).trunc() {
+    let rel = match to_num(&it.heap, arg(args, 0)).trunc() {
         n if n < 0.0 => return Err(err("DataView offset out of bounds")),
-        n => off + n as usize,
+        n => n as usize,
     };
-    if at + size > bytes_len {
+    if rel + size > vlen {
         return Err(err("DataView offset out of bounds"));
     }
+    let at = off + rel;
     let le = truthy(&it.heap, arg(args, 2));
     let n = to_num(&it.heap, arg(args, 1));
     let enc: Vec<u8> = match (name, size) {
@@ -8938,10 +9959,13 @@ fn dv_set(it: &mut Interp, this: Value, args: &[Value], size: usize, name: &str)
         }
         _ => unreachable!(),
     };
-    if let Obj::DView { bytes, .. } = it.heap.obj_mut(id) {
-        bytes[at..at + size].copy_from_slice(&enc);
+    match it.heap.objs.get_mut(buf as usize) {
+        Some(Obj::Buf { bytes, .. }) if at + size <= bytes.len() => {
+            bytes[at..at + size].copy_from_slice(&enc);
+            Ok(Value::Undef)
+        }
+        _ => Err(err("DataView offset out of bounds")),
     }
-    Ok(Value::Undef)
 }
 
 fn n_dv_set_u8(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
@@ -9901,6 +10925,8 @@ fn b64_this(it: &Interp, this: Value, op: &str) -> Result<(u32, bool), JsError> 
     match this {
         Value::Obj(id) => match it.heap.obj(id) {
             Obj::Big64 { signed, .. } => Ok((id, *signed)),
+            Obj::BufView { kind, .. } if *kind == TypedKind::I64 => Ok((id, true)),
+            Obj::BufView { kind, .. } if *kind == TypedKind::U64 => Ok((id, false)),
             _ => Err(err(format!("{op} needs a BigInt array receiver"))),
         },
         _ => Err(err(format!("{op} needs a BigInt array receiver"))),
@@ -9935,10 +10961,10 @@ fn b64_wrap(h: &Heap, v: Value) -> u64 {
 }
 
 /// Named/element store: canonical indices wrap in range (out-of-range
-/// drops, sloppy); `length`/`byteLength` are read-only no-ops; anything
-/// else is an expando pair.
+/// drops, sloppy); `length`/`byteLength`/`byteOffset` are read-only
+/// no-ops; anything else is an expando pair.
 fn b64_set(h: &mut Heap, id: u32, key: &str, val: Value) -> Result<(), JsError> {
-    if key == "length" || key == "byteLength" {
+    if key == "length" || key == "byteLength" || key == "byteOffset" {
         return Ok(());
     }
     let w = b64_wrap(&*h, val);
@@ -9978,8 +11004,28 @@ fn b64_len_items(it: &Interp, v: Value) -> Vec<u64> {
 }
 
 /// Shared Big64 constructor: length, source view/array, or buffer (+ byte
-/// offset/element length, 8-aligned like the Typed views).
+/// offset/element length, 8-aligned like the Typed views). Buffer-backed
+/// forms (Buf/BufView) are live views sharing the store; the rest copy.
 fn b64_ctor(it: &mut Interp, signed: bool, proto: u32, args: &[Value]) -> Result<Value, JsError> {
+    let kind = if signed { TypedKind::I64 } else { TypedKind::U64 };
+    if let Value::Obj(src) = arg(args, 0) {
+        if let Ok(Some((buf, off, len))) = view_window(it, src, kind, args) {
+            return Ok(Value::Obj(it.heap.alloc_obj(Obj::BufView {
+                buf,
+                off,
+                len,
+                kind,
+                pairs: Vec::new(),
+                proto: po(proto),
+            })?));
+        }
+        if matches!(
+            it.heap.obj(src),
+            Obj::Buf { .. } | Obj::BufView { .. }
+        ) {
+            view_window(it, src, kind, args)?;
+        }
+    }
     let elems: Vec<u64> = match arg(args, 0) {
         Value::Undef => Vec::new(),
         v @ (Value::Num(_) | Value::Str(_) | Value::Bool(_) | Value::Null) => {
@@ -10027,6 +11073,23 @@ fn b64_ctor(it: &mut Interp, signed: bool, proto: u32, args: &[Value]) -> Result
             Obj::Big64 { elems, .. } => elems.clone(),
             Obj::Bytes { bytes, .. } => bytes.iter().map(|b| *b as u64).collect(),
             Obj::Typed { elems, .. } => elems.iter().map(|e| b64_wrap_num(*e)).collect(),
+            Obj::BufView { buf, off, len, kind, .. } => {
+                let n = view_count(*kind, *len);
+                let bpe = t_bpe(*kind);
+                (0..n)
+                    .map(|i| {
+                        let at = off + i * bpe;
+                        match kind {
+                            TypedKind::I64 | TypedKind::U64 => {
+                                view_read_u64(&it.heap, *buf, at).unwrap_or(0)
+                            }
+                            kk => b64_wrap_num(
+                                view_read_num(&it.heap, *buf, at, *kk).unwrap_or(0.0),
+                            ),
+                        }
+                    })
+                    .collect()
+            }
             Obj::Arr { items, .. } => {
                 items.iter().map(|x| b64_wrap(&it.heap, *x)).collect()
             }
@@ -10054,6 +11117,7 @@ fn n_b64_fill(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsE
     let w = b64_wrap(&it.heap, arg(args, 0));
     let len = match it.heap.obj(id) {
         Obj::Big64 { elems, .. } => elems.len(),
+        Obj::BufView { len, kind, .. } => view_count(*kind, *len),
         _ => unreachable!(),
     };
     let (a, c) = match (arg(args, 1), arg(args, 2)) {
@@ -10061,8 +11125,19 @@ fn n_b64_fill(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsE
         (s, Value::Undef) => typed_range(len, to_num(&it.heap, s), len as f64),
         (s, e) => typed_range(len, to_num(&it.heap, s), to_num(&it.heap, e)),
     };
-    if let Obj::Big64 { elems, .. } = it.heap.obj_mut(id) {
-        elems[a..c].fill(w);
+    match it.heap.obj(id) {
+        Obj::Big64 { .. } => {
+            if let Obj::Big64 { elems, .. } = it.heap.obj_mut(id) {
+                elems[a..c].fill(w);
+            }
+        }
+        Obj::BufView { buf, off, .. } => {
+            let (buf, off) = (*buf, *off);
+            for i in a.min(len)..c.min(len) {
+                view_write_u64(&mut it.heap, buf, off + i * 8, w);
+            }
+        }
+        _ => unreachable!(),
     }
     Ok(this)
 }
@@ -10079,8 +11154,17 @@ fn dv_big_get(
     name: &str,
 ) -> Result<Value, JsError> {
     let id = dv_this(it, this, name)?;
-    let (bytes, at, le) = dv_args(it, id, args)?;
-    dv_need(&bytes, at, 8)?;
+    let (buf, at, vlen, le) = dv_args(it, id, args)?;
+    let (voff, _) = match it.heap.obj(id) {
+        Obj::DView { off, .. } => (*off, 0),
+        _ => unreachable!(),
+    };
+    dv_rel(at, voff, vlen, 8)?;
+    let bytes = match buf_live(&it.heap, buf) {
+        Some(b) => b,
+        None => return Err(err("DataView offset out of bounds")),
+    };
+    dv_need(bytes, at, 8)?;
     let w = &bytes[at..at + 8];
     let bits = if le {
         u64::from_le_bytes([w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]])
@@ -10102,24 +11186,28 @@ fn dv_big_set(
     name: &str,
 ) -> Result<Value, JsError> {
     let id = dv_this(it, this, name)?;
-    let (bytes_len, off) = match it.heap.obj(id) {
-        Obj::DView { bytes, off, .. } => (bytes.len(), *off),
+    let (buf, vlen, off) = match it.heap.obj(id) {
+        Obj::DView { buf, len, off, .. } => (*buf, *len, *off),
         _ => unreachable!(),
     };
-    let at = match to_num(&it.heap, arg(args, 0)).trunc() {
+    let rel = match to_num(&it.heap, arg(args, 0)).trunc() {
         n if n < 0.0 => return Err(err("DataView offset out of bounds")),
-        n => off + n as usize,
+        n => n as usize,
     };
-    if at + 8 > bytes_len {
+    if rel + 8 > vlen {
         return Err(err("DataView offset out of bounds"));
     }
+    let at = off + rel;
     let le = truthy(&it.heap, arg(args, 2));
     let w = b64_wrap(&it.heap, arg(args, 1));
     let enc = if le { w.to_le_bytes() } else { w.to_be_bytes() };
-    if let Obj::DView { bytes, .. } = it.heap.obj_mut(id) {
-        bytes[at..at + 8].copy_from_slice(&enc);
+    match it.heap.objs.get_mut(buf as usize) {
+        Some(Obj::Buf { bytes, .. }) if at + 8 <= bytes.len() => {
+            bytes[at..at + 8].copy_from_slice(&enc);
+            Ok(Value::Undef)
+        }
+        _ => Err(err("DataView offset out of bounds")),
     }
-    Ok(Value::Undef)
 }
 
 fn n_dv_get_bi64(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
@@ -10164,6 +11252,21 @@ fn td_bytes(it: &Interp, v: Value) -> Vec<u8> {
             Obj::Typed { elems, kind, .. } => {
                 elems.iter().map(|e| to_u8_num(t_write(*kind, *e))).collect()
             }
+            Obj::BufView { buf, off, len, kind, .. } => match kind {
+                TypedKind::I64 | TypedKind::U64 => Vec::new(),
+                kk => {
+                    let n = view_count(*kk, *len);
+                    let bpe = t_bpe(*kk);
+                    (0..n)
+                        .map(|i| {
+                            to_u8_num(t_write(
+                                *kk,
+                                view_read_num(&it.heap, *buf, off + i * bpe, *kk).unwrap_or(0.0),
+                            ))
+                        })
+                        .collect()
+                }
+            },
             _ => Vec::new(),
         },
         _ => Vec::new(),
@@ -13448,6 +14551,61 @@ mod tests {
         );
         assert!(errmsg("new DataView(new ArrayBuffer(8)).getBigInt64(1)").contains("out of bounds"));
         assert!(errmsg("new DataView(new ArrayBuffer(8)).setBigUint64(1,BigInt(1))").contains("out of bounds"));
+    }
+
+    #[test]
+    fn bufview_aliasing() {
+        // Maps endianness shape: BigInt lane written after the u32 view
+        // is made still reads through (single Buf, LE codec).
+        assert_eq!(
+            disp("var a=new BigInt64Array(1);var b=new Uint32Array(a.buffer);a[0]=BigInt(1);b[0]"),
+            "1"
+        );
+        assert_eq!(
+            disp("var a=new BigInt64Array(1);var b=new Uint32Array(a.buffer);a[0]=BigInt(1);b[1]"),
+            "0"
+        );
+        // Cross-view visibility both directions over one ArrayBuffer.
+        assert_eq!(
+            disp("var g=new ArrayBuffer(4);var u8=new Uint8Array(g);var u32=new Uint32Array(g);u8[0]=1;u8[1]=0;u8[2]=0;u8[3]=0;u32[0]"),
+            "1"
+        );
+        assert_eq!(
+            disp("var g=new ArrayBuffer(4);var u8=new Uint8Array(g);var u32=new Uint32Array(g);u32[0]=258;u8[0]+','+u8[1]"),
+            "2,1"
+        );
+        // byteOffset/length windows + alignment/range errors.
+        assert_eq!(disp("new Uint16Array(new ArrayBuffer(8),2,2).length"), "2");
+        assert_eq!(disp("new Uint16Array(new ArrayBuffer(8),2,2).byteOffset"), "2");
+        assert_eq!(disp("new Uint16Array(new ArrayBuffer(8),2,2).byteLength"), "4");
+        assert_eq!(disp("new BigInt64Array(new ArrayBuffer(16),8,1).length"), "1");
+        assert!(errmsg("new Uint16Array(new ArrayBuffer(8),1)").contains("misaligned"));
+        assert!(errmsg("new Uint32Array(new ArrayBuffer(8),16)").contains("misaligned"));
+        assert!(errmsg("new Uint16Array(new ArrayBuffer(3))").contains("mismatch"));
+        assert!(errmsg("new BigInt64Array(new ArrayBuffer(8),1)").contains("misaligned"));
+        // DataView over the same Buf observes typed writes (LE lane).
+        assert_eq!(
+            disp("var g=new ArrayBuffer(4);var u=new Uint32Array(g);var d=new DataView(g);u[0]=287454020;dummy=0;d.getUint8(0)+','+d.getUint8(1)"),
+            "68,51"
+        );
+        assert_eq!(
+            disp("var g=new ArrayBuffer(4);var d=new DataView(g);var u=new Uint32Array(g);d.setUint32(0,1,true);u[0]"),
+            "1"
+        );
+        // .buffer byteLength tracks the store; slice stays an owned copy.
+        assert_eq!(disp("new Uint32Array(2).buffer.byteLength"), "8");
+        assert_eq!(disp("new BigInt64Array(1).buffer.byteLength"), "8");
+        assert_eq!(disp("new Uint8Array(3).buffer.byteLength"), "3");
+        assert_eq!(
+            disp("var g=new ArrayBuffer(4);var u=new Uint32Array(g);var c=u.slice();u[0]=9;c[0]"),
+            "0"
+        );
+        assert_eq!(
+            disp("var u=new Uint8Array(new ArrayBuffer(3));var c=u.slice();u[0]=9;c[0]"),
+            "0"
+        );
+        assert_eq!(disp("ArrayBuffer.isView(new Uint32Array(new ArrayBuffer(4)))"), "true");
+        assert_eq!(disp("ArrayBuffer.isView(new Uint8Array(1).buffer)"), "false");
     }
 
     #[test]

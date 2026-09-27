@@ -204,7 +204,17 @@ impl Marker {
                             self.ow.push(*p);
                         }
                     }
-                    Obj::DView { proto, .. } => {
+                    Obj::BufView { buf, pairs, proto, .. } => {
+                        self.ow.push(*buf);
+                        for (_, v) in pairs {
+                            self.val(*v);
+                        }
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
+                    Obj::DView { buf, proto, .. } => {
+                        self.ow.push(*buf);
                         if let Some(p) = proto {
                             self.ow.push(*p);
                         }

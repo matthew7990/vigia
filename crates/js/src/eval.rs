@@ -12,8 +12,8 @@ use crate::ast::{
 };
 use crate::{
     bindings::{
-        WIN_EVENTS, n_dom_method, n_get_computed_style, n_image_ctor, n_win_add_event_listener,
-        n_win_dispatch_event, n_win_remove_event_listener,
+        WIN_EVENTS, n_dom_method, n_event_ctor, n_get_computed_style, n_image_ctor,
+        n_win_add_event_listener, n_win_dispatch_event, n_win_remove_event_listener,
     },
     err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
     Protos, ThenHandler, Timer, TypedKind, Value,
@@ -1523,6 +1523,49 @@ impl Interp {
                 let _ = set_prop(&mut self.heap, Value::Obj(bag), "constructor", c);
             }
         }
+        // Constructible Event hierarchy (separate table from the DOM
+        // Node one): Event <- CustomEvent/MouseEvent/KeyboardEvent. One
+        // native serves all four ctors, dispatching on its own name.
+        let event_ifaces: &[(&str, &str)] = &[
+            ("Event", ""),
+            ("CustomEvent", "Event"),
+            ("MouseEvent", "Event"),
+            ("KeyboardEvent", "Event"),
+        ];
+        let set_ebag = |it: &mut Interp, name: &str, bag: u32| match name {
+            "Event" => it.protos.event = bag,
+            "CustomEvent" => it.protos.custom_event = bag,
+            "MouseEvent" => it.protos.mouse_event = bag,
+            "KeyboardEvent" => it.protos.keyboard_event = bag,
+            _ => {}
+        };
+        let get_ebag = |it: &Interp, name: &str| match name {
+            "Event" => it.protos.event,
+            "CustomEvent" => it.protos.custom_event,
+            "MouseEvent" => it.protos.mouse_event,
+            "KeyboardEvent" => it.protos.keyboard_event,
+            _ => u32::MAX,
+        };
+        for (name, _parent) in event_ifaces {
+            let bag = self.proto_bag(&[]);
+            set_ebag(self, name, bag);
+            self.ctor(name, n_event_ctor, bag, &[]);
+        }
+        for (name, parent) in event_ifaces {
+            if !parent.is_empty() {
+                let (b, p) = (get_ebag(self, name), get_ebag(self, parent));
+                link(self, b, p);
+            }
+        }
+        for (name, _parent) in event_ifaces {
+            let bag = get_ebag(self, name);
+            if bag == u32::MAX {
+                continue;
+            }
+            if let Some(c) = self.env_get(0, name) {
+                let _ = set_prop(&mut self.heap, Value::Obj(bag), "constructor", c);
+            }
+        }
         // DOM methods as bag values (resolved reads like V8; calls still
         // hit the direct dispatch first). Inherited down the bag chain,
         // so each name registers once at its lowest level.
@@ -1570,6 +1613,7 @@ impl Interp {
                     "createTextNode",
                     "createComment",
                     "createDocumentFragment",
+                    "createEvent",
                     "querySelector",
                     "querySelectorAll",
                     "hasFocus",

@@ -1851,6 +1851,17 @@ impl Interp {
                     let n = self.dom_mut()?.fragment_node();
                     self.dom_wrap(n)
                 }
+                "createEvent" => {
+                    let want = to_str(&self.heap, arg(0));
+                    let kind = match want.as_str() {
+                        "MouseEvents" => "MouseEvent",
+                        "KeyboardEvent" | "KeyEvents" => "KeyboardEvent",
+                        "CustomEvent" => "CustomEvent",
+                        "Event" | "Events" | "HTMLEvents" | "UIEvents" => "Event",
+                        _ => return Err(err(format!("createEvent: unknown type {want}"))),
+                    };
+                    blank_event(self, kind)
+                }
                 "implementation" => self.impl_obj(),
                 "hasFocus" => Ok(Value::Bool(true)),
                 "createComment" => {
@@ -2139,6 +2150,188 @@ fn n_event_stop_propagation(
 ) -> Result<Value, JsError> {
     // internal flag the dispatch loop checks between nodes
     set_prop(&mut it.heap, this, "__stopped", Value::Bool(true)).map(|()| Value::Undef)
+}
+
+// ---- constructible events -----------------------------------------------
+
+/// Extra-key value kinds for EVENT_EXTRAS.
+const EV_NUM: u8 = 0;
+const EV_BOOL: u8 = 1;
+const EV_STR: u8 = 2;
+const EV_VAL: u8 = 3;
+
+/// Per-ctor extra keys from the init dict: (ctor, key, kind). NUM reads
+/// to_num (default 0), BOOL reads truthy (default false), STR reads
+/// to_str (default ""), VAL passes through (default null).
+const EVENT_EXTRAS: &[(&str, &str, u8)] = &[
+    ("CustomEvent", "detail", EV_VAL),
+    ("MouseEvent", "screenX", EV_NUM),
+    ("MouseEvent", "screenY", EV_NUM),
+    ("MouseEvent", "clientX", EV_NUM),
+    ("MouseEvent", "clientY", EV_NUM),
+    ("MouseEvent", "ctrlKey", EV_BOOL),
+    ("MouseEvent", "altKey", EV_BOOL),
+    ("MouseEvent", "shiftKey", EV_BOOL),
+    ("MouseEvent", "metaKey", EV_BOOL),
+    ("MouseEvent", "button", EV_NUM),
+    ("MouseEvent", "buttons", EV_NUM),
+    ("MouseEvent", "relatedTarget", EV_VAL),
+    ("KeyboardEvent", "key", EV_STR),
+    ("KeyboardEvent", "code", EV_STR),
+    ("KeyboardEvent", "keyCode", EV_NUM),
+    ("KeyboardEvent", "which", EV_NUM),
+    ("KeyboardEvent", "ctrlKey", EV_BOOL),
+    ("KeyboardEvent", "altKey", EV_BOOL),
+    ("KeyboardEvent", "shiftKey", EV_BOOL),
+    ("KeyboardEvent", "metaKey", EV_BOOL),
+    ("KeyboardEvent", "repeat", EV_BOOL),
+    ("KeyboardEvent", "isComposing", EV_BOOL),
+];
+
+/// Proto bag for an event ctor name (unknown names fall back to Event).
+fn event_bag(it: &Interp, kind: &str) -> u32 {
+    match kind {
+        "CustomEvent" => it.protos.custom_event,
+        "MouseEvent" => it.protos.mouse_event,
+        "KeyboardEvent" => it.protos.keyboard_event,
+        _ => it.protos.event,
+    }
+}
+
+/// One init-dict read per value kind (non-object init means all defaults;
+/// absent keys also mean defaults).
+fn init_flag(it: &Interp, init: Value, k: &str) -> bool {
+    if !matches!(init, Value::Obj(_)) {
+        return false;
+    }
+    match get_prop(&it.heap, &it.protos, init, k) {
+        Ok(v) => truthy(&it.heap, v),
+        Err(_) => false,
+    }
+}
+
+fn init_num(it: &Interp, init: Value, k: &str) -> f64 {
+    if !matches!(init, Value::Obj(_)) {
+        return 0.0;
+    }
+    match get_prop(&it.heap, &it.protos, init, k) {
+        Ok(Value::Undef) | Err(_) => 0.0,
+        Ok(v) => to_num(&it.heap, v),
+    }
+}
+
+fn init_str(it: &Interp, init: Value, k: &str) -> String {
+    if !matches!(init, Value::Obj(_)) {
+        return String::new();
+    }
+    match get_prop(&it.heap, &it.protos, init, k) {
+        Ok(Value::Undef) | Err(_) => String::new(),
+        Ok(v) => to_str(&it.heap, v),
+    }
+}
+
+fn init_val(it: &Interp, init: Value, k: &str) -> Value {
+    if !matches!(init, Value::Obj(_)) {
+        return Value::Null;
+    }
+    match get_prop(&it.heap, &it.protos, init, k) {
+        Ok(Value::Undef) | Err(_) => Value::Null,
+        Ok(v) => v,
+    }
+}
+
+/// Shared body for constructed and createEvent-blank events: base props
+/// plus the ctor's table extras. Ordinary object, so dispatch fills the
+/// dispatch-time props via normalize_event untouched.
+fn event_fill(
+    it: &mut Interp,
+    target: Value,
+    kind: &str,
+    ty: &str,
+    init: Value,
+) -> Result<(), JsError> {
+    let bubbles = init_flag(it, init, "bubbles");
+    let cancelable = init_flag(it, init, "cancelable");
+    let composed = init_flag(it, init, "composed");
+    let stamp = it.perf_elapsed();
+    let ty = Value::Str(it.heap.alloc_str(ty.to_string())?);
+    set_prop(&mut it.heap, target, "type", ty)?;
+    set_prop(&mut it.heap, target, "bubbles", Value::Bool(bubbles))?;
+    set_prop(&mut it.heap, target, "cancelable", Value::Bool(cancelable))?;
+    set_prop(&mut it.heap, target, "composed", Value::Bool(composed))?;
+    set_prop(&mut it.heap, target, "timeStamp", Value::Num(stamp))?;
+    for (k, key, ek) in EVENT_EXTRAS {
+        if *k != kind {
+            continue;
+        }
+        let v = match ek {
+            &EV_NUM => Value::Num(init_num(it, init, key)),
+            &EV_BOOL => Value::Bool(init_flag(it, init, key)),
+            &EV_STR => Value::Str(it.heap.alloc_str(init_str(it, init, key))?),
+            _ => init_val(it, init, key),
+        };
+        set_prop(&mut it.heap, target, key, v)?;
+    }
+    Ok(())
+}
+
+/// `new Event/CustomEvent/MouseEvent/KeyboardEvent(type, init?)`: one
+/// native dispatching on its own name. `this` from `new` already carries
+/// the ctor's prototype; bare calls allocate under it.
+pub(crate) fn n_event_ctor(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let kind = match it.cur_native {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Native { name, .. } => *name,
+            _ => "?",
+        },
+        _ => "?",
+    };
+    let t = args.first().copied().unwrap_or(Value::Undef);
+    if matches!(t, Value::Undef) {
+        return Err(err("Event needs a type"));
+    }
+    let ty = to_str(&it.heap, t);
+    let init = args.get(1).copied().unwrap_or(Value::Undef);
+    let target = match this {
+        Value::Obj(_) => this,
+        _ => {
+            let proto = po(event_bag(it, kind));
+            Value::Obj(it.heap.alloc_obj(Obj::Ordinary {
+                pairs: Vec::new(),
+                proto,
+            })?)
+        }
+    };
+    event_fill(it, target, kind, &ty, init)?;
+    Ok(target)
+}
+
+/// Blank event for document.createEvent, with an initEvent native that
+/// mutates type/bubbles/cancelable in place.
+fn blank_event(it: &mut Interp, kind: &str) -> Result<Value, JsError> {
+    let proto = po(event_bag(it, kind));
+    let target = Value::Obj(it.heap.alloc_obj(Obj::Ordinary {
+        pairs: Vec::new(),
+        proto,
+    })?);
+    event_fill(it, target, kind, "", Value::Undef)?;
+    let m = Value::Obj(it.heap.alloc_obj(nat("initEvent", n_event_init))?);
+    set_prop(&mut it.heap, target, "initEvent", m)?;
+    Ok(target)
+}
+
+fn n_event_init(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    if !matches!(this, Value::Obj(_)) {
+        return Err(err("initEvent needs an event"));
+    }
+    let t = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    let b = truthy(&it.heap, args.get(1).copied().unwrap_or(Value::Undef));
+    let c = truthy(&it.heap, args.get(2).copied().unwrap_or(Value::Undef));
+    let t = Value::Str(it.heap.alloc_str(t)?);
+    set_prop(&mut it.heap, this, "type", t)?;
+    set_prop(&mut it.heap, this, "bubbles", Value::Bool(b))?;
+    set_prop(&mut it.heap, this, "cancelable", Value::Bool(c))?;
+    Ok(Value::Undef)
 }
 
 /// Prototype-bag DOM methods (so `document.createElement` also resolves
@@ -3602,6 +3795,72 @@ mod tests {
         assert!(it.pending_nav.is_none());
         assert!(errmsg(&mut it, "l.dispatchEvent({})").contains("type"));
         assert!(errmsg(&mut it, "l.dispatchEvent(5)").contains("event object"));
+    }
+
+    #[test]
+    fn constructible_events() {
+        let mut it = interp(r#"<body><div id=a></div></body>"#);
+        // each type: type + one default + one init-provided value
+        assert_eq!(ev(&mut it, "var e0=new Event('x');e0.type"), "x");
+        assert_eq!(ev(&mut it, "e0.bubbles"), "false");
+        assert_eq!(
+            ev(&mut it, "var e1=new Event('y',{bubbles:true});e1.bubbles"),
+            "true"
+        );
+        assert_eq!(
+            ev(&mut it, "var c0=new CustomEvent('k',{detail:7});c0.detail"),
+            "7"
+        );
+        assert_eq!(ev(&mut it, "new CustomEvent('k').detail"), "null");
+        assert_eq!(
+            ev(&mut it, "var m0=new MouseEvent('c',{clientX:5});m0.clientX"),
+            "5"
+        );
+        assert_eq!(ev(&mut it, "m0.screenX"), "0");
+        assert_eq!(
+            ev(&mut it, "var k0=new KeyboardEvent('d',{key:'Enter'});k0.key"),
+            "Enter"
+        );
+        assert_eq!(ev(&mut it, "k0.keyCode"), "0");
+        // missing type throws
+        assert!(errmsg(&mut it, "new Event()").contains("type"));
+        assert!(errmsg(&mut it, "new CustomEvent(undefined)").contains("type"));
+        // instanceof both directions
+        assert_eq!(ev(&mut it, "m0 instanceof Event"), "true");
+        assert_eq!(ev(&mut it, "k0 instanceof Event"), "true");
+        assert_eq!(ev(&mut it, "c0 instanceof Event"), "true");
+        assert_eq!(ev(&mut it, "e0 instanceof MouseEvent"), "false");
+        assert_eq!(ev(&mut it, "m0 instanceof MouseEvent"), "true");
+        // createEvent + initEvent roundtrip
+        assert_eq!(
+            ev(
+                &mut it,
+                "var r=document.createEvent('Event');r.initEvent('go',true,false);r.type"
+            ),
+            "go"
+        );
+        assert_eq!(ev(&mut it, "r.bubbles"), "true");
+        assert_eq!(ev(&mut it, "r.cancelable"), "false");
+        assert_eq!(
+            ev(
+                &mut it,
+                "var rm=document.createEvent('MouseEvents');rm.initEvent('mc',false,true);rm.type"
+            ),
+            "mc"
+        );
+        assert_eq!(ev(&mut it, "rm.clientX"), "0");
+        // dispatchEvent with a constructed CustomEvent keeps detail
+        assert_eq!(
+            ev(
+                &mut it,
+                "var got=0;var a=document.getElementById('a');\
+                 a.addEventListener('k',function(e){got=e.detail});\
+                 a.dispatchEvent(new CustomEvent('k',{detail:7}));got"
+            ),
+            "7"
+        );
+        // unknown createEvent name throws
+        assert!(errmsg(&mut it, "document.createEvent('Nope')").contains("unknown"));
     }
 
     #[test]

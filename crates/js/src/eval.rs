@@ -1681,8 +1681,12 @@ impl Interp {
             ("endsWith", n_str_ends_with),
             ("charAt", n_str_char_at),
             ("charCodeAt", n_str_char_code_at),
+            ("at", n_str_at),
+            ("codePointAt", n_str_code_point_at),
             ("replace", n_str_replace),
+            ("replaceAll", n_str_replace_all),
             ("match", n_str_match),
+            ("matchAll", n_str_match_all),
             ("search", n_str_search),
             ("concat", n_str_concat),
             ("repeat", n_str_repeat),
@@ -7472,6 +7476,49 @@ fn n_str_char_code_at(it: &mut Interp, this: Value, args: &[Value]) -> Result<Va
     }))
 }
 
+/// String.prototype.at: relative indexing over UTF-16 units (Array#at
+/// twin); OOB reads give undefined.
+fn n_str_at(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let u: Vec<u16> = s.encode_utf16().collect();
+    let len = u.len() as i64;
+    let mut i = to_num(&it.heap, arg(args, 0)) as i64;
+    if i < 0 {
+        i += len;
+    }
+    if i < 0 || i >= len {
+        return Ok(Value::Undef);
+    }
+    // Heap strings are valid UTF-8, so a lone unit only arises from
+    // splitting a surrogate pair; decode lossy (lone unit -> FFFD).
+    let t = String::from_utf16_lossy(&u[i as usize..i as usize + 1]);
+    Ok(Value::Str(it.heap.alloc_str(t)?))
+}
+
+/// String.prototype.codePointAt: UTF-16 code point at unit pos, combining
+/// a lead/trail pair; lone units give their own value. NaN/negative/OOB
+/// give undefined (NaN fails the guard, huge values saturate the cast).
+fn n_str_code_point_at(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let p = to_num(&it.heap, arg(args, 0));
+    if p >= 0.0 {
+        let u: Vec<u16> = s.encode_utf16().collect();
+        let i = p as usize;
+        if i < u.len() {
+            let c = u[i];
+            let v = if (0xD800..0xDC00).contains(&c)
+                && matches!(u.get(i + 1), Some(t) if (0xDC00..0xE000).contains(t))
+            {
+                0x10000 + ((c as u32 - 0xD800) << 10) + (u[i + 1] as u32 - 0xDC00)
+            } else {
+                c as u32
+            };
+            return Ok(Value::Num(v as f64));
+        }
+    }
+    Ok(Value::Undef)
+}
+
 /// replace(needle, repl): literal string/number needle, first occurrence,
 /// no $-patterns (no regex in this engine).
 fn n_str_replace(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
@@ -7483,6 +7530,33 @@ fn n_str_replace(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, 
     let repl = to_str(&it.heap, arg(args, 1));
     Ok(Value::Str(
         it.heap.alloc_str(s.replacen(&needle, &repl, 1))?,
+    ))
+}
+
+/// String.prototype.replaceAll: regex search needs the global flag,
+/// string search is literal and must be non-empty. `$`-patterns only
+/// expand on the regex path (via the shared replace_regex helper).
+fn n_str_replace_all(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    if let Value::Obj(id) = arg(args, 0) {
+        if matches!(it.heap.obj(id), Obj::RegExp { .. }) {
+            let global = match it.heap.obj(id) {
+                Obj::RegExp { compiled, .. } => compiled.flags.global,
+                _ => unreachable!(),
+            };
+            if !global {
+                return Err(err("replaceAll called with a non-global RegExp"));
+            }
+            return replace_regex(it, &s, &PatSrc::Obj(id), arg(args, 1));
+        }
+    }
+    let needle = to_str(&it.heap, arg(args, 0));
+    if needle.is_empty() {
+        return Err(err("replaceAll called with an empty string"));
+    }
+    let repl = to_str(&it.heap, arg(args, 1));
+    Ok(Value::Str(
+        it.heap.alloc_str(s.replace(&needle, &repl))?,
     ))
 }
 
@@ -11973,6 +12047,28 @@ fn n_str_match(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Js
     }
 }
 
+/// String.prototype.matchAll: needs a global RegExp (non-regex and
+/// non-global both throw). Returns an array of per-match result arrays
+/// in match()/exec() shape; no match gives an empty array, not null.
+fn n_str_match_all(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let Value::Obj(id) = arg(args, 0) else {
+        return Err(err("matchAll called with a non-RegExp argument"));
+    };
+    let rc = match it.heap.obj(id) {
+        Obj::RegExp { compiled, .. } => compiled.clone(),
+        _ => return Err(err("matchAll called with a non-RegExp argument")),
+    };
+    if !rc.flags.global {
+        return Err(err("matchAll called with a non-global RegExp"));
+    }
+    let mut vals = Vec::new();
+    for m in collect_matches(&rc, &s, 0)? {
+        vals.push(match_to_array(it, &s, &m)?);
+    }
+    Ok(Value::Obj(it.arr_obj(vals)?))
+}
+
 fn n_str_search(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
     let s = this_str(it, this);
     // search() with no arg searches the empty pattern (index 0).
@@ -15915,6 +16011,46 @@ mod tests {
         assert_eq!(disp("'  x '.trim()"), "x");
         assert_eq!(num("'abc'.charCodeAt(0)"), 97.0);
         assert_eq!(disp("'abc'[1]"), "b");
+    }
+
+    #[test]
+    fn string_at_code_point_replace_all_match_all() {
+        assert_eq!(disp("'abc'.at(1)"), "b");
+        assert_eq!(disp("'abc'.at(0)"), "a");
+        assert_eq!(disp("'abc'.at(-1)"), "c");
+        assert_eq!(disp("'abc'.at(3)"), "undefined");
+        assert_eq!(disp("'abc'.at(-4)"), "undefined");
+        assert_eq!(num("'abc'.codePointAt(1)"), 98.0);
+        assert_eq!(
+            num("String.fromCodePoint(0x1F600).codePointAt(0)"),
+            128512.0
+        );
+        assert_eq!(num("String.fromCodePoint(0x1F600).codePointAt(1)"), 56832.0);
+        // Lone surrogates cannot survive the lexer/heap (folded to FFFD),
+        // so codePointAt reports the stored unit's value.
+        assert_eq!(num("'\\uD800'.codePointAt(0)"), 65533.0);
+        assert_eq!(disp("'abc'.codePointAt(5)"), "undefined");
+        assert_eq!(disp("'abc'.codePointAt(-1)"), "undefined");
+        assert_eq!(disp("'abc'.codePointAt(NaN)"), "undefined");
+        assert_eq!(disp("'aaa'.replaceAll('a','b')"), "bbb");
+        assert_eq!(disp("'a-b-c'.replaceAll('-','+')"), "a+b+c");
+        assert_eq!(disp("'aaa'.replaceAll(/a/g,'b')"), "bbb");
+        assert_eq!(disp("'aaa'.replaceAll(/a/g,'$$')"), "$$$");
+        assert_eq!(disp("'aba'.replaceAll(/a/g,'[$&]')"), "[a]b[a]");
+        assert_eq!(disp("'abc'.replaceAll(/b/g,'<$`>')"), "a<a>c");
+        assert_eq!(disp("'abc'.replaceAll(/b/g,\"<$'>\")"), "a<c>c");
+        assert_eq!(disp("'abc'.replaceAll(/(b)/g,'<$1>')"), "a<b>c");
+        assert!(errmsg("'abc'.replaceAll('','x')").contains("empty"));
+        assert!(errmsg("'abc'.replaceAll(/b/,'x')").contains("global"));
+        assert_eq!(disp("var m='a1b2'.matchAll(/(\\d)/g);m.length"), "2");
+        assert_eq!(
+            disp("var m='a1b2'.matchAll(/(\\d)/g);m[0][0]+m[0][1]+m[1][0]+m[1][1]"),
+            "1122"
+        );
+        assert_eq!(disp("var m='a1b2'.matchAll(/\\d/g);m[1][0]"), "2");
+        assert_eq!(disp("'abc'.matchAll(/z/g).length"), "0");
+        assert!(errmsg("'abc'.matchAll(/b/)").contains("global"));
+        assert!(errmsg("'abc'.matchAll('b')").contains("RegExp"));
     }
 
     #[test]

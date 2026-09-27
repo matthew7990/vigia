@@ -207,7 +207,17 @@ const MAX_PROTO_HOPS: u32 = 64;
 /// An object's own (non-inherited) prop. Arr owns "length" + indices.
 fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
     match h.obj(id) {
-        Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
+        Obj::Ordinary { pairs, .. } | Obj::Native { pairs, .. } => {
+            pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+        }
+        // `length` (arity before the first default/rest) lives on the
+        // def, like V8 computes it - not stored. `name` is materialized
+        // as a pair at creation (see func_obj).
+        Obj::Func { pairs, def, .. } => {
+            if key == "length" {
+                let n = def.params.iter().take_while(|(_, d)| d.is_none()).count();
+                return Some(Value::Num(n as f64));
+            }
             pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
         }
         Obj::Arr { items, pairs, .. } => {
@@ -583,15 +593,21 @@ impl Interp {
     }
 
     /// Fresh Func under Function.prototype, with an own "prototype" object
-    /// (fresh Ordinary under Object's proto) like real JS.
+    /// (fresh Ordinary under Object's proto) like real JS. Named funcs
+    /// also carry their `name` (V8 infers more; named declarations and
+    /// methods cover the observed cases).
     pub(crate) fn func_obj(&mut self, def: Rc<FnDef>, env: u32) -> Result<u32, JsError> {
         let pt = self.obj_plain()?;
         let proto = po(self.protos.function_);
+        let mut pairs = vec![("prototype".into(), Value::Obj(pt))];
+        if let Some(n) = &def.name {
+            pairs.push(("name".into(), Value::Str(self.heap.intern_str(n)?)));
+        }
         self.heap.alloc_obj(Obj::Func {
             def,
             env,
             proto,
-            pairs: vec![("prototype".into(), Value::Obj(pt))],
+            pairs,
         })
     }
 
@@ -769,11 +785,15 @@ impl Interp {
             proto: parent_proto,
         })?;
         let fproto = po(self.protos.function_);
+        let mut cpairs = vec![("prototype".into(), Value::Obj(proto_id))];
+        if let Some(n) = &name {
+            cpairs.push(("name".into(), Value::Str(self.heap.intern_str(n)?)));
+        }
         let cid = self.heap.alloc_obj(Obj::Func {
             def: cdef,
             env,
             proto: fproto,
-            pairs: vec![("prototype".into(), Value::Obj(proto_id))],
+            pairs: cpairs,
         })?;
         match self.heap.obj_mut(cid) {
             Obj::Func { pairs, .. } => {
@@ -1095,7 +1115,15 @@ impl Interp {
             pr.array,
             &[("isArray", n_is_array), ("of", n_array_of)],
         );
-        self.ctor("String", n_string_cast, pr.string, &[]);
+        self.ctor(
+            "String",
+            n_string_cast,
+            pr.string,
+            &[
+                ("fromCharCode", n_str_from_char_code),
+                ("fromCodePoint", n_str_from_code_point),
+            ],
+        );
         self.ctor("Number", n_number_cast, pr.number, &[]);
         self.ctor("Boolean", n_boolean_cast, u32::MAX, &[]);
         self.ctor("Date", n_date, pr.date, &[("now", n_date_now)]);
@@ -2624,6 +2652,18 @@ impl Interp {
                     // named fn exprs can self-recurse via their own name
                     self.env_declare(cenv, n, f);
                 }
+                // `arguments`: array-like snapshot of the actual args plus
+                // `callee` (sloppy; no param aliasing in this engine).
+                // Skipped when shadowed by a param or `var` (real scoping).
+                // Arrows still get one (a fresh object, not the outer's).
+                let shadowed = self.envs[cenv as usize].vars.contains_key("arguments");
+                if !shadowed {
+                    let argarr = self.arr_obj(args.to_vec())?;
+                    if let Obj::Arr { pairs, .. } = self.heap.obj_mut(argarr) {
+                        pairs.push(("callee".into(), f));
+                    }
+                    self.env_declare(cenv, "arguments", Value::Obj(argarr));
+                }
                 // Arrows capture `this` lexically from the defining env.
                 let this_val = if def.is_arrow {
                     self.env_get(fenv, "this").unwrap_or(Value::Undef)
@@ -3324,9 +3364,9 @@ fn n_obj_get_descs(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Valu
     let mut out = Vec::new();
     if let Value::Obj(id) = arg(args, 0) {
         let keys: Vec<String> = match it.heap.obj(id) {
-            Obj::Ordinary { pairs, .. }
-            | Obj::Func { pairs, .. }
-            | Obj::Native { pairs, .. } => pairs.iter().map(|(k, _)| k.clone()).collect(),
+            Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
+                pairs.iter().map(|(k, _)| k.clone()).collect()
+            }
             Obj::Arr { items, pairs, .. } => (0..items.len())
                 .map(|i| i.to_string())
                 .chain(pairs.iter().map(|(k, _)| k.clone()))
@@ -3466,6 +3506,31 @@ fn n_string_cast(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value,
         None => String::new(),
     };
     Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+/// String.fromCharCode(...codes): UTF-16 units (lone surrogates pass
+/// through like real strings here).
+fn n_str_from_char_code(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let mut out = String::new();
+    for a in args {
+        let u = to_num(&it.heap, *a) as u16;
+        out.push(char::from_u32(u as u32).unwrap_or('\u{FFFD}'));
+    }
+    Ok(Value::Str(it.heap.alloc_str(out)?))
+}
+
+/// String.fromCodePoint(...cps): real code points (astral included).
+fn n_str_from_code_point(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let mut out = String::new();
+    for a in args {
+        let n = to_num(&it.heap, *a);
+        let cp = n as u32;
+        if n.is_nan() || (cp as f64) != n || char::from_u32(cp).is_none() {
+            return Err(err(format!("invalid code point {}", to_str(&it.heap, *a))));
+        }
+        out.push(char::from_u32(cp).unwrap());
+    }
+    Ok(Value::Str(it.heap.alloc_str(out)?))
 }
 
 fn n_number_cast(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
@@ -6724,9 +6789,11 @@ mod tests {
         assert!(errmsg("null.x").contains("cannot read"));
         assert!(errmsg("undefined.f()").contains("cannot read"));
         assert!(errmsg("1+").contains("byte"));
-        // test threads have ~2MB stacks: cap depth low, check the guard
+        // test threads have ~2MB stacks and debug frames are fat: keep
+        // the depth low, the guard logic is depth-agnostic (see
+        // fatal_errors_bypass_catch).
         let mut it = Interp::new();
-        it.max_call_depth = 100;
+        it.max_call_depth = 40;
         assert!(it
             .run("function f(){f()}f()")
             .unwrap_err()
@@ -6858,6 +6925,26 @@ mod tests {
         assert_eq!(disp("'a'.concat('b','c')"), "abc");
         // via proto on a variable too
         assert_eq!(disp("var s='hi';s.toUpperCase()"), "HI");
+    }
+
+    #[test]
+    fn function_meta() {
+        assert_eq!(disp("function f(a,b){}f.length"), "2");
+        assert_eq!(disp("function f(a,b=1){}f.length"), "1");
+        assert_eq!(disp("function f(){}f.name"), "f");
+        assert_eq!(disp("var o={m(){}};o.m.name"), "m");
+        assert_eq!(disp("function f(){return arguments.length}f(1,2,3)"), "3");
+        assert_eq!(disp("function f(){return arguments[1]}f(1,2,3)"), "2");
+        assert_eq!(disp("function f(){return arguments.callee===f}f()"), "true");
+        assert_eq!(disp("function f(arguments){return arguments}f(9)"), "9");
+    }
+
+    #[test]
+    fn string_statics() {
+        assert_eq!(disp("String.fromCharCode(72,105)"), "Hi");
+        assert_eq!(disp("String.fromCharCode()"), "");
+        assert_eq!(disp("String.fromCodePoint(0x1F600)"), "\u{1F600}");
+        assert!(errmsg("String.fromCodePoint(-1)").contains("invalid code point"));
     }
 
     #[test]
@@ -7433,9 +7520,12 @@ mod tests {
 
     #[test]
     fn fatal_errors_bypass_catch() {
-        // call depth is Fatal: catch never sees it, finally still runs
+        // call depth is Fatal: catch never sees it, finally still runs.
+        // Depth 40, not 100: debug-build native frames are fat (~20KB per
+        // JS level), and test threads only get 2MB - the guard logic is
+        // depth-agnostic, so a shallower trip proves the same thing.
         let mut it = Interp::new();
-        it.max_call_depth = 100;
+        it.max_call_depth = 40;
         let e = it
             .run("var s='';function f(){f()}try{f()}catch(q){s='caught'}finally{s='fin'}")
             .unwrap_err();

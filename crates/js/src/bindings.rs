@@ -10,8 +10,8 @@ use vigia_dom::{Dom, NodeData, NodeId};
 use vigia_session::CookieJar;
 
 use crate::ast::{Expr, Stmt};
-use crate::eval::{get_prop, nat, set_prop, to_str, truthy};
-use crate::{err, po, Interp, JsError, NetCtx, Obj, PendingSubmit, Value};
+use crate::eval::{arg, get_prop, nat, set_prop, to_num, to_str, truthy};
+use crate::{err, po, Interp, JsError, NativeFn, NetCtx, Obj, PendingSubmit, Value};
 
 /// Same list as vigia-html: these never get a close tag when serializing.
 const VOID: &[&str] = &[
@@ -206,6 +206,7 @@ impl Interp {
     pub fn set_dom(&mut self, dom: Dom) {
         self.dom = Some(dom);
         self.dom_objs.clear();
+        self.sheets.clear();
         self.listeners.clear();
         self.pending_nav = None;
         self.pending_submit = None;
@@ -245,6 +246,8 @@ impl Interp {
         };
         self.env_declare(0, "navigator", Value::Obj(nav));
         self.env_declare(0, "location", Value::Obj(loc));
+        // Populate href + derived parts (routers read pathname at boot).
+        let _ = self.set_location_href("");
         // `window` mirrors the global scope (real browsers alias them):
         // seed with document/navigator/location plus every global so far
         // (builtins like atob included). Later script-defined globals
@@ -517,6 +520,34 @@ impl Interp {
         Ok(Value::Obj(o))
     }
 
+    /// CSSStyleSheet facade for a <style>/<link> node (cached for ===).
+    /// Rules are {cssText} stubs - no cascade runs on them here; enough
+    /// for emotion-style insertRule loops (ownerNode match + length).
+    fn sheet_for(&mut self, n: NodeId) -> Result<Value, JsError> {
+        if let Some(&o) = self.sheets.get(&n) {
+            return Ok(Value::Obj(o));
+        }
+        let owner = self.dom_wrap(n)?;
+        let rules = Value::Obj(self.arr_obj(Vec::new())?);
+        let mut pairs = vec![
+            ("ownerNode".into(), owner),
+            ("cssRules".into(), rules),
+        ];
+        for (nm, f) in [
+            ("insertRule", n_sheet_insert as NativeFn),
+            ("deleteRule", n_sheet_delete),
+        ] {
+            pairs.push((nm.into(), Value::Obj(self.heap.alloc_obj(nat(nm, f))?)));
+        }
+        if self.dom_ref()?.tag_name(n) == Some("link") {
+            let href = self.dom_ref()?.attr(n, "href").unwrap_or("").to_string();
+            pairs.push(("href".into(), Value::Str(self.heap.alloc_str(href)?)));
+        }
+        let o = self.obj_pairs(pairs)?;
+        self.sheets.insert(n, o);
+        Ok(Value::Obj(o))
+    }
+
     fn opt_node(&mut self, n: Option<NodeId>) -> Result<Value, JsError> {
         match n {
             Some(n) => self.dom_wrap(n),
@@ -762,11 +793,83 @@ impl Interp {
         )
     }
 
-    /// Reflect a navigation into the JS-visible location.href.
-    fn set_location_href(&mut self, href: &str) -> Result<(), JsError> {
-        if let Some(loc) = self.env_get(0, "location") {
-            let s = self.heap.alloc_str(href.to_string())?;
-            set_prop(&mut self.heap, loc, "href", Value::Str(s))?;
+    /// Reflect a navigation into the JS-visible location object: href
+    /// plus the derived parts routers read (pathname/search/hash/...).
+    /// Unparseable hrefs still set href with sane part defaults.
+    pub(crate) fn set_location_href(&mut self, href: &str) -> Result<(), JsError> {
+        let Some(loc) = self.env_get(0, "location") else {
+            return Ok(());
+        };
+        let url = vigia_url::Url::parse(href).ok();
+        let str_prop = |it: &mut Interp, k: &str, v: String| -> Result<(), JsError> {
+            let id = it.heap.alloc_str(v)?;
+            set_prop(&mut it.heap, loc, k, Value::Str(id))?;
+            Ok(())
+        };
+        str_prop(self, "href", href.to_string())?;
+        match url {
+            Some(u) => {
+                str_prop(self, "protocol", format!("{}:", u.scheme))?;
+                str_prop(
+                    self,
+                    "host",
+                    if u.host.is_empty() {
+                        String::new()
+                    } else {
+                        u.host_header()
+                    },
+                )?;
+                str_prop(self, "hostname", u.host.clone())?;
+                str_prop(
+                    self,
+                    "port",
+                    u.port.map(|p| p.to_string()).unwrap_or_default(),
+                )?;
+                str_prop(self, "pathname", u.path.clone())?;
+                str_prop(
+                    self,
+                    "search",
+                    u.query.as_deref().map(|q| format!("?{q}")).unwrap_or_default(),
+                )?;
+                str_prop(
+                    self,
+                    "hash",
+                    u.fragment.as_deref().map(|f| format!("#{f}")).unwrap_or_default(),
+                )?;
+                str_prop(
+                    self,
+                    "origin",
+                    if u.host.is_empty() {
+                        "null".into()
+                    } else {
+                        format!("{}://{}", u.scheme, u.host_header())
+                    },
+                )?;
+            }
+            None => {
+                // Path-absolute fallback (no base to join against, e.g.
+                // bare test envs): split path/query/hash by hand.
+                let (rest, hash) = match href.split_once('#') {
+                    Some((r, h)) => (r, format!("#{h}")),
+                    None => (href, String::new()),
+                };
+                let (path, search) = match rest.split_once('?') {
+                    Some((p, q)) => (p, format!("?{q}")),
+                    None => (rest, String::new()),
+                };
+                for (k, v) in [
+                    ("protocol", ""),
+                    ("host", ""),
+                    ("hostname", ""),
+                    ("port", ""),
+                    ("pathname", if path.is_empty() { "/" } else { path }),
+                    ("search", search.as_str()),
+                    ("hash", hash.as_str()),
+                    ("origin", "null"),
+                ] {
+                    str_prop(self, k, v.into())?;
+                }
+            }
         }
         Ok(())
     }
@@ -1060,6 +1163,35 @@ impl Interp {
                 }
                 "textContent" => Ok(Value::Null),
                 "implementation" => self.impl_obj(),
+                "styleSheets" => {
+                    // One facade per <style> (+stylesheet <link>), arena
+                    // order; link rules stay empty (no fetching).
+                    let ids: Vec<NodeId> = {
+                        let d = self.dom_ref()?;
+                        (1..d.nodes.len() as NodeId)
+                            .filter(|&i| {
+                                d.tag_name(i).is_some_and(|t| {
+                                    t == "style"
+                                        || (t == "link"
+                                            && d.attr(i, "rel").is_some_and(|r| {
+                                                r.split_whitespace().any(|w| {
+                                                    w.eq_ignore_ascii_case("stylesheet")
+                                                })
+                                            }))
+                                }) && is_desc(d, 0, i)
+                            })
+                            .collect()
+                    };
+                    let mut out = Vec::with_capacity(ids.len());
+                    for n in ids {
+                        out.push(self.sheet_for(n)?);
+                    }
+                    Ok(Value::Obj(self.arr_obj(out)?))
+                }
+                "defaultView" => {
+                    // The window the document belongs to (single page here).
+                    Ok(self.env_get(0, "window").unwrap_or(Value::Undef))
+                }
                 // Snapshot, not live: forms present at access time.
                 "forms" => {
                     let ids: Vec<NodeId> = {
@@ -1137,6 +1269,10 @@ impl Interp {
                 }
                 "checked" => Ok(Value::Bool(self.dom_ref()?.attr(id, "checked").is_some())),
                 "disabled" => Ok(Value::Bool(self.dom_ref()?.attr(id, "disabled").is_some())),
+                "sheet" => match self.dom_ref()?.tag_name(id) {
+                    Some("style") | Some("link") => self.sheet_for(id),
+                    _ => Ok(Value::Null),
+                },
                 _ => Ok(Value::Undef),
             },
         }
@@ -1301,6 +1437,18 @@ impl Interp {
         arg_es: &[Expr],
     ) -> Result<Value, JsError> {
         let args = self.eval_args(env, arg_es)?;
+        self.call_dom_vals(id, name, &args)
+    }
+
+    /// DOM method call with already-evaluated args (shared by the direct
+    /// dispatch and the prototype-bag natives, so `document.createElement`
+    /// also resolves as a value).
+    pub(crate) fn call_dom_vals(
+        &mut self,
+        id: NodeId,
+        name: &str,
+        args: &[Value],
+    ) -> Result<Value, JsError> {
         let arg = |i: usize| args.get(i).copied().unwrap_or(Value::Undef);
         // event methods work on any node, Document (id 0) included
         if let Some(v) = self.event_method(id, name, &args)? {
@@ -1334,10 +1482,56 @@ impl Interp {
                     };
                     self.node_arr(ids)
                 }
+                "getElementsByClassName" => {
+                    let want = to_str(&self.heap, arg(0));
+                    let ids: Vec<NodeId> = {
+                        let d = self.dom_ref()?;
+                        (1..d.nodes.len() as NodeId)
+                            .filter(|&i| {
+                                matches!(d.node(i).data, NodeData::Element(_))
+                                    && is_desc(d, 0, i)
+                                    && d.attr(i, "class").is_some_and(|c| {
+                                        c.split_whitespace().any(|w| w == want)
+                                    })
+                            })
+                            .collect()
+                    };
+                    self.node_arr(ids)
+                }
+                "getElementsByName" => {
+                    let want = to_str(&self.heap, arg(0));
+                    let ids: Vec<NodeId> = {
+                        let d = self.dom_ref()?;
+                        (1..d.nodes.len() as NodeId)
+                            .filter(|&i| {
+                                matches!(d.node(i).data, NodeData::Element(_))
+                                    && is_desc(d, 0, i)
+                                    && d.attr(i, "name") == Some(want.as_str())
+                            })
+                            .collect()
+                    };
+                    self.node_arr(ids)
+                }
                 "createElement" => {
                     let tag = to_str(&self.heap, arg(0)).to_ascii_lowercase();
                     if tag.is_empty() {
                         return Err(err("createElement needs a tag"));
+                    }
+                    let n = {
+                        let d = self.dom_mut()?;
+                        let root = d.root();
+                        let n = d.element(root, &tag, vec![]);
+                        d.detach(n);
+                        n
+                    };
+                    self.dom_wrap(n)
+                }
+                // Namespace ignored (HTML parser lowercases everything;
+                // svg tags still answer SVGElement via dom_wrap).
+                "createElementNS" => {
+                    let tag = to_str(&self.heap, arg(1)).to_ascii_lowercase();
+                    if tag.is_empty() {
+                        return Err(err("createElementNS needs a tag"));
                     }
                     let n = {
                         let d = self.dom_mut()?;
@@ -1491,6 +1685,36 @@ impl Interp {
                 let hits = self.select(id, arg(0))?;
                 self.node_arr(hits)
             }
+            "getElementsByTagName" => {
+                let want = to_str(&self.heap, arg(0)).to_ascii_lowercase();
+                let ids: Vec<NodeId> = {
+                    let d = self.dom_ref()?;
+                    (1..d.nodes.len() as NodeId)
+                        .filter(|&i| {
+                            matches!(d.node(i).data, NodeData::Element(_))
+                                && is_desc(d, id, i)
+                                && (want == "*" || d.tag_name(i) == Some(want.as_str()))
+                        })
+                        .collect()
+                };
+                self.node_arr(ids)
+            }
+            "getElementsByClassName" => {
+                let want = to_str(&self.heap, arg(0));
+                let ids: Vec<NodeId> = {
+                    let d = self.dom_ref()?;
+                    (1..d.nodes.len() as NodeId)
+                        .filter(|&i| {
+                            matches!(d.node(i).data, NodeData::Element(_))
+                                && is_desc(d, id, i)
+                                && d.attr(i, "class").is_some_and(|c| {
+                                    c.split_whitespace().any(|w| w == want)
+                                })
+                        })
+                        .collect()
+                };
+                self.node_arr(ids)
+            }
             _ => match self.dom_proto_call(id, name, &args)? {
                 Some(v) => Ok(v),
                 None => Err(err(format!("{name} is not a function"))),
@@ -1536,6 +1760,58 @@ fn n_event_stop_propagation(
 ) -> Result<Value, JsError> {
     // internal flag the dispatch loop checks between nodes
     set_prop(&mut it.heap, this, "__stopped", Value::Bool(true)).map(|()| Value::Undef)
+}
+
+/// Prototype-bag DOM methods (so `document.createElement` also resolves
+/// as a value, like V8): re-dispatch by the native's own name with the
+/// receiver node. Unknown names still fail at call time.
+pub(crate) fn n_dom_method(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {    let name = match it.cur_native {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Native { name, .. } => *name,
+            _ => "?",
+        },
+        _ => "?",
+    };
+    let Some(n) = it.as_node(this) else {
+        return Err(err("DOM method needs a node receiver"));
+    };
+    it.call_dom_vals(n, name, args)
+}
+
+/// sheet.insertRule(rule, index=0): store a {cssText} stub, return index.
+/// sheet.deleteRule(index): drop it. No parsing, no cascade.
+fn n_sheet_insert(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let css = to_str(&it.heap, arg(args, 0));
+    let rules = match get_prop(&it.heap, &it.protos, this, "cssRules")? {
+        Value::Obj(id) => id,
+        _ => return Err(err("insertRule needs a stylesheet")),
+    };
+    let at = to_num(&it.heap, arg(args, 1));
+    let cs = Value::Str(it.heap.alloc_str(css)?);
+    let rule = Value::Obj(it.obj_pairs(vec![("cssText".into(), cs)])?);
+    if let Obj::Arr { items, .. } = it.heap.obj_mut(rules) {
+        let i = (if at.is_nan() { 0.0 } else { at }.max(0.0) as usize).min(items.len());
+        items.insert(i, rule);
+        return Ok(Value::Num(i as f64));
+    }
+    Err(err("insertRule needs a stylesheet"))
+}
+
+fn n_sheet_delete(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let rules = match get_prop(&it.heap, &it.protos, this, "cssRules")? {
+        Value::Obj(id) => id,
+        _ => return Err(err("deleteRule needs a stylesheet")),
+    };
+    let at = to_num(&it.heap, arg(args, 0));
+    if let Obj::Arr { items, .. } = it.heap.obj_mut(rules) {
+        if at >= 0.0 && at.fract() == 0.0 {
+            let i = at as usize;
+            if i < items.len() {
+                items.remove(i);
+            }
+        }
+    }
+    Ok(Value::Undef)
 }
 
 /// Bare addEventListener/removeEventListener/dispatchEvent resolve to
@@ -1650,6 +1926,7 @@ mod tests {
         assert_eq!(ev(&mut it, "window.Uint8Array === Uint8Array"), "true");
         assert_eq!(ev(&mut it, "window.window === window"), "true");
         assert_eq!(ev(&mut it, "globalThis.atob('aGk=')"), "hi");
+        assert_eq!(ev(&mut it, "window.matchMedia('x').matches"), "false");
         // Writes through window land as real globals (and vice versa).
         assert_eq!(ev(&mut it, "window.FullCalendarVDom={x:1};FullCalendarVDom.x"), "1");
         assert_eq!(ev(&mut it, "var wv=41;window.wv"), "41");
@@ -1838,6 +2115,32 @@ mod tests {
     }
 
     #[test]
+    fn style_sheets() {
+        let mut it = interp("<html><head><style id=s>.a{color:red}</style></head><body></body></html>");
+        assert_eq!(ev(&mut it, "document.styleSheets.length"), "1");
+        assert_eq!(
+            ev(&mut it, "document.styleSheets[0].ownerNode === document.getElementById('s')"),
+            "true"
+        );
+        assert_eq!(
+            ev(
+                &mut it,
+                "var sh=document.getElementById('s').sheet;sh.insertRule('.b{}',0);sh.cssRules.length"
+            ),
+            "1"
+        );
+        assert_eq!(
+            ev(
+                &mut it,
+                "var sh=document.getElementById('s').sheet;sh.insertRule('.b{}',0);sh.cssRules[0].cssText"
+            ),
+            ".b{}"
+        );
+        assert_eq!(ev(&mut it, "document.getElementById('s').sheet === document.getElementById('s').sheet"), "true");
+        assert_eq!(ev(&mut it, "document.createElement('div').sheet"), "null");
+    }
+
+    #[test]
     fn implementation_doc() {
         // jQuery support shape: detached doc with working body.
         let mut it = interp(PAGE);
@@ -1859,6 +2162,10 @@ mod tests {
         // The fake doc stays out of page queries.
         assert_eq!(ev(&mut it, "document.getElementsByTagName('body').length"), "1");
         assert_eq!(ev(&mut it, "document.head.tagName"), "HEAD");
+        assert_eq!(
+            ev(&mut it, "document.createElementNS('http://www.w3.org/2000/svg','circle').tagName"),
+            "CIRCLE"
+        );
         assert_eq!(ev(&mut it, "document.getElementById('a').ownerDocument === document"), "true");
         assert_eq!(ev(&mut it, "document.ownerDocument"), "null");
         assert_eq!(
@@ -1866,6 +2173,37 @@ mod tests {
             "true"
         );
         assert_eq!(ev(&mut it, "navigator.appVersion.indexOf('MSIE')"), "-1");
+        assert_eq!(ev(&mut it, "document.defaultView === window"), "true");
+        assert_eq!(ev(&mut it, "location.pathname"), "/");
+        assert_eq!(ev(&mut it, "window.location.pathname"), "/");
+        assert_eq!(ev(&mut it, "history.pushState(null,'','/app?q=1#h');location.pathname"), "/app");
+        assert_eq!(ev(&mut it, "location.search"), "?q=1");
+        assert_eq!(ev(&mut it, "location.hash"), "#h");
+        assert_eq!(ev(&mut it, "location.href.slice(-10)"), "/app?q=1#h");
+    }
+
+    #[test]
+    fn get_elements_by() {
+        let mut it = interp("<body><div id=a class='x y'><p class='x'>t</p></div><input name=n1></body>");
+        assert_eq!(ev(&mut it, "document.getElementsByClassName('x').length"), "2");
+        assert_eq!(ev(&mut it, "document.getElementById('a').getElementsByClassName('x').length"), "1");
+        assert_eq!(ev(&mut it, "document.getElementsByTagName('p').length"), "1");
+        assert_eq!(ev(&mut it, "document.getElementsByName('n1').length"), "1");
+        assert_eq!(ev(&mut it, "typeof document.body.getElementsByTagName"), "function");
+    }
+
+    #[test]
+    fn dom_methods_as_values() {
+        // canUseDOM shape: resolves as a value, not just at call time.
+        let mut it = interp(PAGE);
+        assert_eq!(ev(&mut it, "typeof document.createElement"), "function");
+        assert_eq!(ev(&mut it, "typeof document.body.appendChild"), "function");
+        assert_eq!(ev(&mut it, "typeof document.body.hasOwnProperty"), "function");
+        assert_eq!(
+            ev(&mut it, "var f=document.createElement;var d=f.call(document,'div');d.tagName"),
+            "DIV"
+        );
+        assert_eq!(ev(&mut it, "document.body.constructor === HTMLElement"), "true");
     }
 
     #[test]

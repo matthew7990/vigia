@@ -12,7 +12,8 @@ use crate::ast::{
 };
 use crate::{
     bindings::{
-        WIN_EVENTS, n_win_add_event_listener, n_win_dispatch_event, n_win_remove_event_listener,
+        WIN_EVENTS, n_dom_method, n_win_add_event_listener, n_win_dispatch_event,
+        n_win_remove_event_listener,
     },
     err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
     Protos, ThenHandler, Timer, TypedKind, Value,
@@ -1332,6 +1333,7 @@ impl Interp {
             ("lastIndexOf", n_str_last_index_of),
             ("slice", n_str_slice),
             ("substring", n_str_substring),
+            ("substr", n_str_substr),
             ("trim", n_str_trim),
             ("trimStart", n_str_trim_start),
             ("trimEnd", n_str_trim_end),
@@ -1411,6 +1413,18 @@ impl Interp {
         ]);
         self.protos.textencoder = self.proto_bag(&[("encode", n_te_encode)]);
         self.protos.textdecoder = self.proto_bag(&[("decode", n_td_decode)]);
+        self.protos.resizeobserver = self.proto_bag(&[
+            ("observe", n_resize_observe),
+            ("unobserve", n_resize_observe),
+            ("disconnect", n_resize_observe),
+        ]);
+        self.protos.storage = self.proto_bag(&[
+            ("getItem", n_storage_get),
+            ("setItem", n_storage_set),
+            ("removeItem", n_storage_remove),
+            ("clear", n_storage_clear),
+            ("key", n_storage_key),
+        ]);
         // DOM hierarchy: Node <- Element <- HTMLElement (+ per-tag
         // interfaces), Node <- DocumentFragment <- ShadowRoot, Node <-
         // Document. Bags chained manually (proto_bag parents to Object);
@@ -1502,6 +1516,62 @@ impl Interp {
             }
             if let Some(c) = self.env_get(0, name) {
                 let _ = set_prop(&mut self.heap, Value::Obj(bag), "constructor", c);
+            }
+        }
+        // DOM methods as bag values (resolved reads like V8; calls still
+        // hit the direct dispatch first). Inherited down the bag chain,
+        // so each name registers once at its lowest level.
+        for (bag_name, methods) in [
+            (
+                "Node",
+                &[
+                    "appendChild",
+                    "insertBefore",
+                    "removeChild",
+                    "remove",
+                    "cloneNode",
+                    "addEventListener",
+                    "removeEventListener",
+                    "dispatchEvent",
+                ][..],
+            ),
+            (
+                "Element",
+                &[
+                    "getAttribute",
+                    "hasAttribute",
+                    "setAttribute",
+                    "removeAttribute",
+                    "querySelector",
+                    "querySelectorAll",
+                    "getElementsByTagName",
+                    "getElementsByClassName",
+                ][..],
+            ),
+            (
+                "Document",
+                &[
+                    "getElementById",
+                    "getElementsByTagName",
+                    "getElementsByClassName",
+                    "getElementsByName",
+                    "createElement",
+                    "createElementNS",
+                    "createTextNode",
+                    "createComment",
+                    "createDocumentFragment",
+                    "querySelector",
+                    "querySelectorAll",
+                ][..],
+            ),
+            ("HTMLFormElement", &["submit"][..]),
+        ] {
+            let bag = get_bag(self, bag_name);
+            if bag == u32::MAX {
+                continue;
+            }
+            for m in methods {
+                self.put(bag, m, n_dom_method);
             }
         }
         // Map/Set/WeakMap prototypes; `size` is an accessor (no data slot).
@@ -1708,6 +1778,7 @@ impl Interp {
         self.ctor("DataView", n_dv_ctor, pr.dataview, &[]);
         self.ctor("TextEncoder", n_te_ctor, pr.textencoder, &[]);
         self.ctor("TextDecoder", n_td_ctor, pr.textdecoder, &[]);
+        self.ctor("ResizeObserver", n_resize_observer_ctor, pr.resizeobserver, &[]);
         self.ctor("Function", n_function_ctor, pr.function_, &[]);
         // Numeric statics the bundle reads (BYTES_PER_ELEMENT per view).
         for (name, bpe) in [
@@ -1774,6 +1845,7 @@ impl Interp {
             ("addEventListener", n_win_add_event_listener),
             ("removeEventListener", n_win_remove_event_listener),
             ("dispatchEvent", n_win_dispatch_event),
+            ("matchMedia", n_match_media),
         ] {
             if let Ok(id) = self.heap.alloc_obj(nat(n, f)) {
                 self.env_declare(0, n, Value::Obj(id));
@@ -1858,6 +1930,37 @@ impl Interp {
         }
         if let Ok(f) = self.heap.alloc_obj(nat("fetch", n_fetch)) {
             self.env_declare(0, "fetch", Value::Obj(f));
+        }
+        // Web Storage: memory-backed locals (no persistence, no events).
+        if let Ok(ls) = storage_obj(self) {
+            self.env_declare(0, "localStorage", Value::Obj(ls));
+        }
+        if let Ok(ss) = storage_obj(self) {
+            self.env_declare(0, "sessionStorage", Value::Obj(ss));
+        }
+        // window.history for SPA routers (no traversal).
+        {
+            let mut hp: Vec<(String, Value)> = Vec::new();
+            for (n, f) in [
+                ("pushState", n_history_push as NativeFn),
+                ("replaceState", n_history_push),
+                ("back", n_history_noop),
+                ("forward", n_history_noop),
+                ("go", n_history_noop),
+                ("listen", n_history_listen),
+                ("createHref", n_history_href),
+                ("block", n_history_listen),
+            ] {
+                match self.heap.alloc_obj(nat(n, f)) {
+                    Ok(id) => hp.push((n.into(), Value::Obj(id))),
+                    Err(_) => break,
+                }
+            }
+            hp.push(("length".into(), Value::Num(1.0)));
+            hp.push(("state".into(), Value::Null));
+            if let Ok(h) = self.obj_pairs(hp) {
+                self.env_declare(0, "history", Value::Obj(h));
+            }
         }
         // Numeric globals (writable in sloppy reality; plain slots here).
         self.env_declare(0, "NaN", Value::Num(f64::NAN));
@@ -2416,11 +2519,20 @@ impl Interp {
 
     /// Fresh env for a catch block, holding the param binding when one
     /// exists: thrown values bind verbatim; an internal Msg materializes
-    /// as an Error object so `e.message`/`e instanceof Error` work.
+    /// as an Error object so `e.message`/`e instanceof Error` work. The
+    /// materialized object gets a `stack` from the in-flight chain.
     fn catch_env(&mut self, env: u32, param: Option<&str>, e: JsError) -> Result<u32, JsError> {
         let v = match e {
             JsError::Throw(v) => v,
-            JsError::Msg(m) => self.error_obj(&m)?,
+            JsError::Msg(m) => {
+                let o = self.error_obj(&m)?;
+                let chain = self.throw_chain.clone().unwrap_or_default();
+                let text = Self::stack_string("Error", &m, &chain);
+                if let Ok(sid) = self.heap.alloc_str(text) {
+                    let _ = set_prop(&mut self.heap, o, "stack", Value::Str(sid));
+                }
+                o
+            }
             JsError::Fatal(_) => unreachable!("fatal errors aren't catchable"),
         };
         let cenv = self.new_env(env)?;
@@ -3174,14 +3286,43 @@ impl Interp {
     }
 
     fn assign(&mut self, env: u32, op: &str, l: &Expr, r: &Expr) -> Result<Value, JsError> {
+        // V8 order: the LHS reference (base/key side effects) evaluates
+        // before the RHS; for compound ops the current value reads next.
+        enum Tgt {
+            Ident(String),
+            Mem(Value, String),
+            Idx(Value, Value),
+        }
+        let tgt = match l {
+            Expr::Ident(n) => Tgt::Ident(n.clone()),
+            Expr::Member(o, k) => Tgt::Mem(self.expr(env, o)?, k.clone()),
+            Expr::Index(o, ix) => {
+                let t = self.expr(env, o)?;
+                let k = self.expr(env, ix)?;
+                Tgt::Idx(t, k)
+            }
+            _ => return Err(err("bad assignment target")),
+        };
         let rv = self.expr(env, r)?;
         let v = if op == "=" {
             rv
         } else {
-            let cur = self.get_ref(env, l)?;
+            let cur = match &tgt {
+                Tgt::Ident(n) => self.env_get(env, n).ok_or_else(|| self.undefined_err(n))?,
+                Tgt::Mem(t, k) => self.recv_get(*t, k)?,
+                Tgt::Idx(t, k) => self.recv_get_idx(*t, *k)?,
+            };
             self.apply_bin(op.trim_end_matches('='), cur, rv)?
         };
-        self.set_ref(env, l, v)?;
+        match tgt {
+            Tgt::Ident(n) => {
+                if !self.env_set(env, &n, v) {
+                    self.env_declare(0, &n, v); // sloppy mode: implicit global
+                }
+            }
+            Tgt::Mem(t, k) => self.recv_set(t, &k, v)?,
+            Tgt::Idx(t, k) => self.recv_set_idx(t, k, v)?,
+        }
         Ok(v)
     }
 
@@ -3562,6 +3703,16 @@ impl Interp {
             }
         }
         eprintln!("js? stack: {}", sigs.join(" > "));
+        // Innermost body: shows the failing statement + its guard.
+        if let Some(&fid) = self.js_stack.last() {
+            if let Obj::Func { def, .. } = self.heap.obj(fid) {
+                let bdbg = format!("{:?}", def.body);
+                eprintln!(
+                    "js? body {:.6000}",
+                    bdbg.chars().take(6000).collect::<String>()
+                );
+            }
+        }
         let mut e = Some(env);
         for _ in 0..3 {
             let Some(id) = e else { break };
@@ -3887,8 +4038,17 @@ impl Interp {
                     self.env_declare(cenv, r, Value::Obj(arr));
                 }
                 if let Some(n) = &def.name {
-                    // named fn exprs can self-recurse via their own name
-                    self.env_declare(cenv, n, f);
+                    // Named functions self-recurse via their own name -
+                    // unless a param (or rest) shadows it, which wins
+                    // (V8 scoping; e.g. minified `function t(t,n)`).
+                    let shadowed = def.rest.as_deref() == Some(n.as_str())
+                        || def.params.iter().any(|(p, _)| match p {
+                            Pat::Ident(pn) => pn == n,
+                            _ => false,
+                        });
+                    if !shadowed {
+                        self.env_declare(cenv, n, f);
+                    }
                 }
                 // `arguments`: array-like snapshot of the actual args plus
                 // `callee` (sloppy; no param aliasing in this engine).
@@ -3960,12 +4120,16 @@ impl Interp {
                 }
                 // Snapshot the chain while the innermost frame is still on
                 // it (first/innermost Err wins; outer frames see None set).
-                // Popped with the rest below - no `?` between.
+                // Popped with the rest below - no `?` between. Thrown
+                // Error objects also gain their `stack` here.
                 if r.is_err() && self.throw_chain.is_none() {
                     let c = self.js_chain();
                     if !c.is_empty() {
                         self.throw_chain = Some(c);
                     }
+                }
+                if let Err(JsError::Throw(v)) = &r {
+                    self.ensure_stack(*v);
                 }
                 self.js_stack.pop();
                 self.fn_async = prev_async;
@@ -3985,6 +4149,9 @@ impl Interp {
                     if !c.is_empty() {
                         self.throw_chain = Some(c);
                     }
+                }
+                if let Err(JsError::Throw(v)) = &r {
+                    self.ensure_stack(*v);
                 }
                 self.js_stack.pop();
                 self.cur_native = prev;
@@ -4031,15 +4198,32 @@ impl Interp {
     pub(crate) fn error_obj(&mut self, msg: &str) -> Result<Value, JsError> {
         let proto = po(self.protos.error);
         let m = Value::Str(self.heap.alloc_str(msg.to_string())?);
-        Ok(Value::Obj(self.heap.alloc_obj(Obj::Ordinary {
+        let o = Value::Obj(self.heap.alloc_obj(Obj::Ordinary {
             pairs: vec![("message".into(), m)],
             proto,
-        })?))
+        })?);
+        let s = Value::Str(self.heap.alloc_str(Self::stack_string("Error", msg, ""))?);
+        set_prop(&mut self.heap, o, "stack", s)?;
+        Ok(o)
     }
 
     /// Text of a thrown value for an error report: objects with a
     /// `message` prop (Error-shaped) render "Name: message".
     fn thrown_text(&self, v: Value) -> String {
+        match self.error_parts(v) {
+            Some((name, ms)) => {
+                if ms.is_empty() {
+                    name
+                } else {
+                    format!("{name}: {ms}")
+                }
+            }
+            None => to_str(&self.heap, v),
+        }
+    }
+
+    /// (name, message) of an Error-shaped object, if it has a message.
+    fn error_parts(&self, v: Value) -> Option<(String, String)> {
         if let Value::Obj(_) = v {
             if let Ok(m) = get_prop(&self.heap, &self.protos, v, "message") {
                 if !matches!(m, Value::Undef) {
@@ -4049,16 +4233,60 @@ impl Interp {
                     if name.is_empty() {
                         name = "Error".into();
                     }
-                    let ms = to_str(&self.heap, m);
-                    return if ms.is_empty() {
-                        name
-                    } else {
-                        format!("{name}: {ms}")
-                    };
+                    return Some((name, to_str(&self.heap, m)));
                 }
             }
         }
-        to_str(&self.heap, v)
+        None
+    }
+
+    /// V8-shaped stack text ("Name: msg" + `at` frames, innermost first
+    /// like V8). Empty chain gives the bare head line.
+    fn stack_string(name: &str, msg: &str, chain: &str) -> String {
+        let head = if msg.is_empty() {
+            name.to_string()
+        } else {
+            format!("{name}: {msg}")
+        };
+        if chain.is_empty() {
+            return head;
+        }
+        let mut s = head;
+        let frames: Vec<&str> = chain.split(" > ").collect();
+        for f in frames.into_iter().rev() {
+            s.push_str("\n    at ");
+            s.push_str(f);
+        }
+        s
+    }
+
+    /// Ensure a thrown Error-shaped object carries a framed `stack`.
+    /// Objects constructed by Error()/error_obj carry a frameless
+    /// default (so `.stack.split` never crashes); the first unwind
+    /// upgrades exactly-that-default with frames. Anything else custom
+    /// is never touched.
+    fn ensure_stack(&mut self, v: Value) {
+        let Value::Obj(id) = v else {
+            return;
+        };
+        let Some((nm, ms)) = self.error_parts(v) else {
+            return;
+        };
+        let chain = self.js_chain();
+        if chain.is_empty() {
+            return;
+        }
+        let current = match own_prop(&self.heap, id, "stack") {
+            Some(Value::Str(sid)) => self.heap.get_str(sid).to_string(),
+            _ => String::new(),
+        };
+        if !current.is_empty() && current != Self::stack_string(&nm, &ms, "") {
+            return;
+        }
+        let text = Self::stack_string(&nm, &ms, &chain);
+        if let Ok(sid) = self.heap.alloc_str(text) {
+            let _ = set_prop(&mut self.heap, v, "stack", Value::Str(sid));
+        }
     }
 
     /// Boundary render: a thrown value becomes its text (the heap id
@@ -4357,7 +4585,7 @@ pub(crate) fn nat(name: &'static str, f: NativeFn) -> Obj {
     }
 }
 
-fn arg(args: &[Value], i: usize) -> Value {
+pub(crate) fn arg(args: &[Value], i: usize) -> Value {
     args.get(i).copied().unwrap_or(Value::Undef)
 }
 
@@ -5554,8 +5782,32 @@ fn n_str_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Js
     Ok(Value::Str(it.heap.alloc_str(char_slice(&chars, a, b))?))
 }
 
-fn n_str_substring(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+/// Legacy substr(start, length): negative start counts from the end.
+fn n_str_substr(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
     let s = this_str(it, this);
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len() as i64;
+    let mut a = to_num(&it.heap, arg(args, 0)).trunc() as i64;
+    if a < 0 {
+        a = (len + a).max(0);
+    }
+    let b = match args.get(1) {
+        Some(v) => {
+            let n = to_num(&it.heap, *v).trunc() as i64;
+            if n <= 0 {
+                return Ok(Value::Str(it.heap.alloc_str(String::new())?));
+            }
+            (a + n).min(len)
+        }
+        None => len,
+    };
+    let a = a.clamp(0, len);
+    Ok(Value::Str(it.heap.alloc_str(
+        chars[a as usize..b as usize].iter().collect(),
+    )?))
+}
+
+fn n_str_substring(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {    let s = this_str(it, this);
     let chars: Vec<char> = s.chars().collect();
     let len = chars.len() as i64;
     let mut a = (to_num(&it.heap, arg(args, 0)) as i64).clamp(0, len);
@@ -8125,7 +8377,8 @@ fn replace_regex(it: &mut Interp, s: &str, src: &PatSrc, repl: Value) -> Result<
 // -- Error ---------------------------------------------------------------------------
 
 /// Error(msg): called or `new`ed alike - an Ordinary under Error.proto-
-/// type with an own `message` prop. No `stack` (v1 documents the gap).
+/// type with own `message` + frameless `stack` (upgraded with frames on
+/// first unwind; custom stacks are never touched).
 fn n_error(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
     let msg = match args.first() {
         Some(v) if !matches!(v, Value::Undef) => to_str(&it.heap, *v),
@@ -8134,8 +8387,14 @@ fn n_error(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsErro
     if let Value::Obj(id) = this {
         // `new Error(m)` hands us the fresh object with the right proto
         if matches!(it.heap.obj(id), Obj::Ordinary { .. }) {
-            let m = Value::Str(it.heap.alloc_str(msg)?);
+            let m = Value::Str(it.heap.alloc_str(msg.clone())?);
             set_prop(&mut it.heap, this, "message", m)?;
+            let name = match get_prop(&it.heap, &it.protos, this, "name") {
+                Ok(Value::Undef) | Err(_) => "Error".to_string(),
+                Ok(v) => to_str(&it.heap, v),
+            };
+            let s = Value::Str(it.heap.alloc_str(Interp::stack_string(&name, &msg, ""))?);
+            set_prop(&mut it.heap, this, "stack", s)?;
             return Ok(this);
         }
     }
@@ -8299,6 +8558,202 @@ fn b64_val(c: u8) -> Option<u8> {
 /// ("Illegal constructor") - only instanceof/prototype use them here.
 fn n_dom_illegal(_it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
     Err(err("Illegal constructor"))
+}
+
+/// Web Storage (local/session): Ordinary with string pairs plus a
+/// maintained `length` pair. Deviations: `length` enumerates (V8 hides
+/// it), and a literal key named "length" collides with the counter.
+/// Memory-only (no profile persistence yet); no `storage` events.
+fn storage_recount(it: &mut Interp, obj: Value) {
+    let n = match obj {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Ordinary { pairs, .. } => pairs
+                .iter()
+                .filter(|(k, _)| k != "length")
+                .count() as f64,
+            _ => return,
+        },
+        _ => return,
+    };
+    let _ = set_prop(&mut it.heap, obj, "length", Value::Num(n));
+}
+
+fn n_storage_get(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let key = to_str(&it.heap, arg(args, 0));
+    // Own data pairs only (methods live on the prototype, never leak).
+    let found = match this {
+        Value::Obj(id) => own_prop(&it.heap, id, &key),
+        _ => None,
+    };
+    match found {
+        Some(Value::Str(id)) => Ok(Value::Str(id)),
+        Some(v) => Ok(Value::Str(it.heap.alloc_str(to_str(&it.heap, v))?)),
+        None => Ok(Value::Null),
+    }
+}
+
+fn n_storage_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let key = to_str(&it.heap, arg(args, 0));
+    let val = to_str(&it.heap, arg(args, 1));
+    if !matches!(this, Value::Obj(_)) {
+        return Err(err("Storage.setItem needs a storage receiver"));
+    }
+    let v = Value::Str(it.heap.alloc_str(val)?);
+    set_prop(&mut it.heap, this, &key, v)?;
+    storage_recount(it, this);
+    Ok(Value::Undef)
+}
+
+fn n_storage_remove(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let key = to_str(&it.heap, arg(args, 0));
+    if let Value::Obj(id) = this {
+        if let Obj::Ordinary { pairs, .. } = it.heap.obj_mut(id) {
+            pairs.retain(|(k, _)| k != &key);
+        }
+        storage_recount(it, this);
+    }
+    Ok(Value::Undef)
+}
+
+fn n_storage_clear(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    if let Value::Obj(id) = this {
+        if let Obj::Ordinary { pairs, .. } = it.heap.obj_mut(id) {
+            pairs.clear();
+        }
+        storage_recount(it, this);
+    }
+    Ok(Value::Undef)
+}
+
+fn n_storage_key(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let i = to_num(&it.heap, arg(args, 0));
+    if !(i >= 0.0) || i.fract() != 0.0 {
+        return Ok(Value::Null);
+    }
+    let hit = match this {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Ordinary { pairs, .. } => pairs
+                .iter()
+                .filter(|(k, _)| k != "length")
+                .nth(i as usize)
+                .map(|(k, _)| k.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    match hit {
+        Some(k) => Ok(Value::Str(it.heap.alloc_str(k)?)),
+        None => Ok(Value::Null),
+    }
+}
+
+fn storage_obj(it: &mut Interp) -> Result<u32, JsError> {
+    let proto = po(it.protos.storage);
+    let id = it.heap.alloc_obj(Obj::Ordinary {
+        pairs: vec![("length".into(), Value::Num(0.0))],
+        proto,
+    })?;
+    Ok(id)
+}
+
+/// window.history: length/state plus pushState/replaceState updating
+/// the shared location object; back/forward/go/listen/block are no-ops
+/// (single-snapshot model - no traversal or POP events). Enough for
+/// React Router's createBrowserHistory({window}).
+fn n_history_push(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let url = to_str(&it.heap, arg(args, 2));
+    if !url.is_empty() {
+        // Resolve against the current href like a real pushState, then
+        // refresh the whole location object (pathname/search/...).
+        let href = to_str(
+            &it.heap,
+            match it.env_get(0, "location") {
+                Some(loc) => get_prop(&it.heap, &it.protos, loc, "href").unwrap_or(Value::Undef),
+                None => Value::Undef,
+            },
+        );
+        // Proper URL join through the engine parser first (handles
+        // query/hash replacement); string fallback for odd shapes.
+        let joined = vigia_url::Url::parse(&href)
+            .and_then(|b| b.join(&url))
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| {
+                if url.contains("://") || url.starts_with('/') || href.is_empty() {
+                    url.clone()
+                } else if let Some(i) = href.rfind('/') {
+                    format!("{}{}", &href[..i + 1], url)
+                } else {
+                    url.clone()
+                }
+            });
+        let _ = it.set_location_href(&joined);
+    }
+    if let Some(st) = it.env_get(0, "history") {
+        let _ = set_prop(&mut it.heap, st, "state", arg(args, 0));
+    }
+    Ok(Value::Undef)
+}
+
+fn n_history_noop(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(Value::Undef)
+}
+
+fn n_history_listen(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    // Unlisten function; POP never fires in a snapshot.
+    Ok(Value::Obj(it.heap.alloc_obj(nat("unlisten", n_history_noop))?))
+}
+
+fn n_history_href(_it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(arg(args, 0))
+}
+
+/// ResizeObserver: records observations, never fires (no layout engine
+/// to observe - poppers just never reposition). Enough for sidebar code
+/// that constructs + observes + disconnects at boot.
+fn n_resize_observer_ctor(
+    it: &mut Interp,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let cb = arg(args, 0);
+    if !matches!(cb, Value::Obj(_)) {
+        return Err(err("ResizeObserver needs a callback"));
+    }
+    let proto = po(it.protos.resizeobserver);
+    let id = it.heap.alloc_obj(Obj::Ordinary {
+        pairs: vec![("__cb".into(), cb)],
+        proto,
+    })?;
+    Ok(Value::Obj(id))
+}
+
+fn n_resize_observe(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(Value::Undef)
+}
+
+/// window.matchMedia(query): static result (matches false - no layout
+/// engine, so everything reads as the desktop default), with the
+/// listener surface as no-ops. Bundles use it for responsive branches
+/// and reduced-motion checks.
+fn n_match_media(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let q = to_str(&it.heap, arg(args, 0));
+    let qs = Value::Str(it.heap.alloc_str(q)?);
+    let mut ids = Vec::new();
+    for (n, f) in [
+        ("addListener", n_history_noop as NativeFn),
+        ("removeListener", n_history_noop),
+        ("addEventListener", n_history_noop),
+        ("removeEventListener", n_history_noop),
+        ("dispatchEvent", n_history_noop),
+    ] {
+        ids.push((n.into(), Value::Obj(it.heap.alloc_obj(nat(n, f))?)));
+    }
+    ids.push(("matches".into(), Value::Bool(false)));
+    ids.push(("media".into(), qs));
+    ids.push(("onchange".into(), Value::Null));
+    Ok(Value::Obj(it.obj_pairs(ids)?))
 }
 
 /// `Function(p1, .., pn, body)` / `new Function(...)`: params and body
@@ -9294,6 +9749,33 @@ mod tests {
     }
 
     #[test]
+    fn error_stacks() {
+        // Thrown Errors carry a V8-shaped stack (head + at-frames).
+        assert_eq!(
+            disp("function a(){throw new Error('x')}function b(){a()}try{b()}catch(e){e.stack.split('\\n')[0]}"),
+            "Error: x"
+        );
+        assert_eq!(
+            disp("function a(){throw new Error('x')}function b(){a()}try{b()}catch(e){e.stack.split('\\n')[1].trim()}"),
+            "at a"
+        );
+        // Engine errors materialize with stacks too (React parses them).
+        assert_eq!(
+            disp("function f(){nope()}try{f()}catch(e){e instanceof Error}"),
+            "true"
+        );
+        assert_eq!(
+            disp("function f(){nope()}try{f()}catch(e){typeof e.stack}"),
+            "string"
+        );
+        // Custom stacks survive the unwind untouched.
+        assert_eq!(
+            disp("var e=new Error('x');e.stack='custom';try{throw e}catch(r){r.stack}"),
+            "custom"
+        );
+    }
+
+    #[test]
     fn promise_expandos() {
         // Deferred pattern (i18next): resolve/reject live on the promise.
         assert_eq!(
@@ -9309,6 +9791,35 @@ mod tests {
         assert_eq!(disp("var p=new Promise(function(){});p.x=1;p.x"), "1");
         assert_eq!(disp("var p=new Promise(function(){});p.x=1;Object.keys(p).join()"), "x");
         assert_eq!(disp("var p=new Promise(function(){});p.x=1;delete p.x;('x' in p)"), "false");
+    }
+
+    #[test]
+    fn fn_name_shadowed_by_param() {
+        // A param (or rest) named like the function wins over the
+        // self-name (minified React schedulers do `function t(t,n)`).
+        assert_eq!(disp("function t(t,n){return t}t(null,1)"), "null");
+        assert_eq!(disp("function g(g){return g}g(42)"), "42");
+        assert_eq!(disp("var f=function f(){return typeof f};f()"), "function");
+        assert_eq!(disp("function h(){return typeof h}h()"), "function");
+        // ...and the param (not the function) is what member reads see.
+        assert!(errmsg("function t(t,n){var a=t.deletions}t(null,1)").contains("deletions"));
+    }
+
+    #[test]
+    fn assign_order() {
+        // V8: LHS reference (with side effects) evaluates before RHS.
+        assert_eq!(disp("function h(e){ (e={a:1}).p={c:e}; return e.p.c===e; }h(0)"), "true");
+        assert_eq!(
+            disp("var log='';var o={};o[get('k')]=get('v');log;function get(s){log+=s;return s}"),
+            "kv"
+        );
+        // Compound reads current before RHS runs.
+        assert_eq!(
+            disp("var log='';var o={n:1};o.n+=get('v');log;function get(s){log+=s;return s}"),
+            "v"
+        );
+        assert_eq!(disp("var o={n:1};o.n+=2;o.n"), "3");
+        assert_eq!(disp("var o={};o['k']=5;o.k"), "5");
     }
 
     #[test]
@@ -9582,6 +10093,53 @@ mod tests {
     fn console_levels() {
         assert_eq!(out("console.error('e');console.warn('w');console.info('i');console.debug('d')"), "e\nw\ni\nd\n");
         assert_eq!(out("console.error()"), "\n");
+    }
+
+    #[test]
+    fn history_api() {
+        assert_eq!(disp("history.length"), "1");
+        assert_eq!(disp("history.state"), "null");
+        assert_eq!(disp("history.pushState({a:1},'','/x');history.state.a"), "1");
+        assert_eq!(disp("history.pushState(null,'','/y')"), "undefined");
+        assert_eq!(disp("typeof history.listen(function(){})"), "function");
+        assert_eq!(disp("history.createHref('/z')"), "/z");
+        assert_eq!(disp("history.back()"), "undefined");
+    }
+    #[test]
+    fn web_storage() {
+        assert_eq!(disp("localStorage.setItem('a','1');localStorage.getItem('a')"), "1");
+        assert_eq!(disp("localStorage.getItem('nope')"), "null");
+        assert_eq!(disp("localStorage.setItem('a',1);localStorage.length"), "1");
+        assert_eq!(disp("localStorage.setItem('a',1);localStorage.key(0)"), "a");
+        assert_eq!(disp("localStorage.key(9)"), "null");
+        assert_eq!(disp("localStorage.setItem('a',1);localStorage.removeItem('a');localStorage.length"), "0");
+        assert_eq!(disp("localStorage.setItem('a',1);localStorage.clear();localStorage.length"), "0");
+        assert_eq!(disp("sessionStorage.setItem('c','v');sessionStorage.getItem('c')"), "v");
+        assert_eq!(disp("localStorage.setItem('n',42);localStorage.getItem('n')"), "42");
+    }
+
+    #[test]
+    fn string_substr() {
+        assert_eq!(disp("'hello'.substr(1,3)"), "ell");
+        assert_eq!(disp("'hello'.substr(-2)"), "lo");
+        assert_eq!(disp("'hello'.substr(2)"), "llo");
+        assert_eq!(disp("'hello'.substr()"), "hello");
+        assert_eq!(disp("'hello'.substr(1,0)"), "");
+    }
+
+    #[test]
+    fn resize_observer() {
+        assert_eq!(disp("var r=new ResizeObserver(function(){});r.observe({});typeof r.disconnect"), "function");
+        assert_eq!(disp("var r=new ResizeObserver(function(){});r.unobserve({})"), "undefined");
+        assert!(errmsg("new ResizeObserver(1)").contains("callback"));
+        assert_eq!(disp("typeof ResizeObserver"), "function");
+    }
+
+    #[test]
+    fn match_media() {
+        assert_eq!(disp("matchMedia('(min-width: 100px)').matches"), "false");
+        assert_eq!(disp("matchMedia('(min-width: 100px)').media"), "(min-width: 100px)");
+        assert_eq!(disp("var m=matchMedia('x');m.addListener(function(){});m.matches"), "false");
     }
 
     #[test]
@@ -10628,11 +11186,11 @@ mod tests {
             1.0
         );
         // tight heap: proto/builtin installs hit the cap and skip; plain
-        // own-prop objects still work. The cap tracks the install
-        // footprint - every new builtin moves it, update deliberately.
-        // (300 since the DOM interface batch; the edge is jagged - some
-        // lower values pass alone but not reliably, so keep margin.)
-        let mut it = Interp::with_cap(300);
+        // own-prop objects still work. Self-calibrated above install
+        // (absolute values kept flaking as builtins were added).
+        let mut it = Interp::with_cap(1_000_000);
+        it.run("0").unwrap();
+        it.heap.cap = it.heap.live() + 50;
         assert_eq!(it.run("var o={a:1};o.a").unwrap(), Value::Num(1.0));
     }
 
@@ -11048,8 +11606,9 @@ mod tests {
             disp("var r;try{nope()}catch(e){r=e.message+'|'+(e instanceof Error)}r"),
             "nope is not defined|true"
         );
-        // no `stack` in v1
-        assert_eq!(disp("typeof new Error('x').stack"), "undefined");
+        // `stack` exists from construction (head line; frames attach on
+        // first unwind).
+        assert_eq!(disp("typeof new Error('x').stack"), "string");
     }
 
     #[test]

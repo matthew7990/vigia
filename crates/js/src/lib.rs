@@ -382,6 +382,8 @@ pub struct Protos {
     pub float64array: u32,
     pub textencoder: u32,
     pub textdecoder: u32,
+    pub storage: u32,
+    pub resizeobserver: u32,
     pub dom_node: u32,
     pub dom_element: u32,
     pub dom_htmlelement: u32,
@@ -429,6 +431,8 @@ impl Protos {
             float64array: u32::MAX,
             textencoder: u32::MAX,
             textdecoder: u32::MAX,
+            storage: u32::MAX,
+            resizeobserver: u32::MAX,
             dom_node: u32::MAX,
             dom_element: u32::MAX,
             dom_htmlelement: u32::MAX,
@@ -588,6 +592,9 @@ pub struct Interp {
     pub dom: Option<vigia_dom::Dom>,
     /// node -> wrapper obj cache so `a === b` identity holds per node
     pub(crate) dom_objs: HashMap<NodeId, u32>,
+    /// style/link node -> CSSStyleSheet facade (ownerNode/cssRules/
+    /// insertRule), so `el.sheet === el.sheet`. Cleared by set_dom.
+    pub(crate) sheets: HashMap<NodeId, u32>,
     /// node -> (event type, handler) listeners. JS values, so they live
     /// here rather than on DOM nodes. Cleared by set_dom.
     pub(crate) listeners: HashMap<NodeId, Vec<(String, Value)>>,
@@ -652,8 +659,7 @@ pub struct Interp {
     pub(crate) free_envs: Vec<u32>,
     /// `Symbol.for` registry: key -> symbol obj id (roots, live forever).
     pub(crate) symbol_registry: HashMap<String, u32>,
-    /// Every env currently open on the eval stack (innermost last):
-    /// exec_block pushes its env, `for` pushes its decl env. GC roots -
+    /// Every env currently open on the eval stack (innermost last):    /// exec_block pushes its env, `for` pushes its decl env. GC roots -
     /// together with parent links they cover every live frame.
     pub(crate) env_stack: Vec<u32>,
     /// Values held by in-flight calls (callee, `this`, args). Rust locals
@@ -701,6 +707,7 @@ impl Interp {
             }],
             dom: None,
             dom_objs: HashMap::new(),
+            sheets: HashMap::new(),
             listeners: HashMap::new(),
             net: None,
             pending_nav: None,

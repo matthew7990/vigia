@@ -343,6 +343,8 @@ impl Interp {
             self.protos.float64array,
             self.protos.textencoder,
             self.protos.textdecoder,
+            self.protos.storage,
+            self.protos.resizeobserver,
             self.protos.dom_node,
             self.protos.dom_element,
             self.protos.dom_htmlelement,
@@ -388,6 +390,9 @@ impl Interp {
             }
         }
         for &o in self.dom_objs.values() {
+            m.ow.push(o);
+        }
+        for &o in self.sheets.values() {
             m.ow.push(o);
         }
         for &s in self.heap.intern.values() {
@@ -571,7 +576,10 @@ mod tests {
         // mk()'s fresh return string sits in a Rust local while ch()
         // churns past the GC threshold; GC must NOT run mid-expression
         // (call_depth > 0), else the temp is swept and concat corrupts.
-        let mut it = Interp::with_cap(700);
+        // Self-calibrated above install like its sibling below.
+        let mut it = Interp::with_cap(1_000_000);
+        it.run("0").unwrap();
+        it.heap.cap = it.heap.live() + 400;
         it.run(
             "function mk(){return 'a'+'b'}\
              function ch(){for(var i=0;i<300;i++){var t={n:i}}return 'z'}\

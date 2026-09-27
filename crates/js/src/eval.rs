@@ -2113,7 +2113,32 @@ impl Interp {
                 ("raw", n_str_raw),
             ],
         );
-        self.ctor("Number", n_number_cast, pr.number, &[]);
+        self.ctor(
+            "Number",
+            n_number_cast,
+            pr.number,
+            &[
+                ("isFinite", n_number_is_finite),
+                ("isInteger", n_number_is_integer),
+                ("isNaN", n_number_is_nan),
+                ("isSafeInteger", n_number_is_safe),
+            ],
+        );
+        // Number constants (V8 values; maps reads the SAFE_INTEGER pair).
+        if let Some(nc) = self.env_get(0, "Number") {
+            for (k, v) in [
+                ("EPSILON", f64::EPSILON),
+                ("MAX_SAFE_INTEGER", 9_007_199_254_740_991.0),
+                ("MAX_VALUE", f64::MAX),
+                ("MIN_SAFE_INTEGER", -9_007_199_254_740_991.0),
+                ("MIN_VALUE", f64::MIN_POSITIVE),
+                ("NaN", f64::NAN),
+                ("NEGATIVE_INFINITY", f64::NEG_INFINITY),
+                ("POSITIVE_INFINITY", f64::INFINITY),
+            ] {
+                let _ = set_prop(&mut self.heap, nc, k, Value::Num(v));
+            }
+        }
         self.ctor("Boolean", n_boolean_cast, u32::MAX, &[]);
         self.ctor("Date", n_date, pr.date, &[("now", n_date_now), ("UTC", n_date_utc)]);
         self.ctor(
@@ -6400,6 +6425,24 @@ fn n_str_raw(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsE
 
 fn n_number_cast(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Num(to_num(&it.heap, arg(args, 0))))
+}
+
+/// Number.isFinite/isInteger/isNaN/isSafeInteger: no coercion (unlike
+/// the globals) - non-Numbers are false.
+fn n_number_is_finite(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.is_finite())))
+}
+
+fn n_number_is_integer(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.fract() == 0.0)))
+}
+
+fn n_number_is_nan(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.is_nan())))
+}
+
+fn n_number_is_safe(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Bool(matches!(arg(args, 0), Value::Num(n) if n.fract() == 0.0 && n.abs() <= 9_007_199_254_740_991.0)))
 }
 
 fn n_boolean_cast(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
@@ -15350,6 +15393,24 @@ mod tests {
         // is the window object there, not a fresh instance).
         assert_eq!(disp("function F(){this.s=Symbol('s')}var o=new F();typeof o.s"), "symbol");
         assert!(errmsg("Reflect.construct(Symbol,[])").contains("not a constructor"));
+    }
+
+    #[test]
+    fn numbers() {
+        assert_eq!(num("Number.MAX_SAFE_INTEGER"), 9_007_199_254_740_991.0);
+        assert_eq!(num("Number.MIN_SAFE_INTEGER"), -9_007_199_254_740_991.0);
+        assert_eq!(num("Number.EPSILON"), f64::EPSILON);
+        assert_eq!(disp("Number.MAX_VALUE > 1e308"), "true");
+        assert_eq!(disp("Number.MIN_VALUE > 0"), "true");
+        assert_eq!(disp("Number.NaN !== Number.NaN"), "true");
+        assert_eq!(disp("Number.POSITIVE_INFINITY > 1e308"), "true");
+        assert_eq!(disp("Number.isSafeInteger(3)"), "true");
+        assert_eq!(disp("Number.isSafeInteger(3.5)"), "false");
+        assert_eq!(disp("Number.isSafeInteger('3')"), "false");
+        assert_eq!(disp("Number.isInteger(-0)"), "true");
+        assert_eq!(disp("Number.isFinite(1/0)"), "false");
+        assert_eq!(disp("Number.isNaN(0/0)"), "true");
+        assert_eq!(disp("Number.isNaN('x')"), "false");
     }
 
     #[test]

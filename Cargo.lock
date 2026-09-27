@@ -129,6 +129,7 @@ dependencies = [
  "vigia-serve",
  "vigia-session",
  "vigia-snapshot",
+ "vigia-url",
 ]
 
 [[package]]

@@ -8,7 +8,8 @@ use std::rc::Rc;
 use vigia_json::Json;
 
 use crate::ast::{
-    ClassCtor, ClassMember, Expr, FnDef, MemberKind, ObjEntry, OptOp, Pat, Stmt, VarDecl, VarKind,
+    ClassCtor, ClassMember, Expr, FnDef, MemberKind, ObjEntry, ObjKey, OptOp, Pat, Stmt, VarDecl,
+    VarKind,
 };
 use crate::{
     bindings::{
@@ -3652,14 +3653,19 @@ impl Interp {
             Pat::Obj(fields, rest) => {
                 let mut taken = Vec::with_capacity(fields.len());
                 for f in fields {
-                    let fv = match self.as_node(v) {
-                        Some(n) => {
-                            let key = f.key.clone();
-                            self.dom_get(n, &key)?
+                    // Computed keys evaluate then coerce like index access.
+                    let key = match &f.key {
+                        ObjKey::Lit(s) => s.clone(),
+                        ObjKey::Computed(e) => {
+                            let kv = self.expr(env, e)?;
+                            to_str(&self.heap, kv)
                         }
-                        None => get_prop(&self.heap, &self.protos, v, &f.key)?,
                     };
-                    taken.push(f.key.clone());
+                    let fv = match self.as_node(v) {
+                        Some(n) => self.dom_get(n, &key)?,
+                        None => get_prop(&self.heap, &self.protos, v, &key)?,
+                    };
+                    taken.push(key);
                     let mut item = fv;
                     if matches!(item, Value::Undef) {
                         if let Some(d) = &f.default {
@@ -11986,6 +11992,38 @@ mod tests {
             "3"
         );
         assert_eq!(disp("class C{static ['s']=4}C.s"), "4");
+    }
+
+    #[test]
+    fn computed_object_keys() {
+        assert_eq!(disp("var o={['a'+'b']: 1};o.ab"), "1");
+        assert_eq!(disp("var k='x';var o={[k]: 5};o.x"), "5");
+        assert_eq!(disp("var o={[1+2]: 9};o[3]"), "9");
+        assert_eq!(disp("var k='b';var o={a: 1,[k]: 2,'s': 3};o.a+o.b"), "3");
+        assert_eq!(disp("var o={['X-Goog-Api-Key']: 7};o['X-Goog-Api-Key']"), "7");
+        assert_eq!(disp("var o={[5]: 1};o[5]"), "1");
+        // __proto__ stays an ordinary pair (no proto mutation).
+        assert_eq!(disp("var o={__proto__: 1};o.__proto__"), "1");
+    }
+
+    #[test]
+    fn computed_destructuring() {
+        assert_eq!(disp("var k='ab';var o={ab: 1};var {[k]: v}=o;v"), "1");
+        assert_eq!(disp("var {['z']: v = 42}={};v"), "42");
+        assert_eq!(disp("var k='q';var {['z']: v = 42,[k]: w}={q: 1};v+w"), "43");
+        assert_eq!(disp("var {[5]: v}={5: 8};v"), "8");
+        assert_eq!(disp("var t;({['a'+'b']: t}={ab: 9});t"), "9");
+        assert_eq!(disp("function f({['a'+'b']: v}){return v}f({ab: 4})"), "4");
+        assert_eq!(disp("var {['a']: v,...rest}={a: 1,b: 2};v+rest.b"), "3");
+    }
+
+    #[test]
+    fn computed_object_method() {
+        // Plain [k]() only; async/generator prefixes and computed
+        // accessors in literals stay unsupported.
+        assert_eq!(disp("var k='m';var o={[k](){return 7}};o.m()"), "7");
+        assert_eq!(disp("var k='m';var o={[k](){return this.x},x: 5};o[k]()"), "5");
+        assert_eq!(disp("var o={m(){return 3}};o.m()"), "3");
     }
 
     #[test]

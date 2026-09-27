@@ -100,9 +100,17 @@ pub enum Pat {
     Obj(Vec<ObjField>, Option<String>),
 }
 
+/// Destructuring object key: literal name or computed `[expr]` (coerced
+/// via the same to_str rule as computed object keys and index access).
+#[derive(Debug, Clone)]
+pub enum ObjKey {
+    Lit(String),
+    Computed(Expr),
+}
+
 #[derive(Debug, Clone)]
 pub struct ObjField {
-    pub key: String,
+    pub key: ObjKey,
     pub pat: Pat,
     pub default: Option<Expr>,
 }

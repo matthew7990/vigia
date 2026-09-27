@@ -8,7 +8,8 @@
 use std::rc::Rc;
 
 use crate::ast::{
-    ClassMember, Expr, FnDef, MemberKind, ObjEntry, ObjField, OptOp, Pat, Stmt, VarDecl, VarKind,
+    ClassMember, Expr, FnDef, MemberKind, ObjEntry, ObjField, ObjKey, OptOp, Pat, Stmt, VarDecl,
+    VarKind,
 };
 use crate::eval::fmt_num;
 use crate::lex::{lex, Tok, Token};
@@ -467,9 +468,8 @@ impl P {
         Ok(v)
     }
 
-    /// `[a, , b=1, ...r]` or `{x, y: [z], w=2, ...rest}`. Leaves are plain
-    /// identifiers (plus nested patterns); no computed keys, no member
-    /// targets.
+    /// `[a, , b=1, ...r]` or `{x, y: [z], w=2, [k]: p, ...rest}`. Leaves
+    /// are plain identifiers (plus nested patterns); no member targets.
     fn pattern(&mut self) -> R<Pat> {
         if self.eat_p("[") {
             let mut els: Vec<Option<(Pat, Option<Expr>)>> = Vec::new();
@@ -517,6 +517,33 @@ impl P {
                         self.exp_p("}")?;
                         break;
                     }
+                    // Computed `[expr]: pat[ = default]`; shorthand needs a
+                    // literal key so `[k]` alone stays an error here.
+                    if self.at_p("[") {
+                        self.i += 1;
+                        let k = self.expr()?;
+                        self.exp_p("]")?;
+                        self.exp_p(":")?;
+                        let p = self.pattern_leaf()?;
+                        let d = if self.eat_p("=") {
+                            Some(self.assign()?)
+                        } else {
+                            None
+                        };
+                        fields.push(ObjField {
+                            key: ObjKey::Computed(k),
+                            pat: p,
+                            default: d,
+                        });
+                        if self.eat_p("}") {
+                            break;
+                        }
+                        self.exp_p(",")?;
+                        if self.eat_p("}") {
+                            break; // trailing comma
+                        }
+                        continue;
+                    }
                     let key = match self.bump() {
                         Tok::Ident(s) => s,
                         Tok::Kw(k) => k.to_string(),
@@ -541,7 +568,11 @@ impl P {
                         };
                         (Pat::Ident(key.clone()), d)
                     };
-                    fields.push(ObjField { key, pat, default });
+                    fields.push(ObjField {
+                        key: ObjKey::Lit(key),
+                        pat,
+                        default,
+                    });
                     if self.eat_p("}") {
                         break;
                     }
@@ -1175,7 +1206,7 @@ impl P {
                         ObjEntry::Pair(k, v) => match v {
                             Expr::Ident(n) if n == k => {
                                 fields.push(ObjField {
-                                    key: k,
+                                    key: ObjKey::Lit(k),
                                     pat: Pat::Ident(n),
                                     default: None,
                                 });
@@ -1185,17 +1216,34 @@ impl P {
                                 return Err(err("compound assignment in pattern"));
                             }
                                 fields.push(ObjField {
-                                    key: k,
+                                    key: ObjKey::Lit(k),
                                     pat: Self::expr_to_pat(*l)?,
                                     default: Some(*r),
                                 });
                             }
                             v => fields.push(ObjField {
-                                key: k.clone(),
+                                key: ObjKey::Lit(k.clone()),
                                 pat: Self::expr_to_pat(v)?,
                                 default: None,
                             }),
                         },
+                        ObjEntry::Computed(kex, vex) => {
+                            let (pat, default) = match vex {
+                                Expr::Ident(n) => (Pat::Ident(n), None),
+                                Expr::Assign(op, l, r) => {
+                                    if op != "=" {
+                                        return Err(err("compound assignment in pattern"));
+                                    }
+                                    (Self::expr_to_pat(*l)?, Some(*r))
+                                }
+                                v => (Self::expr_to_pat(v)?, None),
+                            };
+                            fields.push(ObjField {
+                                key: ObjKey::Computed(kex),
+                                pat,
+                                default,
+                            });
+                        }
                         ObjEntry::Spread(e) => match e {
                             Expr::Ident(n) => {
                                 if rest.is_some() {
@@ -1209,7 +1257,7 @@ impl P {
                         },
                         _ => {
                             return Err(err(
-                                "getters and computed keys need identifiers in destructuring assignment",
+                                "getters need identifiers in destructuring assignment",
                             ))
                         }
                     }
@@ -1858,13 +1906,38 @@ impl P {
                             }
                             continue;
                         }
-                        // Computed `[kexpr]: v` key.
+                        // Computed `[kexpr]: v` or plain `[kexpr]()` method.
+                        // async/generator prefixes and computed accessors
+                        // stay unsupported (documented gap).
                         if self.eat_p("[") {
                             let k = self.expr()?;
                             self.exp_p("]")?;
-                            self.exp_p(":")?;
-                            let val = self.assign()?;
-                            v.push(ObjEntry::Computed(k, val));
+                            if self.at_p("(") {
+                                self.exp_p("(")?;
+                                let (params, rest) = self.param_list()?;
+                                self.exp_p(")")?;
+                                self.exp_p("{")?;
+                                self.in_fn += 1;
+                                let save_gen = self.gen_ok;
+                                let body = self.block_body();
+                                self.gen_ok = save_gen;
+                                self.in_fn -= 1;
+                                let def = Rc::new(FnDef {
+                                    name: None,
+                                    params,
+                                    body: body?,
+                                    is_async: false,
+                                    is_gen: false,
+                                    is_arrow: false,
+                                    rest,
+                                    cls: None,
+                                });
+                                v.push(ObjEntry::Computed(k, Expr::Func(def)));
+                            } else {
+                                self.exp_p(":")?;
+                                let val = self.assign()?;
+                                v.push(ObjEntry::Computed(k, val));
+                            }
                             if self.eat_p("}") {
                                 break;
                             }

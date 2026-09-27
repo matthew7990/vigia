@@ -770,6 +770,10 @@ impl Interp {
                 };
                 return self.opt_node(p);
             }
+            "parentNode" => {
+                let p = self.dom_ref()?.parent(id);
+                return self.opt_node(p);
+            }
             "children" | "childNodes" => {
                 let all = key == "childNodes";
                 let ids: Vec<NodeId> = {
@@ -1421,6 +1425,13 @@ mod tests {
             "a"
         );
         assert_eq!(ev(&mut it, "document.body.parentElement.tagName"), "HTML");
+        assert_eq!(
+            ev(&mut it, "document.querySelector('#a p').parentNode.id"),
+            "a"
+        );
+        // parentNode (unlike parentElement) sees non-element parents.
+        assert_eq!(ev(&mut it, "document.documentElement.parentNode.nodeType"), "9");
+        assert_eq!(ev(&mut it, "document.parentNode"), "null");
     }
 
     #[test]

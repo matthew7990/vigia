@@ -22,8 +22,11 @@
 //!   `new` on a Native just calls it (ctors allocate their own result).
 //!   `new` callee is primary + member chain: `new a.b()` is New(Member a.b).
 //! - No regex literals: String.replace takes a string/number needle only.
-//! - No for-in/of, switch, do-while, getters, delete, void, ?., ??,
-//!   =>, spread, classes, labels, __proto__ accessor.
+//! - Supported beyond ES5: ?. ?? => arrow fns, for-of over arrays/strings,
+//!   regex literals + RegExp (test/exec/match/replace/split/search),
+//!   template literals (untagged), ... spread in calls/arrays/objects.
+//! - No for-in, switch, do-while, getters, delete, void,
+//!   spread/rest in other positions, classes, labels, __proto__ accessor.
 //! - Events: addEventListener + inline `on*` attrs, bubble phase only
 //!   (no capture). Dispatch is synchronous.
 //! - Async (synchronous engine, real semantics where the model allows):

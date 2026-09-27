@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use crate::ast::{Expr, FnDef, OptOp, Stmt};
+use crate::ast::{Expr, FnDef, ObjEntry, OptOp, Stmt};
 use crate::eval::fmt_num;
 use crate::lex::{lex, Tok, Token};
 use crate::{err, JsError};
@@ -791,7 +791,11 @@ impl P {
         let mut v = Vec::new();
         if !self.at_p(")") {
             loop {
-                v.push(self.expr()?);
+                if self.eat_p("...") {
+                    v.push(Expr::Spread(Box::new(self.expr()?)));
+                } else {
+                    v.push(self.expr()?);
+                }
                 if !self.eat_p(",") {
                     break;
                 }
@@ -871,7 +875,11 @@ impl P {
                 let mut v = Vec::new();
                 if !self.eat_p("]") {
                     loop {
-                        v.push(self.expr()?);
+                        if self.eat_p("...") {
+                            v.push(Expr::Spread(Box::new(self.expr()?)));
+                        } else {
+                            v.push(self.expr()?);
+                        }
                         if self.eat_p("]") {
                             break;
                         }
@@ -884,9 +892,20 @@ impl P {
                 Ok(Expr::Arr(v))
             }
             Tok::P("{") => {
-                let mut v: Vec<(String, Expr)> = Vec::new();
+                let mut v: Vec<ObjEntry> = Vec::new();
                 if !self.eat_p("}") {
                     loop {
+                        if self.eat_p("...") {
+                            v.push(ObjEntry::Spread(self.expr()?));
+                            if self.eat_p("}") {
+                                break;
+                            }
+                            self.exp_p(",")?;
+                            if self.eat_p("}") {
+                                break; // trailing comma
+                            }
+                            continue;
+                        }
                         let key = match self.bump() {
                             Tok::Ident(s) => s,
                             Tok::Kw(k) => k.to_string(),
@@ -904,7 +923,7 @@ impl P {
                         } else {
                             Expr::Ident(key.clone())
                         };
-                        v.push((key, val));
+                        v.push(ObjEntry::Pair(key, val));
                         if self.eat_p("}") {
                             break;
                         }

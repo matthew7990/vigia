@@ -11,7 +11,9 @@ pub enum Expr {
     Undef,
     Ident(String),
     Arr(Vec<Expr>),
-    ObjLit(Vec<(String, Expr)>),
+    ObjLit(Vec<ObjEntry>),
+    /// `...x` in calls, arrays and object literals (expanded at eval).
+    Spread(Box<Expr>),
     /// op: "!" "~" "+" "-" "typeof" "++" "--" (prefix)
     Unary(&'static str, Box<Expr>),
     /// op: "++" "--" (postfix)
@@ -35,6 +37,13 @@ pub enum Expr {
     OptChain(Box<Expr>, Vec<OptOp>),
     Func(Rc<FnDef>),
     New(Box<Expr>, Vec<Expr>),
+}
+
+/// One object-literal entry: `k: v`, `k` shorthand, or `...x` spread.
+#[derive(Debug)]
+pub enum ObjEntry {
+    Pair(String, Expr),
+    Spread(Expr),
 }
 
 /// One step of an optional chain. The bool marks a `?.` step.

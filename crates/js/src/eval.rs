@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use vigia_json::Json;
 
-use crate::ast::{Expr, FnDef, OptOp, Stmt};
+use crate::ast::{Expr, FnDef, ObjEntry, OptOp, Stmt};
 use crate::{
     err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
     Protos, ThenHandler, Timer, Value,
@@ -998,17 +998,35 @@ impl Interp {
             Expr::Arr(items) => {
                 let mut v = Vec::with_capacity(items.len());
                 for it in items {
-                    v.push(self.expr(env, it)?);
+                    if let Expr::Spread(e) = it {
+                        v.extend(self.spread_items(env, e)?);
+                    } else {
+                        v.push(self.expr(env, it)?);
+                    }
                 }
                 Ok(Value::Obj(self.arr_obj(v)?))
             }
+            Expr::Spread(_) => Err(err("spread outside a call, array or object")),
             Expr::ObjLit(ps) => {
                 let mut pairs: Vec<(String, Value)> = Vec::new();
-                for (k, ex) in ps {
-                    let v = self.expr(env, ex)?;
-                    match pairs.iter_mut().find(|(pk, _)| pk == k) {
-                        Some(slot) => slot.1 = v,
-                        None => pairs.push((k.clone(), v)),
+                let put = |pairs: &mut Vec<(String, Value)>, k: String, v: Value| match pairs
+                    .iter_mut()
+                    .find(|(pk, _)| *pk == k)
+                {
+                    Some(slot) => slot.1 = v,
+                    None => pairs.push((k, v)),
+                };
+                for entry in ps {
+                    match entry {
+                        ObjEntry::Pair(k, ex) => {
+                            let v = self.expr(env, ex)?;
+                            put(&mut pairs, k.clone(), v);
+                        }
+                        ObjEntry::Spread(ex) => {
+                            for (k, v) in self.spread_pairs(env, ex)? {
+                                put(&mut pairs, k, v);
+                            }
+                        }
                     }
                 }
                 Ok(Value::Obj(self.obj_pairs(pairs)?))
@@ -1321,9 +1339,55 @@ impl Interp {
     pub(crate) fn eval_args(&mut self, env: u32, es: &[Expr]) -> Result<Vec<Value>, JsError> {
         let mut v = Vec::with_capacity(es.len());
         for e in es {
-            v.push(self.expr(env, e)?);
+            if let Expr::Spread(inner) = e {
+                v.extend(self.spread_items(env, inner)?);
+            } else {
+                v.push(self.expr(env, e)?);
+            }
         }
         Ok(v)
+    }
+
+    /// `...x` in calls and arrays: x must be an array (strict subset).
+    fn spread_items(&mut self, env: u32, e: &Expr) -> Result<Vec<Value>, JsError> {
+        match self.expr(env, e)? {
+            Value::Obj(id) => match self.heap.obj(id) {
+                Obj::Arr { items, .. } => Ok(items.clone()),
+                _ => Err(err("spread of a non-array")),
+            },
+            _ => Err(err("spread of a non-array")),
+        }
+    }
+
+    /// `{...x}` entries: own string-keyed props; null/undefined/numbers /
+    /// booleans contribute nothing; strings and arrays spread by index.
+    fn spread_pairs(&mut self, env: u32, e: &Expr) -> Result<Vec<(String, Value)>, JsError> {
+        match self.expr(env, e)? {
+            Value::Undef | Value::Null | Value::Num(_) | Value::Bool(_) => Ok(vec![]),
+            Value::Str(id) => {
+                let s = self.heap.get_str(id).to_string();
+                let mut out = Vec::with_capacity(s.len());
+                for (i, c) in s.chars().enumerate() {
+                    out.push((
+                        i.to_string(),
+                        Value::Str(self.heap.alloc_str(c.to_string())?),
+                    ));
+                }
+                Ok(out)
+            }
+            Value::Obj(id) => match self.heap.obj(id) {
+                Obj::Arr { items, .. } => Ok(items
+                    .clone()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, v)| (i.to_string(), v))
+                    .collect()),
+                Obj::Ordinary { pairs, .. }
+                | Obj::Func { pairs, .. }
+                | Obj::Native { pairs, .. } => Ok(pairs.clone()),
+                Obj::RegExp { .. } | Obj::Promise(_) | Obj::Dom(_) | Obj::Freed => Ok(vec![]),
+            },
+        }
     }
 
     fn call(&mut self, env: u32, callee: &Expr, arg_es: &[Expr]) -> Result<Value, JsError> {
@@ -4145,6 +4209,18 @@ mod tests {
 
     fn errmsg(src: &str) -> String {
         ev(src).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn spreads() {
+        assert_eq!(num("function s(a,b,c){return a+b+c}s(...[1,2,3])"), 6.0);
+        assert_eq!(disp("[0, ...[1,2], 3]"), "[0,1,2,3]");
+        assert_eq!(disp("({...( {a: 1}), a: 9}).a"), "9");
+        assert_eq!(disp("({x: 1, ...null}).x"), "1");
+        assert_eq!(disp("({...'hi'})[1]"), "i");
+        assert!(errmsg("var x = [...5]").contains("non-array"));
+        // Rest params are the next unit: still a parse error today.
+        assert!(errmsg("var f = (...a) => a").contains("unexpected"));
     }
 
     #[test]

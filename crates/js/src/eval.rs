@@ -7,7 +7,9 @@ use std::rc::Rc;
 
 use vigia_json::Json;
 
-use crate::ast::{Expr, FnDef, ObjEntry, OptOp, Pat, Stmt, VarDecl};
+use crate::ast::{
+    ClassCtor, ClassMember, Expr, FnDef, MemberKind, ObjEntry, OptOp, Pat, Stmt, VarDecl,
+};
 use crate::{
     err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
     Protos, ThenHandler, Timer, Value,
@@ -15,10 +17,15 @@ use crate::{
 
 pub(crate) enum Flow {
     Normal,
-    Break,
-    Continue,
+    /// break, optionally to a named label (`None` = innermost loop/switch).
+    Break(Option<String>),
+    /// continue, optionally to a label wrapping a loop.
+    Continue(Option<String>),
     Return(Value),
 }
+
+/// Pending class constructor parts: params, rest name, body.
+type CtorParts = (Vec<(String, Option<Expr>)>, Option<String>, Vec<Stmt>);
 
 // ---- coercions ---------------------------------------------------------
 
@@ -533,6 +540,185 @@ impl Interp {
         })
     }
 
+    /// `__super` stashed on a method/accessor func by class eval, or None.
+    fn func_super(&self, id: u32) -> Option<Value> {
+        match self.heap.obj(id) {
+            Obj::Func { pairs, .. } => pairs.iter().find(|(k, _)| k == "__super").map(|(_, v)| *v),
+            _ => None,
+        }
+    }
+
+    /// Evaluate a class value: prototype with methods/accessors, ctor func
+    /// with statics, instance fields collected for `new`. `declare` binds
+    /// the name (declarations only - expressions stay anonymous).
+    fn eval_class(
+        &mut self,
+        env: u32,
+        name: Option<String>,
+        parent: &Option<Box<Expr>>,
+        members: &[ClassMember],
+        declare: bool,
+    ) -> Result<Value, JsError> {
+        let (sup_val, parent_proto) = match parent {
+            None => (None, po(self.protos.object)),
+            Some(p) => {
+                let v = self.expr(env, p)?;
+                match v {
+                    Value::Null => (None, None),
+                    Value::Obj(_) => {
+                        let pp = match get_prop(&self.heap, &self.protos, v, "prototype")? {
+                            Value::Obj(q) => Some(q),
+                            _ => po(self.protos.object),
+                        };
+                        (Some(v), pp)
+                    }
+                    _ => return Err(err("class heritage must be a constructor or null")),
+                }
+            }
+        };
+        let mut proto_pairs: Vec<(String, Value)> = Vec::new();
+        let mut statics: Vec<(String, Value)> = Vec::new();
+        let mut fields: Vec<(String, Option<Expr>)> = Vec::new();
+        let mut static_inits: Vec<(String, Option<Expr>)> = Vec::new();
+        let mut ctor: Option<CtorParts> = None;
+        for m in members {
+            match &m.kind {
+                MemberKind::Ctor { params, rest, body } => {
+                    if ctor.is_some() {
+                        return Err(err("duplicate constructor"));
+                    }
+                    ctor = Some((params.clone(), rest.clone(), body.clone()));
+                }
+                MemberKind::Method(nm, def) => {
+                    let mid = self.func_obj(def.clone(), env)?;
+                    if sup_val.is_some() {
+                        self.stash_super(mid, sup_val)?;
+                    }
+                    if m.statik {
+                        statics.push((nm.clone(), Value::Obj(mid)));
+                    } else {
+                        proto_pairs.push((nm.clone(), Value::Obj(mid)));
+                    }
+                }
+                MemberKind::Get(nm, def) => {
+                    let d = Some(def.clone());
+                    if m.statik {
+                        self.obj_accessor(env, &mut statics, nm, &d, &None)?;
+                    } else {
+                        self.obj_accessor(env, &mut proto_pairs, nm, &d, &None)?;
+                    }
+                }
+                MemberKind::Set(nm, def) => {
+                    let d = Some(def.clone());
+                    if m.statik {
+                        self.obj_accessor(env, &mut statics, nm, &None, &d)?;
+                    } else {
+                        self.obj_accessor(env, &mut proto_pairs, nm, &None, &d)?;
+                    }
+                }
+                MemberKind::Field(nm, init) => {
+                    if m.statik {
+                        static_inits.push((nm.clone(), init.clone()));
+                    } else {
+                        fields.push((nm.clone(), init.clone()));
+                    }
+                }
+            }
+        }
+        // Accessor funcs are built inside obj_accessor: stash the parent
+        // on them too so getters/setters can use `super`.
+        if let Some(s) = sup_val {
+            let mut accs = Vec::new();
+            for (_, v) in proto_pairs.iter().chain(statics.iter()) {
+                if let Value::Obj(aid) = v {
+                    accs.push(*aid);
+                }
+            }
+            for aid in accs {
+                let (g, st) = match self.heap.obj(aid) {
+                    Obj::Accessor { get, set, .. } => (*get, *set),
+                    _ => continue,
+                };
+                for f in [g, st].into_iter().flatten() {
+                    if let Obj::Func { pairs, .. } = self.heap.obj_mut(f) {
+                        pairs.push(("__super".into(), s));
+                    }
+                }
+            }
+        }
+        let (params, rest, body) = match ctor {
+            Some(t) => t,
+            // Derived default: `constructor(...@args) { super(...@args); }`.
+            None if sup_val.is_some() => (
+                vec![],
+                Some("@args".to_string()),
+                vec![Stmt::Expr(Expr::SuperCall(vec![Expr::Spread(Box::new(
+                    Expr::Ident("@args".into()),
+                ))]))],
+            ),
+            None => (vec![], None, vec![]),
+        };
+        let cdef = Rc::new(FnDef {
+            name: name.clone(),
+            params,
+            body,
+            is_async: false,
+            is_arrow: false,
+            rest,
+            cls: Some(ClassCtor { fields }),
+        });
+        let proto_id = self.heap.alloc_obj(Obj::Ordinary {
+            pairs: proto_pairs,
+            proto: parent_proto,
+        })?;
+        let fproto = po(self.protos.function_);
+        let cid = self.heap.alloc_obj(Obj::Func {
+            def: cdef,
+            env,
+            proto: fproto,
+            pairs: vec![("prototype".into(), Value::Obj(proto_id))],
+        })?;
+        match self.heap.obj_mut(cid) {
+            Obj::Func { pairs, .. } => {
+                pairs.extend(statics);
+                if let Some(s) = sup_val {
+                    pairs.push(("__super".into(), s));
+                }
+            }
+            _ => unreachable!(),
+        }
+        match self.heap.obj_mut(proto_id) {
+            Obj::Ordinary { pairs, .. } => pairs.push(("constructor".into(), Value::Obj(cid))),
+            _ => unreachable!(),
+        };
+        // The name is in scope for static initializers (and for methods
+        // at call time - same env object, declared before any call).
+        if declare {
+            if let Some(n) = &name {
+                self.env_declare(env, n, Value::Obj(cid));
+            }
+        }
+        for (nm, init) in &static_inits {
+            let v = match init {
+                Some(e) => self.expr(env, e)?,
+                None => Value::Undef,
+            };
+            set_prop(&mut self.heap, Value::Obj(cid), nm, v)?;
+        }
+        Ok(Value::Obj(cid))
+    }
+
+    /// Push a `__super` pair onto a freshly built method func.
+    fn stash_super(&mut self, mid: u32, sup: Option<Value>) -> Result<(), JsError> {
+        if let Some(s) = sup {
+            match self.heap.obj_mut(mid) {
+                Obj::Func { pairs, .. } => pairs.push(("__super".into(), s)),
+                _ => return Err(err("method is not a function")),
+            }
+        }
+        Ok(())
+    }
+
     /// push a Native method onto a pairs-holding obj (proto bag or ctor).
     /// Heap-cap edge: skips silently when there's no room.
     fn put(&mut self, on: u32, name: &'static str, f: NativeFn) {
@@ -1010,6 +1196,23 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::FnDecl(_) => Ok(Flow::Normal), // hoisted
+            Stmt::ClassDecl(n, c) => {
+                // Never hoisted: earlier use is "not defined".
+                match c {
+                    Expr::Class {
+                        name: _,
+                        parent,
+                        members,
+                    } => {
+                        self.eval_class(env, Some(n.clone()), parent, members, true)?;
+                    }
+                    _ => {
+                        let v = self.expr(env, c)?;
+                        self.env_declare(env, n, v);
+                    }
+                }
+                Ok(Flow::Normal)
+            }
             Stmt::Return(e) => {
                 let v = match e {
                     Some(e) => self.expr(env, e)?,
@@ -1028,6 +1231,9 @@ impl Interp {
                 }
             }
             Stmt::While(c, body) => {
+                // A directly-enclosing `name:` hands its name over; only
+                // its own (or no) label resumes/breaks here.
+                let mine = self.label_direct.take();
                 loop {
                     self.maybe_gc();
                     let c = self.expr(env, c)?;
@@ -1036,19 +1242,22 @@ impl Interp {
                     }
                     self.tick()?;
                     match self.stmt(env, body)? {
-                        Flow::Normal | Flow::Continue => {}
-                        Flow::Break => break,
+                        Flow::Normal => {}
+                        Flow::Continue(t) if t.is_none() || mine.as_deref() == t.as_deref() => {}
+                        Flow::Break(t) if t.is_none() || mine.as_deref() == t.as_deref() => break,
                         f => return Ok(f),
                     }
                 }
                 Ok(Flow::Normal)
             }
             Stmt::DoWhile(body, c) => {
+                let mine = self.label_direct.take();
                 loop {
                     self.maybe_gc();
                     match self.stmt(env, body)? {
-                        Flow::Normal | Flow::Continue => {}
-                        Flow::Break => break,
+                        Flow::Normal => {}
+                        Flow::Continue(t) if t.is_none() || mine.as_deref() == t.as_deref() => {}
+                        Flow::Break(t) if t.is_none() || mine.as_deref() == t.as_deref() => break,
                         f => return Ok(f),
                     }
                     self.tick()?;
@@ -1106,16 +1315,45 @@ impl Interp {
                     for (_, body) in &cases[s..] {
                         match self.exec_block(body, env)? {
                             Flow::Normal => {}
-                            Flow::Break => break,
+                            Flow::Break(None) => break,
                             other => return Ok(other),
                         }
                     }
                 }
                 Ok(Flow::Normal)
             }
+            Stmt::Label(name, body) => {
+                // Hand a directly-wrapped loop its name so `continue
+                // name` resumes it (and not some inner loop); anything
+                // else keeps the previous handoff. Restored after.
+                let wraps_loop = matches!(
+                    **body,
+                    Stmt::For(..)
+                        | Stmt::ForOf { .. }
+                        | Stmt::ForIn { .. }
+                        | Stmt::While(..)
+                        | Stmt::DoWhile(..)
+                );
+                let prev = std::mem::replace(
+                    &mut self.label_direct,
+                    if wraps_loop { Some(name.clone()) } else { None },
+                );
+                let r = self.stmt(env, body);
+                self.label_direct = prev;
+                match r? {
+                    Flow::Normal => Ok(Flow::Normal),
+                    Flow::Break(t) if t.is_none() || t.as_deref() == Some(name.as_str()) => {
+                        Ok(Flow::Normal)
+                    }
+                    Flow::Continue(t) if t.as_deref() == Some(name.as_str()) => {
+                        Err(err(format!("continue target '{name}' is not a loop")))
+                    }
+                    f => Ok(f),
+                }
+            }
             Stmt::Block(ss) => self.exec_scoped(env, ss),
-            Stmt::Break => Ok(Flow::Break),
-            Stmt::Continue => Ok(Flow::Continue),
+            Stmt::Break(t) => Ok(Flow::Break(t.clone())),
+            Stmt::Continue(t) => Ok(Flow::Continue(t.clone())),
             Stmt::Throw(e) => {
                 let v = self.expr(env, e)?;
                 Err(JsError::Throw(v))
@@ -1133,7 +1371,7 @@ impl Interp {
     fn exec_scoped(&mut self, env: u32, ss: &[Stmt]) -> Result<Flow, JsError> {
         if ss
             .iter()
-            .any(|s| matches!(s, Stmt::VarDecl(_) | Stmt::FnDecl(_)))
+            .any(|s| matches!(s, Stmt::VarDecl(_) | Stmt::FnDecl(_) | Stmt::ClassDecl(..)))
         {
             let e2 = self.new_env(env)?;
             self.exec_block(ss, e2)
@@ -1212,6 +1450,7 @@ impl Interp {
         upd: &Option<Expr>,
         body: &Stmt,
     ) -> Result<Flow, JsError> {
+        let mine = self.label_direct.take();
         if let Some(init) = init {
             match self.stmt(fenv, init)? {
                 Flow::Normal => {}
@@ -1228,8 +1467,9 @@ impl Interp {
                 }
             }
             match self.stmt(fenv, body)? {
-                Flow::Normal | Flow::Continue => {}
-                Flow::Break => break,
+                Flow::Normal => {}
+                Flow::Continue(t) if t.is_none() || mine.as_deref() == t.as_deref() => {}
+                Flow::Break(t) if t.is_none() || mine.as_deref() == t.as_deref() => break,
                 f => return Ok(f),
             }
             if let Some(u) = upd {
@@ -1321,6 +1561,7 @@ impl Interp {
         items: &[Value],
         body: &Stmt,
     ) -> Result<Flow, JsError> {
+        let mine = self.label_direct.take();
         for &item in items {
             self.tick()?;
             self.maybe_gc();
@@ -1330,8 +1571,9 @@ impl Interp {
                 self.env_declare(0, name, item);
             }
             match self.stmt(fenv, body)? {
-                Flow::Normal | Flow::Continue => {}
-                Flow::Break => break,
+                Flow::Normal => {}
+                Flow::Continue(t) if t.is_none() || mine.as_deref() == t.as_deref() => {}
+                Flow::Break(t) if t.is_none() || mine.as_deref() == t.as_deref() => break,
                 f => return Ok(f),
             }
         }
@@ -1380,6 +1622,11 @@ impl Interp {
                                 put(&mut pairs, k, v);
                             }
                         }
+                        ObjEntry::Computed(kex, vex) => {
+                            let kv = self.expr(env, kex)?;
+                            let v = self.expr(env, vex)?;
+                            put(&mut pairs, to_str(&self.heap, kv), v);
+                        }
                         ObjEntry::Accessor { key, get, set } => {
                             self.obj_accessor(env, &mut pairs, key, get, set)?;
                         }
@@ -1422,6 +1669,40 @@ impl Interp {
                 self.recv_get_idx(v, k)
             }
             Expr::Func(def) => Ok(Value::Obj(self.func_obj(def.clone(), env)?)),
+            Expr::Class {
+                name,
+                parent,
+                members,
+            } => self.eval_class(env, name.clone(), parent, members, false),
+            Expr::SuperCall(args) => {
+                let sup = self
+                    .super_stack
+                    .last()
+                    .copied()
+                    .ok_or_else(|| err("unexpected super"))?;
+                let this = self.env_get(env, "this").unwrap_or(Value::Undef);
+                let a = self.eval_args(env, args)?;
+                self.call_value(sup, this, &a, Some("super"))
+            }
+            Expr::SuperProp(k) => {
+                let sup = self
+                    .super_stack
+                    .last()
+                    .copied()
+                    .ok_or_else(|| err("unexpected super"))?;
+                let key = match &**k {
+                    Expr::Ident(n) => n.clone(),
+                    _ => {
+                        let kv = self.expr(env, k)?;
+                        to_str(&self.heap, kv)
+                    }
+                };
+                let proto = match get_prop(&self.heap, &self.protos, sup, "prototype")? {
+                    Value::Obj(p) => Some(p),
+                    _ => po(self.protos.object),
+                };
+                walk_props(&self.heap, &self.protos, proto, &key)
+            }
             Expr::New(c, args) => {
                 let f = self.expr(env, c)?;
                 if let Value::Obj(id) = f {
@@ -1465,6 +1746,8 @@ impl Interp {
                 self.expr(env, e)?;
                 Ok(Value::Undef)
             }
+            "delete" => self.delete_op(env, e),
+            "++" | "--" => self.bump(env, e, if op == "++" { 1.0 } else { -1.0 }, false),
             "await" => {
                 if !self.fn_async {
                     return Err(err("await outside async"));
@@ -1490,7 +1773,6 @@ impl Interp {
                     }
                 }
             }
-            "++" | "--" => self.bump(env, e, if op == "++" { 1.0 } else { -1.0 }, false),
             _ => {
                 let v = self.expr(env, e)?;
                 Ok(match op {
@@ -1501,6 +1783,86 @@ impl Interp {
                     _ => return Err(err(format!("bad unary op {op}"))),
                 })
             }
+        }
+    }
+
+    /// `delete ref`: remove an own property, true when gone-or-absent.
+    /// Bindings can't delete (false); array slots blank to Undef keeping
+    /// length (no holes in this engine); DOM nodes drop the attribute.
+    fn delete_op(&mut self, env: u32, e: &Expr) -> Result<Value, JsError> {
+        match e {
+            Expr::Ident(_) => Ok(Value::Bool(false)),
+            Expr::Member(o, k) => {
+                let t = self.expr(env, o)?;
+                self.delete_key(t, k, None)
+            }
+            Expr::Index(o, ix) => {
+                let t = self.expr(env, o)?;
+                let kv = self.expr(env, ix)?;
+                let ks = to_str(&self.heap, kv);
+                self.delete_key(t, &ks, Some(kv))
+            }
+            _ => {
+                self.expr(env, e)?;
+                Ok(Value::Bool(true))
+            }
+        }
+    }
+
+    fn delete_key(&mut self, t: Value, key: &str, kval: Option<Value>) -> Result<Value, JsError> {
+        match t {
+            Value::Obj(id) => match self.heap.obj(id) {
+                Obj::Ordinary { .. } | Obj::Func { .. } | Obj::Native { .. } => {
+                    if let Obj::Ordinary { pairs, .. }
+                    | Obj::Func { pairs, .. }
+                    | Obj::Native { pairs, .. } = self.heap.obj_mut(id)
+                    {
+                        pairs.retain(|(k, _)| k != key);
+                    }
+                    Ok(Value::Bool(true))
+                }
+                Obj::Arr { .. } => {
+                    // Canonical index blanks the slot, length kept.
+                    if let Some(Value::Num(n)) = kval {
+                        if n >= 0.0 && n.fract() == 0.0 {
+                            if let Obj::Arr { items, .. } = self.heap.obj_mut(id) {
+                                if let Some(slot) = items.get_mut(n as usize) {
+                                    *slot = Value::Undef;
+                                }
+                            }
+                        }
+                    } else if key.parse::<usize>().is_ok() {
+                        let n: usize = key.parse().unwrap_or(usize::MAX);
+                        if let Obj::Arr { items, .. } = self.heap.obj_mut(id) {
+                            if let Some(slot) = items.get_mut(n) {
+                                *slot = Value::Undef;
+                            }
+                        }
+                    }
+                    Ok(Value::Bool(true))
+                }
+                Obj::Dom(n) => {
+                    let n = *n;
+                    // Attribute-mapped props drop the attribute; expando
+                    // keys were never stored, so nothing to do.
+                    let attr = match key {
+                        "className" => "class",
+                        k => k,
+                    };
+                    self.dom_remove_attr(n, attr)?;
+                    Ok(Value::Bool(true))
+                }
+                _ => Ok(Value::Bool(true)),
+            },
+            Value::Str(_) | Value::Num(_) | Value::Bool(_) => Ok(Value::Bool(true)),
+            Value::Undef | Value::Null => Err(err(format!(
+                "cannot delete '{key}' of {}",
+                if matches!(t, Value::Null) {
+                    "null"
+                } else {
+                    "undefined"
+                }
+            ))),
         }
     }
 
@@ -1907,8 +2269,39 @@ impl Interp {
                 )
             }
             Expr::Ident(n) => (self.expr(env, callee)?, Value::Undef, Some(n.as_str())),
+            Expr::SuperProp(k) => {
+                let sup = self
+                    .super_stack
+                    .last()
+                    .copied()
+                    .ok_or_else(|| err("unexpected super"))?;
+                let key = match &**k {
+                    Expr::Ident(n) => n.clone(),
+                    _ => {
+                        let kv = self.expr(env, k)?;
+                        to_str(&self.heap, kv)
+                    }
+                };
+                let recv = self.env_get(env, "this").unwrap_or(Value::Undef);
+                let proto = match get_prop(&self.heap, &self.protos, sup, "prototype")? {
+                    Value::Obj(p) => Some(p),
+                    _ => po(self.protos.object),
+                };
+                (
+                    walk_props(&self.heap, &self.protos, proto, &key)?,
+                    recv,
+                    None,
+                )
+            }
             _ => (self.expr(env, callee)?, Value::Undef, None),
         };
+        if let Value::Obj(id) = f {
+            if let Obj::Func { def, .. } = self.heap.obj(id) {
+                if def.cls.is_some() {
+                    return Err(err("class constructor must be invoked with new"));
+                }
+            }
+        }
         let args = self.eval_args(env, arg_es)?;
         self.call_value(f, this, &args, hint)
     }
@@ -1984,6 +2377,13 @@ impl Interp {
                     let this = parent;
                     parent = Value::Undef;
                     method = None;
+                    if let Value::Obj(id) = cur {
+                        if let Obj::Func { def, .. } = self.heap.obj(id) {
+                            if def.cls.is_some() {
+                                return Err(err("class constructor must be invoked with new"));
+                            }
+                        }
+                    }
                     cur = self.call_value(cur, this, &args, None)?;
                 }
             }
@@ -2048,6 +2448,10 @@ impl Interp {
                         return Err(e);
                     }
                 };
+                // Methods of a derived class carry `__super`. It is pushed
+                // next to exec_block (below) so the `?`s above cannot
+                // leak it; every exit below restores it.
+                let sup = self.func_super(id);
                 for (i, (p, d)) in def.params.iter().enumerate() {
                     let v = match args.get(i).copied().unwrap_or(Value::Undef) {
                         Value::Undef if d.is_some() => self.expr(cenv, d.as_ref().unwrap())?,
@@ -2075,11 +2479,45 @@ impl Interp {
                 // is shadowed per call rather than accumulated.
                 let prev_async = self.fn_async;
                 self.fn_async = def.is_async;
-                let r = match self.exec_block(&def.body, cenv) {
+                let pushed_super = sup.is_some();
+                if let Some(s) = sup {
+                    self.super_stack.push(s);
+                }
+                let mut r = match self.exec_block(&def.body, cenv) {
                     Ok(Flow::Return(v)) => Ok(v),
                     Ok(_) => Ok(Value::Undef),
                     Err(e) => Err(e),
                 };
+                // Class instance fields install on `this` when the body
+                // succeeded. Post-body order is a documented deviation
+                // (spec runs them right after super()); crucially this
+                // also runs for parent fields via super(), which goes
+                // through call_value too. super_stack is still pushed.
+                if r.is_ok() {
+                    if let Some(cc) = def.cls.as_ref() {
+                        for (nm, init) in &cc.fields {
+                            let v = match init {
+                                Some(e) => self.expr(cenv, e),
+                                None => Ok(Value::Undef),
+                            };
+                            match v {
+                                Ok(v) => {
+                                    if let Err(e) = set_prop(&mut self.heap, this_val, nm, v) {
+                                        r = Err(e);
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    r = Err(e);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if pushed_super {
+                    self.super_stack.pop();
+                }
                 self.fn_async = prev_async;
                 (def.is_async, r)
             }
@@ -5296,6 +5734,35 @@ mod tests {
     }
 
     #[test]
+    fn delete_operator() {
+        assert_eq!(disp("var o={a:1,b:2};delete o.a"), "true");
+        assert_eq!(disp("var o={a:1};delete o.a;o.a"), "undefined");
+        assert_eq!(disp("var o={a:1};delete o.a;('a' in o)"), "false");
+        assert_eq!(disp("var a=[1,2,3];delete a[0];a.length"), "3");
+        assert_eq!(disp("var a=[1,2,3];delete a[0];a[0]"), "undefined");
+        assert_eq!(disp("var x=1;delete x"), "false");
+        assert_eq!(disp("delete 1"), "true");
+        assert!(errmsg("delete null.x").contains("cannot delete"));
+    }
+
+    #[test]
+    fn labels() {
+        assert_eq!(disp("var t=0;a:{t=1;break a;t=2}t"), "1");
+        assert_eq!(
+            disp("var i=0;outer:for(var j=0;j<5;j++){if(j===2)break outer;i++}i"),
+            "2"
+        );
+        assert_eq!(
+            disp("var s='';row:for(var r=0;r<3;r++){for(var c=0;c<3;c++){if(c===1)continue row;s+=c}}s"),
+            "000"
+        );
+        assert_eq!(disp("var o={};var k='a';o[k]=1;o.a"), "1");
+        assert_eq!(disp("var k='b';var o={[k]:2,[k+'c']:3};o.b+o.bc"), "5");
+        assert!(errmsg("break nope").contains("no such label"));
+        assert!(errmsg("a:{continue a}").contains("not a loop"));
+    }
+
+    #[test]
     fn destructuring() {
         assert_eq!(disp("var [a,b]=['x','y'];a+b"), "xy");
         assert_eq!(disp("var {p,q}={p:1,q:2};p+q"), "3");
@@ -5308,6 +5775,66 @@ mod tests {
         assert_eq!(disp("const [x,y]='a=b'.split('=');x+y"), "ab");
         assert!(errmsg("var [a]=null").contains("non-iterable"));
         assert!(errmsg("var [a]=1").contains("non-iterable"));
+    }
+
+    #[test]
+    fn classes() {
+        assert_eq!(disp("class A{};typeof A"), "function");
+        assert_eq!(
+            disp("class A{constructor(x){this.x=x}get(){return this.x}}new A(5).get()"),
+            "5"
+        );
+        assert_eq!(disp("class A{};new A() instanceof A"), "true");
+        assert_eq!(disp("class A{};new A().constructor===A"), "true");
+        assert_eq!(disp("class A{x=10}new A().x"), "10");
+        assert_eq!(disp("class A{static s=3}A.s"), "3");
+        assert_eq!(disp("class A{static get D(){return 7}}A.D"), "7");
+        assert_eq!(disp("class A{get g(){return 42}}new A().g"), "42");
+        assert_eq!(
+            disp("class A{set s(v){this.n=v}}var a=new A();a.s=9;a.n"),
+            "9"
+        );
+        assert_eq!(
+            disp("class B extends Array{};var b=new B();b instanceof B"),
+            "true"
+        );
+        assert_eq!(
+            disp("class B extends Object{constructor(){super();this.y=2}}new B().y"),
+            "2"
+        );
+        assert_eq!(
+            disp("class E extends Object{};new E() instanceof Object"),
+            "true"
+        );
+        assert_eq!(
+            disp("class N extends null{};new N() instanceof Object"),
+            "false"
+        );
+        assert_eq!(disp("var C=class{who(){return 'n'}};new C().who()"), "n");
+        assert_eq!(
+            disp("var C=class Named{who(){return 'n'}};new C().who()"),
+            "n"
+        );
+        // Parent fields install through super(), own fields shadow proto.
+        assert_eq!(disp("class K{x=10}class E extends K{};new E().x"), "10");
+        assert_eq!(
+            disp("class K{x=10}K.prototype.x=99;class F extends K{y=20}var f=new F();f.x+','+f.y"),
+            "10,20"
+        );
+        // super methods bind the receiver.
+        assert_eq!(
+            disp("class P{greet(){return 'hi '+this.n}}class C extends P{constructor(){super();this.n='bo'}go(){return super.greet()}}new C().go()"),
+            "hi bo"
+        );
+        // Errors.
+        assert!(errmsg("class A{};A()").contains("invoked with new"));
+        assert!(errmsg("class A{};new A()()").contains("not a function"));
+        assert!(errmsg("class A extends 5{}").contains("constructor or null"));
+        assert!(errmsg("class A{constructor(){}constructor(){}}").contains("duplicate"));
+        assert!(errmsg("class A{static constructor(){}}").contains("static constructor"));
+        assert!(errmsg("function f(){super.x}").contains("unexpected super"));
+        assert!(errmsg("super.x").contains("unexpected super"));
+        assert!(errmsg("class A extends B{}").contains("not defined"));
     }
 
     #[test]

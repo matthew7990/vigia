@@ -263,6 +263,9 @@ impl Interp {
         for &v in &self.call_vals {
             m.val(v);
         }
+        for &v in &self.super_stack {
+            m.val(v);
+        }
         for p in [
             self.protos.object,
             self.protos.array,

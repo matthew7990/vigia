@@ -258,17 +258,17 @@ impl Interp {
         self.net = net;
         let mut errs = Vec::new();
         let mut fetched = 0;
-        for s in &scripts {
+        for (n, s) in scripts.iter().enumerate() {
             match s {
                 ScriptSource::Inline(src) => {
                     if let Err(e) = self.run(src) {
-                        errs.push(e);
+                        errs.push(Self::tag_err(format!("inline#{n}"), e));
                     }
                 }
                 ScriptSource::External(raw) => match self.fetch_script(raw, &mut fetched) {
                     Ok(Some(body)) => {
                         if let Err(e) = self.run(&body) {
-                            errs.push(e);
+                            errs.push(Self::tag_err(format!("src {raw}"), e));
                         }
                     }
                     // no net ctx installed: skip silently
@@ -289,6 +289,16 @@ impl Interp {
             jar: self.net.take().map(|c| c.jar),
             pending_nav: self.pending_nav.take(),
             pending_submit: self.pending_submit.take(),
+        }
+    }
+
+    /// Prefix a script-run error with which script failed (Msg/Fatal carry
+    /// text; thrown values pass through untouched).
+    fn tag_err(tag: String, e: JsError) -> JsError {
+        match e {
+            JsError::Msg(m) => JsError::Msg(format!("{tag}: {m}")),
+            JsError::Fatal(m) => JsError::Fatal(format!("{tag}: {m}")),
+            t => t,
         }
     }
 
@@ -323,6 +333,12 @@ impl Interp {
 
     fn dom_mut(&mut self) -> Result<&mut Dom, JsError> {
         self.dom.as_mut().ok_or_else(|| err("no DOM installed"))
+    }
+
+    /// Remove an attribute (delete operator path from eval).
+    pub(crate) fn dom_remove_attr(&mut self, id: NodeId, name: &str) -> Result<(), JsError> {
+        self.dom_mut()?.remove_attr(id, name);
+        Ok(())
     }
 
     /// NodeId if `v` is a DOM node handle.
@@ -1799,7 +1815,7 @@ mod tests {
         let mut it = Interp::new();
         let out = it.run_scripts(d, None);
         assert_eq!(out.errors.len(), 1);
-        assert_eq!(out.errors[0].to_string(), "zip");
+        assert_eq!(out.errors[0].to_string(), "inline#0: zip");
     }
 
     #[test]

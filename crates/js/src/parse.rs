@@ -7,7 +7,9 @@
 
 use std::rc::Rc;
 
-use crate::ast::{Expr, FnDef, ObjEntry, ObjField, OptOp, Pat, Stmt, VarDecl};
+use crate::ast::{
+    ClassMember, Expr, FnDef, MemberKind, ObjEntry, ObjField, OptOp, Pat, Stmt, VarDecl,
+};
 use crate::eval::fmt_num;
 use crate::lex::{lex, Tok, Token};
 use crate::{err, JsError};
@@ -24,6 +26,9 @@ pub fn parse_program(src: &str) -> Result<Vec<Stmt>, JsError> {
         in_fn: 0,
         in_loop: 0,
         in_switch: 0,
+        in_label: 0,
+        labels: Vec::new(),
+        super_ok: false,
     };
     let mut stmts = Vec::new();
     while !p.at_eof() {
@@ -39,6 +44,13 @@ struct P {
     in_fn: u32,
     in_loop: u32,
     in_switch: u32,
+    in_label: u32,
+    /// Enclosing label names with the fn depth where they were declared
+    /// (`break`/`continue` cannot cross a function boundary).
+    labels: Vec<(String, u32)>,
+    /// `super` parses only inside a derived class body (methods and
+    /// field inits inherit it; plain functions reset it, arrows keep it).
+    super_ok: bool,
 }
 
 type R<T> = Result<T, JsError>;
@@ -89,6 +101,12 @@ impl P {
 
     fn at_kw(&self, k: &str) -> bool {
         matches!(self.peek(), Tok::Kw(x) if *x == k)
+    }
+
+    /// Token after the current one is `(`: distinguishes `get()` (a
+    /// method named get) from `get x()` (an accessor).
+    fn next_is_paren(&self) -> bool {
+        matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(Tok::P("(")))
     }
 
     fn at_eof(&self) -> bool {
@@ -289,6 +307,14 @@ impl P {
             }
             Tok::Kw("for") => self.for_stmt(),
             Tok::Kw("switch") => self.switch_stmt(),
+            Tok::Kw("class") => {
+                self.i += 1;
+                let n = self
+                    .ident()
+                    .map_err(|_| err("class declaration needs a name"))?;
+                let c = self.parse_class(Some(n.clone()))?;
+                Ok(Stmt::ClassDecl(n, c))
+            }
             Tok::Kw("throw") => {
                 self.i += 1;
                 // real ASI: a newline between throw and its expr is an error
@@ -305,17 +331,48 @@ impl P {
             Tok::Kw("try") => self.try_stmt(),
             Tok::Kw("break") | Tok::Kw("continue") => {
                 let is_break = matches!(self.peek(), Tok::Kw("break"));
-                // `break` also escapes a switch; `continue` never does.
-                if self.in_loop == 0 && !(is_break && self.in_switch > 0) {
+                self.i += 1;
+                // `break foo` / `continue foo`: label on the same line.
+                let label = match self.peek().clone() {
+                    Tok::Ident(s) if !self.nl() => {
+                        self.i += 1;
+                        Some(s)
+                    }
+                    _ => None,
+                };
+                if let Some(ref l) = label {
+                    if !self.labels.iter().any(|(n, d)| n == l && *d == self.in_fn) {
+                        return Err(err(format!("no such label: {l}")));
+                    }
+                }
+                // Unlabeled `break` also escapes a switch or a labeled
+                // block; unlabeled `continue` needs a real loop.
+                let ok = if label.is_some() {
+                    true
+                } else if is_break {
+                    self.in_loop > 0 || self.in_switch > 0 || self.in_label > 0
+                } else {
+                    self.in_loop > 0
+                };
+                if !ok {
                     return Err(err("break/continue outside loop"));
                 }
-                self.i += 1;
                 self.semi()?;
                 Ok(if is_break {
-                    Stmt::Break
+                    Stmt::Break(label)
                 } else {
-                    Stmt::Continue
+                    Stmt::Continue(label)
                 })
+            }
+            Tok::Ident(n) if matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(Tok::P(":"))) => {
+                // `name: stmt` - a labeled statement, break/continue target.
+                self.i += 2;
+                self.in_label += 1;
+                self.labels.push((n.clone(), self.in_fn));
+                let b = self.stmt();
+                self.labels.pop();
+                self.in_label -= 1;
+                Ok(Stmt::Label(n, Box::new(b?)))
             }
             _ => {
                 let e = self.expr()?;
@@ -504,7 +561,11 @@ impl P {
         self.exp_p(")")?;
         self.exp_p("{")?;
         self.in_fn += 1;
+        // Plain functions never see `super` (arrows inherit the flag).
+        let save_super = self.super_ok;
+        self.super_ok = false;
         let body = self.block_body();
+        self.super_ok = save_super;
         self.in_fn -= 1;
         Ok(Rc::new(FnDef {
             name,
@@ -513,6 +574,7 @@ impl P {
             is_async,
             is_arrow: false,
             rest,
+            cls: None,
         }))
     }
 
@@ -618,6 +680,7 @@ impl P {
                 is_async,
                 is_arrow: true,
                 rest,
+                cls: None,
             }))));
         };
         Ok(Some(Expr::Func(Rc::new(FnDef {
@@ -627,6 +690,7 @@ impl P {
             is_async,
             is_arrow: true,
             rest,
+            cls: None,
         }))))
     }
 
@@ -670,6 +734,273 @@ impl P {
         self.in_switch -= 1;
         Ok(Stmt::Switch { disc, cases })
     }
+
+    /// `class Name extends Sup { ... }`. Members: constructor, methods,
+    /// statics, get/set, fields. No computed keys, no `#private`, no
+    /// static blocks, no decorators.
+    fn parse_class(&mut self, name: Option<String>) -> R<Expr> {
+        let parent = if self.eat_kw("extends") {
+            Some(Box::new(self.class_parent()?))
+        } else {
+            None
+        };
+        self.exp_p("{")?;
+        let mut members = Vec::new();
+        let mut ctor_seen = false;
+        let save_super = self.super_ok;
+        self.super_ok = parent.is_some();
+        macro_rules! bail {
+            ($msg:literal) => {{
+                self.super_ok = save_super;
+                return Err(err($msg));
+            }};
+        }
+        loop {
+            if self.eat_p("}") {
+                break;
+            }
+            if self.at_eof() {
+                bail!("unterminated class");
+            }
+            if matches!(self.peek(), Tok::P(p) if *p == ";") {
+                self.i += 1;
+                continue;
+            }
+            // `static` modifier, or a member literally named `static`.
+            let mut statik = false;
+            if matches!(self.peek(), Tok::Ident(s) if s == "static") {
+                self.i += 1;
+                if self.at_p("{") {
+                    bail!("static blocks unsupported");
+                }
+                if !self.at_p("(") && !self.at_p("=") && !self.at_p(";") && !self.nl() {
+                    statik = true;
+                } else if self.at_p("(") {
+                    // Method named `static`.
+                    let (params, rest) = self.method_params()?;
+                    let body = self.method_body()?;
+                    members.push(ClassMember {
+                        statik: false,
+                        kind: MemberKind::Method(
+                            "static".into(),
+                            Rc::new(FnDef {
+                                name: Some("static".into()),
+                                params,
+                                body,
+                                is_async: false,
+                                is_arrow: false,
+                                rest,
+                                cls: None,
+                            }),
+                        ),
+                    });
+                    continue;
+                } else {
+                    // Field named `static`.
+                    let init = self.field_init()?;
+                    members.push(ClassMember {
+                        statik: false,
+                        kind: MemberKind::Field("static".into(), init),
+                    });
+                    continue;
+                }
+            }
+            // `async m(){}` vs a member named `async` (`async()`,
+            // `async = 1`, `async;`).
+            let mut is_async = false;
+            if matches!(self.peek(), Tok::Kw("async")) {
+                let modifier = !matches!(
+                    self.t.get(self.i + 1).map(|t| &t.t),
+                    Some(Tok::P("(" | "=" | ";" | "}")) | Some(Tok::Eof) | None
+                );
+                if modifier {
+                    self.i += 1;
+                    is_async = true;
+                }
+            }
+            if self.eat_p("*") {
+                bail!("generators unsupported");
+            }
+            // get/set accessors (a `(` right after means a method named
+            // get/set instead).
+            if matches!(self.peek(), Tok::Ident(s) if s == "get" || s == "set")
+                && !self.next_is_paren()
+            {
+                let is_get = matches!(self.peek(), Tok::Ident(s) if s == "get");
+                self.i += 1;
+                let prop = self.acc_name()?;
+                if prop == "constructor" {
+                    bail!("class constructor may not be an accessor");
+                }
+                self.exp_p("(")?;
+                let (params, rest) = self.param_list()?;
+                if rest.is_some() {
+                    bail!("rest in accessor params");
+                }
+                self.exp_p(")")?;
+                if is_async {
+                    bail!("async accessor unsupported");
+                }
+                let body = self.method_body()?;
+                if is_get {
+                    if !params.is_empty() {
+                        bail!("getter takes no params");
+                    }
+                    members.push(ClassMember {
+                        statik,
+                        kind: MemberKind::Get(
+                            prop.clone(),
+                            Rc::new(FnDef {
+                                name: Some(prop),
+                                params,
+                                body,
+                                is_async: false,
+                                is_arrow: false,
+                                rest,
+                                cls: None,
+                            }),
+                        ),
+                    });
+                } else {
+                    if params.len() != 1 || params[0].1.is_some() {
+                        bail!("setter takes one plain param");
+                    }
+                    members.push(ClassMember {
+                        statik,
+                        kind: MemberKind::Set(
+                            prop.clone(),
+                            Rc::new(FnDef {
+                                name: Some(prop),
+                                params,
+                                body,
+                                is_async: false,
+                                is_arrow: false,
+                                rest,
+                                cls: None,
+                            }),
+                        ),
+                    });
+                }
+                // No separator needed after methods/accessors/ctors -
+                // the loop top handles `}` and the next member follows.
+                continue;
+            }
+            let key = self.acc_name()?;
+            if key == "constructor" && !statik && self.at_p("(") {
+                if ctor_seen {
+                    bail!("duplicate constructor");
+                }
+                ctor_seen = true;
+                if is_async {
+                    bail!("async constructor unsupported");
+                }
+                self.exp_p("(")?;
+                let (params, rest) = self.param_list()?;
+                self.exp_p(")")?;
+                let body = self.method_body()?;
+                members.push(ClassMember {
+                    statik: false,
+                    kind: MemberKind::Ctor { params, rest, body },
+                });
+                continue;
+            }
+            if key == "constructor" && statik {
+                bail!("static constructor unsupported");
+            }
+            if self.at_p("(") {
+                self.exp_p("(")?;
+                let (params, rest) = self.param_list()?;
+                self.exp_p(")")?;
+                let body = self.method_body()?;
+                members.push(ClassMember {
+                    statik,
+                    kind: MemberKind::Method(
+                        key.clone(),
+                        Rc::new(FnDef {
+                            name: Some(key),
+                            params,
+                            body,
+                            is_async,
+                            is_arrow: false,
+                            rest,
+                            cls: None,
+                        }),
+                    ),
+                });
+                continue;
+            }
+            // Field: `x = init`, `x;`, `x }` or `x <newline>`.
+            let init = self.field_init()?;
+            members.push(ClassMember {
+                statik,
+                kind: MemberKind::Field(key, init),
+            });
+        }
+        self.super_ok = save_super;
+        Ok(Expr::Class {
+            name,
+            parent,
+            members,
+        })
+    }
+
+    /// `(params)` of a class method named `static` (parens confirmed).
+    fn method_params(&mut self) -> R<Params> {
+        self.exp_p("(")?;
+        let (params, rest) = self.param_list()?;
+        self.exp_p(")")?;
+        Ok((params, rest))
+    }
+
+    /// `{ stmts }` of a class method or constructor.
+    fn method_body(&mut self) -> R<Vec<Stmt>> {
+        self.exp_p("{")?;
+        self.in_fn += 1;
+        let body = self.block_body();
+        self.in_fn -= 1;
+        body
+    }
+
+    /// Initializer of a class field after the name: `= expr`, `;`,
+    /// `}` or a newline ends it.
+    fn field_init(&mut self) -> R<Option<Expr>> {
+        if self.eat_p("=") {
+            let e = self.assign()?;
+            self.member_end()?;
+            Ok(Some(e))
+        } else {
+            self.member_end()?;
+            Ok(None)
+        }
+    }
+
+    /// End of a class field/accessor: `;`, `}`, or a newline before next.
+    fn member_end(&mut self) -> R<()> {
+        if self.eat_p(";") || self.at_p("}") || self.nl() {
+            Ok(())
+        } else {
+            Err(self.unexp("expected ';'"))
+        }
+    }
+
+    /// Heritage expression: member chain with an optional call
+    /// (`extends M(B)` for mixins). No arithmetic.
+    fn class_parent(&mut self) -> R<Expr> {
+        let mut c = self.primary()?;
+        loop {
+            if self.eat_p(".") {
+                c = Expr::Member(Box::new(c), self.prop_name()?);
+            } else if self.eat_p("[") {
+                let k = self.expr()?;
+                self.exp_p("]")?;
+                c = Expr::Index(Box::new(c), Box::new(k));
+            } else {
+                break;
+            }
+        }
+        self.call_tail(c)
+    }
+
     fn try_for_of(&mut self) -> R<Option<Stmt>> {
         let save = self.i;
         let is_decl = matches!(
@@ -802,7 +1133,9 @@ impl P {
         }
         let t = self.assign()?;
         self.exp_p(":")?;
-        let f = self.ternary()?;
+        // False branch is AssignmentExpression (right-assoc nesting and
+        // `a?b:c=d` both need assign, not ternary).
+        let f = self.assign()?;
         Ok(Expr::Ternary(Box::new(c), Box::new(t), Box::new(f)))
     }
 
@@ -879,6 +1212,7 @@ impl P {
             // `await` parses everywhere; eval rejects it outside async fns.
             Tok::Kw("await") => "await",
             Tok::Kw("void") => "void",
+            Tok::Kw("delete") => "delete",
             Tok::Kw("new") => "new",
             _ => "",
         };
@@ -895,7 +1229,7 @@ impl P {
                 }
                 Ok(Expr::Unary(op, Box::new(e)))
             }
-            "typeof" | "await" | "void" => {
+            "typeof" | "await" | "void" | "delete" => {
                 self.i += 1;
                 Ok(Expr::Unary(op, Box::new(self.unary()?)))
             }
@@ -1088,6 +1422,30 @@ impl P {
                 };
                 Ok(Expr::Func(self.fn_tail(name, true)?))
             }
+            Tok::Kw("class") => {
+                let name = if matches!(self.peek(), Tok::Ident(_)) {
+                    Some(self.ident()?)
+                } else {
+                    None
+                };
+                self.parse_class(name)
+            }
+            Tok::Kw("super") => {
+                if !self.super_ok {
+                    return Err(err("unexpected super"));
+                }
+                if self.at_p("(") {
+                    Ok(Expr::SuperCall(self.args()?))
+                } else if self.eat_p(".") {
+                    Ok(Expr::SuperProp(Box::new(Expr::Ident(self.prop_name()?))))
+                } else if self.eat_p("[") {
+                    let k = self.expr()?;
+                    self.exp_p("]")?;
+                    Ok(Expr::SuperProp(Box::new(k)))
+                } else {
+                    Err(err("unexpected super"))
+                }
+            }
             Tok::P("(") => {
                 let e = self.expr()?;
                 self.exp_p(")")?;
@@ -1119,6 +1477,22 @@ impl P {
                     loop {
                         if self.eat_p("...") {
                             v.push(ObjEntry::Spread(self.assign()?));
+                            if self.eat_p("}") {
+                                break;
+                            }
+                            self.exp_p(",")?;
+                            if self.eat_p("}") {
+                                break; // trailing comma
+                            }
+                            continue;
+                        }
+                        // Computed `[kexpr]: v` key.
+                        if self.eat_p("[") {
+                            let k = self.expr()?;
+                            self.exp_p("]")?;
+                            self.exp_p(":")?;
+                            let val = self.assign()?;
+                            v.push(ObjEntry::Computed(k, val));
                             if self.eat_p("}") {
                                 break;
                             }
@@ -1160,6 +1534,7 @@ impl P {
                                 is_async: false,
                                 is_arrow: false,
                                 rest: None,
+                                cls: None,
                             });
                             if key == "get" {
                                 if !def.params.is_empty() {
@@ -1205,6 +1580,7 @@ impl P {
                                 is_async: false,
                                 is_arrow: false,
                                 rest,
+                                cls: None,
                             });
                             v.push(ObjEntry::Pair(key, Expr::Func(def)));
                             if self.eat_p("}") {

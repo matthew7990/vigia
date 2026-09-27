@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Expr {
     Num(f64),
     Str(String),
@@ -32,6 +32,16 @@ pub enum Expr {
     },
     /// Template: (cooked, expr) pairs plus the cooked tail.
     Tpl(Vec<(String, Expr)>, String),
+    /// `class Name extends Sup { ... }` (name None for expressions).
+    Class {
+        name: Option<String>,
+        parent: Option<Box<Expr>>,
+        members: Vec<ClassMember>,
+    },
+    /// `super(args)` in a derived constructor.
+    SuperCall(Vec<Expr>),
+    /// `super.name` / `super[key]`: method lookup on the parent prototype.
+    SuperProp(Box<Expr>),
     /// Optional chain: base + steps. Each step carries its own `?.` flag.
     /// `a?.b.c(d)` is Chain(a, [Member(b,true), Member(c,false), Call(d,false)]).
     OptChain(Box<Expr>, Vec<OptOp>),
@@ -40,11 +50,13 @@ pub enum Expr {
 }
 
 /// One object-literal entry: `k: v`, `k` shorthand, `...x` spread,
-/// `m() {}` method, or `get x()` / `set x(v)` accessor side.
-#[derive(Debug)]
+/// `m() {}` method, `get x()` / `set x(v)` accessor side, or a computed
+/// `[kexpr]: v` key.
+#[derive(Debug, Clone)]
 pub enum ObjEntry {
     Pair(String, Expr),
     Spread(Expr),
+    Computed(Expr, Expr),
     Accessor {
         key: String,
         get: Option<std::rc::Rc<FnDef>>,
@@ -53,7 +65,7 @@ pub enum ObjEntry {
 }
 
 /// One `var` declarator: `name = init` or a pattern (`[a,b] = e`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum VarDecl {
     Plain(String, Option<Expr>),
     Pat(Pat, Expr),
@@ -61,29 +73,57 @@ pub enum VarDecl {
 
 /// Destructuring pattern: identifier leaves (plus nested patterns),
 /// element/field defaults, holes (`[,,]`) and a trailing rest name.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Pat {
     Ident(String),
     Arr(Vec<Option<(Pat, Option<Expr>)>>, Option<String>),
     Obj(Vec<ObjField>, Option<String>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ObjField {
     pub key: String,
     pub pat: Pat,
     pub default: Option<Expr>,
 }
 
+/// A class member after parsing: constructor, method, accessor side,
+/// or field (instance or static).
+#[derive(Debug, Clone)]
+pub struct ClassMember {
+    pub statik: bool,
+    pub kind: MemberKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum MemberKind {
+    Ctor {
+        params: Vec<(String, Option<Expr>)>,
+        rest: Option<String>,
+        body: Vec<Stmt>,
+    },
+    Method(String, Rc<FnDef>),
+    Get(String, Rc<FnDef>),
+    Set(String, Rc<FnDef>),
+    Field(String, Option<Expr>),
+}
+
+/// Constructor closure data: instance field initializers. `derived` is
+/// implicit (presence of `__super` in the ctor's pairs at eval).
+#[derive(Debug, Clone)]
+pub struct ClassCtor {
+    pub fields: Vec<(String, Option<Expr>)>,
+}
+
 /// One step of an optional chain. The bool marks a `?.` step.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum OptOp {
     Member(String, bool),
     Index(Expr, bool),
     Call(Vec<Expr>, bool),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FnDef {
     pub name: Option<String>,
     pub params: Vec<(String, Option<Expr>)>,
@@ -95,9 +135,12 @@ pub struct FnDef {
     pub is_arrow: bool,
     /// Trailing `...args`: collects surplus call args into an array.
     pub rest: Option<String>,
+    /// Some for class constructors: instance field initializers, and the
+    /// marker that direct calls must reject ("invoke with new").
+    pub cls: Option<ClassCtor>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Stmt {
     Expr(Expr),
     /// var/let/const are the same for now; Vec covers `var a=1, b=2`.
@@ -133,10 +176,15 @@ pub enum Stmt {
         cases: Vec<(Option<Expr>, Vec<Stmt>)>,
     },
     Block(Vec<Stmt>),
-    Break,
-    Continue,
+    Break(Option<String>),
+    Continue(Option<String>),
     /// `throw <expr>`
     Throw(Expr),
+    /// `name: stmt` - break/continue target (validated at runtime).
+    Label(String, Box<Stmt>),
+    /// `class Name extends Sup { ... }`: evaluates the class value, then
+    /// binds the name (never hoisted - using it earlier is "not defined").
+    ClassDecl(String, Expr),
     /// try { body } [catch [(param)] { block }] [finally { block }] -
     /// the parser requires at least one of catch/finally.
     Try {

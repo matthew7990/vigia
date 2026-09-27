@@ -66,6 +66,10 @@ const KWS: &[&str] = &[
     "default",
     "do",
     "void",
+    "delete",
+    "class",
+    "extends",
+    "super",
 ];
 
 /// Longest first: prefix order decides `>>>=` vs `>>>` vs `>>` vs `>`.
@@ -124,6 +128,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, JsError> {
             b'.' if b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => num(b, &mut i)?,
             b'"' | b'\'' => string(b, &mut i)?,
             c if is_ident_start(c) => word(src, b, &mut i),
+            // Identifier starting with a unicode escape (`\u0061bc`).
+            b'\\' if b.get(i + 1) == Some(&b'u') => word(src, b, &mut i),
             b'/' if !matches!(b.get(i + 1), Some(b'/') | Some(b'*')) && regex_allowed(&out) => {
                 regex(src, &mut i)?
             }
@@ -385,15 +391,50 @@ fn tpl_chunk(b: &[u8], i: &mut usize, braces: &mut Vec<bool>, head: bool) -> Res
 }
 
 fn word(src: &str, b: &[u8], i: &mut usize) -> Tok {
+    // Fast path: no backslash, slice straight out of the source.
     let s = *i;
     while *i < b.len() && is_ident(b[*i]) {
         *i += 1;
     }
-    let w = &src[s..*i];
-    match KWS.iter().copied().find(|k| *k == w) {
-        Some(k) => Tok::Kw(k),
-        None => Tok::Ident(w.to_string()),
+    if b.get(*i) != Some(&b'\\') {
+        let w = &src[s..*i];
+        return match KWS.iter().copied().find(|k| *k == w) {
+            Some(k) => Tok::Kw(k),
+            None => Tok::Ident(w.to_string()),
+        };
     }
+    // Slow path: `\uXXXX` / `\u{...}` escapes inside the identifier
+    // (`n.al\u00edcuota`). An escaped word is never a keyword per spec.
+    let mut w = src[s..*i].to_string();
+    loop {
+        if b.get(*i) == Some(&b'\\') && b.get(*i + 1) == Some(&b'u') {
+            *i += 2;
+            let cp = if b.get(*i) == Some(&b'{') {
+                *i += 1;
+                let h0 = *i;
+                while b.get(*i).is_some_and(|c| c.is_ascii_hexdigit()) {
+                    *i += 1;
+                }
+                let h = u32::from_str_radix(&src[h0..*i], 16).unwrap_or(0xFFFD);
+                if b.get(*i) != Some(&b'}') {
+                    return Tok::Ident(w);
+                }
+                *i += 1;
+                h
+            } else {
+                let h0 = *i;
+                *i += 4;
+                u32::from_str_radix(src.get(h0..*i).unwrap_or(""), 16).unwrap_or(0xFFFD)
+            };
+            w.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+        } else if *i < b.len() && is_ident(b[*i]) {
+            w.push(b[*i] as char);
+            *i += 1;
+        } else {
+            break;
+        }
+    }
+    Tok::Ident(w)
 }
 
 /// `/` opens a regex when an operand is expected: start of input, or the
@@ -426,13 +467,14 @@ fn regex_allowed(out: &[Token]) -> bool {
 }
 
 /// Scan `/pat/flags` from the opening `/` (already confirmed not to be a
-/// comment). Returns the Regex token.
+/// comment). Returns the Regex token. In JS `]` always closes a class
+/// (`[]` is the empty class, unlike most flavors where `[]]` holds a
+/// literal bracket).
 fn regex(src: &str, i: &mut usize) -> Result<Tok, JsError> {
     let b = src.as_bytes();
     let start = *i + 1;
     *i += 1;
     let mut in_class = false;
-    let mut class_first = false;
     loop {
         let Some(&c) = b.get(*i) else {
             return Err(err("unterminated regex"));
@@ -444,26 +486,19 @@ fn regex(src: &str, i: &mut usize) -> Result<Tok, JsError> {
                 match b.get(*i) {
                     None => return Err(err("unterminated regex")),
                     Some(b'\n') | Some(b'\r') => return Err(err("newline in regex literal")),
-                    Some(_) => {
-                        class_first = false;
-                        *i += 1;
-                    }
+                    Some(_) => *i += 1,
                 }
             }
             b'[' if !in_class => {
                 in_class = true;
-                class_first = true;
                 *i += 1;
             }
-            b']' if in_class && !class_first => {
+            b']' if in_class => {
                 in_class = false;
                 *i += 1;
             }
             b'/' if !in_class => break,
-            _ => {
-                class_first = false;
-                *i += 1;
-            }
+            _ => *i += 1,
         }
     }
     let pat = src[start..*i].to_string();

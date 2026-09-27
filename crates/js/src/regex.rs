@@ -29,6 +29,14 @@ pub fn parse_flags(s: &str) -> Result<Flags, char> {
     Ok(f)
 }
 
+/// One class atom while parsing: a single char (rangeable) or a whole
+/// class escape like `\d` (never a range endpoint).
+#[derive(Debug, Clone, PartialEq)]
+enum Atom {
+    Char(char),
+    Class(Vec<(char, char)>),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Node {
     Empty,
@@ -51,6 +59,12 @@ enum Node {
     },
     Group {
         idx: usize,
+        child: Box<Node>,
+    },
+    /// Zero-width lookahead: child must match (positive) or not match
+    /// (negative) at the current position, consuming nothing.
+    Lookahead {
+        positive: bool,
         child: Box<Node>,
     },
 }
@@ -214,13 +228,25 @@ impl P {
                 self.i += 1;
                 if self.peek() == Some('?') {
                     self.i += 1;
-                    if self.peek() != Some(':') {
-                        return Err("only (?: ) groups are supported".into());
+                    match self.peek() {
+                        Some(':') => {
+                            self.i += 1;
+                            let inner = self.alt(true)?;
+                            self.expect(')')?;
+                            Ok(inner)
+                        }
+                        Some('=') | Some('!') => {
+                            let positive = self.peek() == Some('=');
+                            self.i += 1;
+                            let inner = self.alt(true)?;
+                            self.expect(')')?;
+                            Ok(Node::Lookahead {
+                                positive,
+                                child: Box::new(inner),
+                            })
+                        }
+                        _ => Err("only (?: ), (?= ) and (?! ) groups are supported".into()),
                     }
-                    self.i += 1;
-                    let inner = self.alt(true)?;
-                    self.expect(')')?;
-                    Ok(inner)
                 } else {
                     self.groups += 1;
                     let idx = self.groups;
@@ -302,6 +328,8 @@ impl P {
             )),
             'b' if !in_class => Ok(Node::WordBound(true)),
             'B' if !in_class => Ok(Node::WordBound(false)),
+            // `\b` inside a class is backspace (V8 agrees).
+            'b' => Ok(Node::Lit('\u{8}')),
             'n' => Ok(Node::Lit('\n')),
             't' => Ok(Node::Lit('\t')),
             'r' => Ok(Node::Lit('\r')),
@@ -335,6 +363,10 @@ impl P {
         Ok(h)
     }
 
+    /// `[...]` with V8 Annex-B rules: `]` closes only a non-empty
+    /// class (`[]` matches nothing, `[^]` everything); `-` is literal
+    /// first/last; a range forms only between two single chars (after a
+    /// class escape, `-x` parses as literals).
     fn class(&mut self) -> Result<Node, String> {
         self.i += 1; // '['
         let neg = if self.peek() == Some('^') {
@@ -344,49 +376,65 @@ impl P {
             false
         };
         let mut ranges: Vec<(char, char)> = Vec::new();
-        let mut first = true;
+        let mut empty = true;
         loop {
             match self.peek() {
                 None => return Err("unterminated class".into()),
-                Some(']') if !first => {
+                Some(']') if !empty => {
+                    self.i += 1;
+                    break;
+                }
+                Some(']') => {
+                    // Empty class: `[]` closes here, matches nothing.
                     self.i += 1;
                     break;
                 }
                 Some(_) => {
-                    let lo = self.class_atom()?;
-                    if self.peek() == Some('-') && self.c.get(self.i + 1) != Some(&']') {
-                        self.i += 1; // '-'
-                        let hi = self.class_atom()?;
-                        if (hi as u32) < (lo as u32) {
-                            return Err("range out of order".into());
+                    match self.class_atom()? {
+                        Atom::Char(lo) => {
+                            if self.peek() == Some('-') && self.c.get(self.i + 1) != Some(&']') {
+                                self.i += 1; // tentative '-'
+                                match self.class_atom()? {
+                                    Atom::Char(hi) => {
+                                        if (hi as u32) < (lo as u32) {
+                                            return Err("range out of order".into());
+                                        }
+                                        ranges.push((lo, hi));
+                                    }
+                                    Atom::Class(rs) => {
+                                        // `[\d-x]`: dash is literal, the
+                                        // escape keeps its own ranges.
+                                        ranges.push(('-', '-'));
+                                        ranges.extend(rs);
+                                    }
+                                }
+                            } else {
+                                ranges.push((lo, lo));
+                            }
                         }
-                        ranges.push((lo, hi));
-                    } else {
-                        ranges.push((lo, lo));
+                        Atom::Class(rs) => {
+                            ranges.extend(rs);
+                        }
                     }
                 }
             }
-            first = false;
+            empty = false;
         }
         Ok(Node::Class { neg, ranges })
     }
 
-    fn class_atom(&mut self) -> Result<char, String> {
+    /// One class atom: a single char or a whole class escape (`\d`).
+    fn class_atom(&mut self) -> Result<Atom, String> {
         match self.peek() {
             None => Err("unterminated class".into()),
-            Some('\\') => {
-                let save = self.i;
-                match self.escape(true)? {
-                    Node::Lit(c) => Ok(c),
-                    _ => {
-                        self.i = save;
-                        Err("class range over a class escape".into())
-                    }
-                }
-            }
+            Some('\\') => match self.escape(true)? {
+                Node::Lit(c) => Ok(Atom::Char(c)),
+                Node::Class { ranges, .. } => Ok(Atom::Class(ranges)),
+                _ => Err("bad class escape".into()),
+            },
             Some(c) => {
                 self.i += 1;
-                Ok(c)
+                Ok(Atom::Char(c))
             }
         }
     }
@@ -575,6 +623,16 @@ fn mt(n: &Node, s: &[char], pos: usize, caps: Caps, run: &mut Run) -> Outs {
             }
             out
         }
+        Node::Lookahead { positive, child } => {
+            let hits = mt(child, s, pos, caps.clone(), run);
+            // Positive lookahead keeps the child's captures (spec);
+            // negative succeeds only when the child matches nothing.
+            match (positive, hits.into_iter().next()) {
+                (true, Some((_, c))) => vec![(pos, c)],
+                (false, None) => vec![(pos, caps)],
+                _ => vec![],
+            }
+        }
         Node::Quant {
             lo,
             hi,
@@ -754,6 +812,17 @@ mod tests {
     }
 
     #[test]
+    fn lookahead() {
+        assert_eq!(m(r"a(?=b)", "", "ab"), Some((0, 1)));
+        assert_eq!(m(r"a(?=b)", "", "ac"), None);
+        assert_eq!(m(r"a(?!b)", "", "ac"), Some((0, 1)));
+        assert_eq!(m(r"a(?!b)", "", "ab"), None);
+        assert_eq!(g(r"(?=(a))ab", "", "ab"), vec![Some((0, 1))]);
+        assert_eq!(m(r"(?=(a))b", "", "ab"), None);
+        assert_eq!(m(r"[^.]*(?=\..*)\.|.*", "", "a.b"), Some((0, 2)));
+    }
+
+    #[test]
     fn groups_and_lazy() {
         assert_eq!(
             g(r"(\w+)@(\w+)", "", "u@d"),
@@ -778,6 +847,20 @@ mod tests {
         assert_eq!(m(r"a)", "", "a)"), Some((0, 2)));
         assert_eq!(m(r"a{,2}", "", "a{,2}"), Some((0, 5)));
         assert_eq!(m(r"a{2}", "", "aaa"), Some((0, 2)));
+        // V8 class rules: trailing/leading dash is literal, `[]` is empty,
+        // `[\d-x]` is \d plus literal "-x", `\b` in class is backspace.
+        assert_eq!(m(r"[^\s-]", "", "a b"), Some((0, 1)));
+        assert_eq!(m(r"[-ab]", "", "a-b"), Some((0, 1)));
+        assert_eq!(m(r"[\w-]", "", "a-b"), Some((0, 1)));
+        assert_eq!(m(r"[\d-x]", "", "5"), Some((0, 1)));
+        assert_eq!(m(r"[\d-x]", "", "x"), Some((0, 1)));
+        assert_eq!(m(r"[\d-x]", "", "-"), Some((0, 1)));
+        assert_eq!(m(r"[\d-x]", "", "d"), None);
+        assert_eq!(m(r"[]", "", "a"), None);
+        assert_eq!(m(r"[^]", "", "a"), Some((0, 1)));
+        assert_eq!(m(r"[\b]", "", "\u{8}"), Some((0, 1)));
+        assert_eq!(m(r"[\b]", "", "b"), None);
+        assert_eq!(m(r"[\b-c]", "", "c"), Some((0, 1)));
     }
 
     #[test]

@@ -506,6 +506,14 @@ pub struct Interp {
     pub(crate) cur_native: Value,
     /// true while an `async function` body is on the stack (gate for await).
     pub(crate) fn_async: bool,
+    /// Parent ctors of in-flight derived-class methods (innermost last):
+    /// `super()` / `super.m` resolve against the top. Pushed by
+    /// call_value for Funcs carrying `__super`, popped on return.
+    pub(crate) super_stack: Vec<Value>,
+    /// Label of the directly-enclosing `name:` when it wraps the loop
+    /// about to run (taken by it at start). Lets `continue name` resume
+    /// the right loop instead of an inner one restarting itself.
+    pub(crate) label_direct: Option<String>,
     /// GC freelist for the env arena (envs never shrink either).
     pub(crate) free_envs: Vec<u32>,
     /// `Symbol.for` registry: key -> symbol obj id (roots, live forever).
@@ -566,6 +574,8 @@ impl Interp {
             handled_promises: HashSet::new(),
             cur_native: Value::Undef,
             fn_async: false,
+            super_stack: Vec::new(),
+            label_direct: None,
             free_envs: Vec::new(),
             symbol_registry: HashMap::new(),
             env_stack: Vec::new(),

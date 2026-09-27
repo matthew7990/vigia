@@ -193,9 +193,22 @@ Working:
 - `vigia-js`: own lexer/parser/eval, prototypes, builtin methods,
   `new`/`instanceof`/`in`, DOM bindings (`getElementById`,
   `querySelector(All)`, `createElement`, `appendChild`, `insertBefore`,
-  live `style` block), events with bubbling, external `src=` scripts,
-  Promise + microtasks + virtual-clock timers + `async`/`await`,
-  Promise-returning `fetch`, mark-sweep GC
+  live `style` block, `classList`, `contains`/`closest`/`matches`),
+  events with bubbling plus constructible `Event`/`CustomEvent`/
+  `MouseEvent`/`KeyboardEvent` and `document.createEvent`,
+  `document.cookie` read/write on the session jar, external `src=`
+  scripts, Promise + microtasks + virtual-clock timers + `async`/`await`,
+  Promise-returning `fetch`, `navigator.sendBeacon`, mark-sweep GC
+- Browser persona (no layout engine behind it): `navigator` constants
+  plus `userAgentData`, `plugins`/`mimeTypes`, `connection`,
+  `geolocation`, `indexedDB`, hardware fields; `screen` + viewport dims;
+  `performance.now`/`timeOrigin`; `document` props (`compatMode`,
+  `hidden`, `hasFocus`, ...); `getComputedStyle` snapshot;
+  `HTMLCanvasElement` 2d stub (draws nowhere, blank pixels);
+  zero-geometry `getBoundingClientRect`; all-visible
+  `IntersectionObserver`; fixed `America/Montevideo` timezone.
+  `--stealth` sends the Chrome request profile (UA + `Sec-Fetch-*`)
+  and syncs the JS `navigator` UA family to it
 - WebForms basics: `form.submit()`, `__doPostBack` (injects
   `__EVENTTARGET`/`__EVENTARGUMENT`), `javascript:` hrefs run as page
   code — verified against a live postback round-trip
@@ -206,19 +219,20 @@ Working:
 Still to do:
 
 - JS: classes (`extends`/`super`), logical assignment, `**`, `delete`
+- Canvas rasterizer (pixels behind the 2d stub), WebGL absence,
+  CSS cascade behind `getComputedStyle`
 - Own TLS 1.3 (replace the rustls exception)
 - HTML5 tree-construction hardening (adoption agency, foster parenting)
 - Keep-alive pooling; parallel fetch engine (thread pool, RSS budget)
-- WebForms beyond postbacks: no UpdatePanel/AJAX, no `document.cookie`
-  from JS yet
+- WebForms beyond postbacks: no UpdatePanel/AJAX
 
 Honest limits: a `pending await` is an error, not a suspension (vigia
 settles everything eagerly); events don't capture, only bubble; every
-request is `Connection: close` for now. And there is deliberately no
-stealth or anti-bot evasion — when a site puts up a bot-manager
-CAPTCHA, that's a wall, not a puzzle. The strategy is valid sessions
-plus API replay (`net` shows the endpoints, `req` replays them), not
-fingerprint spoofing.
+request is `Connection: close` for now. `--stealth` camouflages the
+request profile, but there is no CAPTCHA solving here: when a site
+puts up a bot-manager CAPTCHA, that's a wall, not a puzzle. The
+strategy is valid sessions plus API replay (`net` shows the
+endpoints, `req` replays them), not fingerprint spoofing.
 
 ## Docs and contributing
 

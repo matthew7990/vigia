@@ -439,6 +439,9 @@ impl Interp {
         for &o in self.ctxgls.values() {
             m.ow.push(o);
         }
+        for w in self.walkers.values() {
+            m.val(w.filter);
+        }
         for &s in self.heap.intern.values() {
             m.sw.push(s);
         }

@@ -651,6 +651,17 @@ pub struct PendingSubmit {
     pub fields: Vec<(String, String)>,
 }
 
+/// Live TreeWalker state, keyed by walker object id. NodeIds read the
+/// arena on every step (no snapshot), so mid-walk inserts/removals show
+/// up; `filter` is a GC root like event listeners. Cleared by set_dom.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WalkerState {
+    pub root: NodeId,
+    pub current: NodeId,
+    pub what: u32,
+    pub filter: Value,
+}
+
 pub struct Interp {
     pub heap: Heap,
     /// env 0 is global
@@ -667,6 +678,8 @@ pub struct Interp {
     pub(crate) sheets: HashMap<NodeId, u32>,
     /// classList facades per element (cached for === identity).
     pub(crate) token_lists: HashMap<NodeId, u32>,
+    /// TreeWalker objects by obj id (live state, see WalkerState).
+    pub(crate) walkers: HashMap<u32, WalkerState>,
     /// Live pixel buffers per canvas node (RGBA row-major). Created lazily
     /// by 2d ops from the width/height attrs; cleared by set_dom (fresh
     /// arena per page, so stale ids must not leak pixels across pages).
@@ -810,6 +823,7 @@ impl Interp {
             cur_script: None,
             sheets: HashMap::new(),
             token_lists: HashMap::new(),
+            walkers: HashMap::new(),
             canvases: HashMap::new(),
             ctx2ds: HashMap::new(),
             ctxgls: HashMap::new(),

@@ -15,7 +15,7 @@ use crate::eval::{
     n_mimetypes_arr, n_plugins_arr, n_send_beacon, n_user_agent_data, set_prop, to_num, to_str,
     truthy,
 };
-use crate::{err, po, Interp, JsError, NativeFn, NetCtx, Obj, PendingSubmit, Value};
+use crate::{WalkerState, err, po, Interp, JsError, NativeFn, NetCtx, Obj, PendingSubmit, Value};
 
 /// Same list as vigia-html: these never get a close tag when serializing.
 const VOID: &[&str] = &[
@@ -210,6 +210,7 @@ impl Interp {
     pub fn set_dom(&mut self, dom: Dom) {
         self.dom = Some(dom);
         self.dom_objs.clear();
+        self.walkers.clear();
         self.sheets.clear();
         self.canvases.clear();
         self.ctx2ds.clear();
@@ -1994,6 +1995,18 @@ impl Interp {
                     let n = self.dom_mut()?.comment_node(&t);
                     self.dom_wrap(n)
                 }
+                "createTreeWalker" => {
+                    let Some(root) = self.as_node(arg(0)) else {
+                        return Err(err("createTreeWalker needs a node"));
+                    };
+                    let what = match arg(1) {
+                        Value::Undef => u32::MAX,
+                        v => to_num(&self.heap, v) as u32,
+                    };
+                    let filter = arg(2);
+                    self.walker_check_filter(filter)?;
+                    self.tree_walker_obj(root, what, filter)
+                }
                 "querySelector" => {
                     let hits = self.select(id, arg(0))?;
                     self.opt_node(hits.into_iter().next())
@@ -2247,6 +2260,396 @@ impl Interp {
             },
         }
     }
+}
+
+// ---- TreeWalker -----------------------------------------------------
+
+/// NodeFilter verdicts.
+const W_ACCEPT: u32 = 1;
+const W_REJECT: u32 = 2;
+const W_SKIP: u32 = 3;
+
+impl Interp {
+    /// Callable behind a filter value: a bare function (this=undefined),
+    /// or the acceptNode method of a NodeFilter-shaped object (called
+    /// with the object as receiver). None = not callable.
+    fn walker_callable(&self, filter: Value) -> Option<(Value, Value)> {
+        let Value::Obj(id) = filter else {
+            return None;
+        };
+        match self.heap.obj(id) {
+            Obj::Func { .. } | Obj::Native { .. } => Some((filter, Value::Undef)),
+            _ => match get_prop(&self.heap, &self.protos, filter, "acceptNode") {
+                Ok(Value::Obj(mid)) => match self.heap.obj(mid) {
+                    Obj::Func { .. } | Obj::Native { .. } => Some((Value::Obj(mid), filter)),
+                    _ => None,
+                },
+                _ => None,
+            },
+        }
+    }
+
+    fn walker_check_filter(&self, filter: Value) -> Result<(), JsError> {
+        match filter {
+            Value::Undef | Value::Null => Ok(()),
+            _ if self.walker_callable(filter).is_some() => Ok(()),
+            _ => Err(err("TreeWalker filter is not a function")),
+        }
+    }
+
+    /// Walker facade: root/whatToShow/filter/currentNode read the side
+    /// table through accessors (writes stay consistent), and the step
+    /// natives carry the walker id the way __node methods do.
+    fn tree_walker_obj(
+        &mut self,
+        root: NodeId,
+        what: u32,
+        filter: Value,
+    ) -> Result<Value, JsError> {
+        let wid = self.heap.alloc_obj(Obj::Ordinary {
+            pairs: Vec::new(),
+            proto: po(self.protos.object),
+        })?;
+        let mut pairs = Vec::new();
+        for (nm, f) in [
+            ("nextNode", n_walker_next as NativeFn),
+            ("previousNode", n_walker_prev),
+        ] {
+            let m = self.heap.alloc_obj(nat(nm, f))?;
+            set_prop(&mut self.heap, Value::Obj(m), "__walker", Value::Num(wid as f64))?;
+            pairs.push((nm.into(), Value::Obj(m)));
+        }
+        let accs: &[(&str, NativeFn, Option<NativeFn>)] = &[
+            ("root", n_walker_root_get, None),
+            ("whatToShow", n_walker_what_get, Some(n_walker_what_set)),
+            ("filter", n_walker_filter_get, Some(n_walker_filter_set)),
+            ("currentNode", n_walker_cur_get, Some(n_walker_cur_set)),
+        ];
+        for &(nm, g, s) in accs {
+            let get = self.heap.alloc_obj(nat(nm, g))?;
+            set_prop(
+                &mut self.heap,
+                Value::Obj(get),
+                "__walker",
+                Value::Num(wid as f64),
+            )?;
+            let set = match s {
+                Some(f) => {
+                    let x = self.heap.alloc_obj(nat(nm, f))?;
+                    set_prop(
+                        &mut self.heap,
+                        Value::Obj(x),
+                        "__walker",
+                        Value::Num(wid as f64),
+                    )?;
+                    Some(x)
+                }
+                None => None,
+            };
+            let proto = po(self.protos.object);
+            let acc = self
+                .heap
+                .alloc_obj(Obj::Accessor { get: Some(get), set, proto })?;
+            pairs.push((nm.into(), Value::Obj(acc)));
+        }
+        self.walkers.insert(
+            wid,
+            WalkerState {
+                root,
+                current: root,
+                what,
+                filter,
+            },
+        );
+        if let Obj::Ordinary { pairs: slot, .. } = self.heap.obj_mut(wid) {
+            *slot = pairs;
+        }
+        Ok(Value::Obj(wid))
+    }
+
+    /// whatToShow bit test, then the filter function. A failed bit lands
+    /// as SKIP (children still traversed, filter not called); a script
+    /// throw propagates untouched.
+    fn walker_test(&mut self, wid: u32, node: NodeId) -> Result<u32, JsError> {
+        let (what, filter) = self
+            .walkers
+            .get(&wid)
+            .map(|s| (s.what, s.filter))
+            .ok_or_else(|| err("bad TreeWalker"))?;
+        let ty = match self.dom_ref()?.node(node).data {
+            NodeData::Element(_) => 1,
+            NodeData::Text(_) => 3,
+            NodeData::Comment(_) => 8,
+            NodeData::Document => 9,
+            NodeData::Fragment => 11,
+        };
+        if what & (1 << (ty - 1)) == 0 {
+            return Ok(W_SKIP);
+        }
+        match filter {
+            Value::Undef | Value::Null => Ok(W_ACCEPT),
+            f => {
+                let (func, this) = self
+                    .walker_callable(f)
+                    .ok_or_else(|| err("TreeWalker filter is not a function"))?;
+                let wrap = self.dom_wrap(node)?;
+                let r = self.call_value(func, this, &[wrap], Some("acceptNode"))?;
+                match to_num(&self.heap, r) as u32 {
+                    1 => Ok(W_ACCEPT),
+                    2 => Ok(W_REJECT),
+                    3 => Ok(W_SKIP),
+                    n => Err(err(format!("TreeWalker filter gave {n}, want 1, 2 or 3"))),
+                }
+            }
+        }
+    }
+
+    /// Next node in document order after `node` (exclusive): first child,
+    /// else the nearest next sibling up the ancestor chain. `skip_sub`
+    /// jumps past `node`'s whole subtree (a REJECT verdict). Stops at the
+    /// walker root or a detached chain end.
+    fn step_forward(
+        &self,
+        root: NodeId,
+        node: NodeId,
+        skip_sub: bool,
+    ) -> Result<Option<NodeId>, JsError> {
+        let dom = self.dom_ref()?;
+        if !skip_sub {
+            if let Some(&c) = dom.children(node).first() {
+                return Ok(Some(c));
+            }
+        }
+        let mut t = node;
+        loop {
+            if t == root {
+                return Ok(None);
+            }
+            let (par, nxt) = {
+                let d = self.dom_ref()?;
+                match d.parent(t) {
+                    None => (None, None),
+                    Some(p) => {
+                        let kids = d.children(p);
+                        let nxt = kids
+                            .iter()
+                            .position(|&c| c == t)
+                            .and_then(|i| kids.get(i + 1).copied());
+                        (Some(p), nxt)
+                    }
+                }
+            };
+            if let Some(s) = nxt {
+                return Ok(Some(s));
+            }
+            match par {
+                Some(p) => t = p,
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Previous sibling of `node` (None for a first child, the root, or a
+    /// detached node). The caller descends to deepest-last itself so each
+    /// level passes through the filter (REJECT prunes before descending).
+    fn prev_sibling_of(&self, node: NodeId) -> Result<Option<NodeId>, JsError> {
+        let d = self.dom_ref()?;
+        match d.parent(node) {
+            None => Ok(None),
+            Some(p) => {
+                let kids = d.children(p);
+                Ok(kids
+                    .iter()
+                    .position(|&c| c == node)
+                    .and_then(|i| i.checked_sub(1).and_then(|j| kids.get(j).copied())))
+            }
+        }
+    }
+
+    fn walker_state(&self, wid: u32) -> Result<(NodeId, NodeId), JsError> {
+        self.walkers
+            .get(&wid)
+            .map(|s| (s.root, s.current))
+            .ok_or_else(|| err("bad TreeWalker"))
+    }
+
+    fn walker_next(&mut self, wid: u32) -> Result<Option<NodeId>, JsError> {
+        let (root, mut node) = self.walker_state(wid)?;
+        let mut skip_sub = false;
+        loop {
+            let Some(n) = self.step_forward(root, node, skip_sub)? else {
+                return Ok(None);
+            };
+            node = n;
+            skip_sub = false;
+            match self.walker_test(wid, node)? {
+                W_ACCEPT => {
+                    if let Some(s) = self.walkers.get_mut(&wid) {
+                        s.current = node;
+                    }
+                    return Ok(Some(node));
+                }
+                W_SKIP => {}
+                _ => skip_sub = true,
+            }
+        }
+    }
+
+    fn walker_prev(&mut self, wid: u32) -> Result<Option<NodeId>, JsError> {
+        let (root, mut node) = self.walker_state(wid)?;
+        loop {
+            let mut sib = self.prev_sibling_of(node)?;
+            while let Some(s) = sib {
+                node = s;
+                let mut r = self.walker_test(wid, node)?;
+                while r != W_REJECT {
+                    let last = self.dom_ref()?.children(node).last().copied();
+                    let Some(l) = last else {
+                        break;
+                    };
+                    node = l;
+                    r = self.walker_test(wid, node)?;
+                }
+                if r == W_ACCEPT {
+                    if let Some(st) = self.walkers.get_mut(&wid) {
+                        st.current = node;
+                    }
+                    return Ok(Some(node));
+                }
+                sib = self.prev_sibling_of(node)?;
+            }
+            if node == root {
+                return Ok(None);
+            }
+            let Some(p) = self.dom_ref()?.parent(node) else {
+                return Ok(None);
+            };
+            node = p;
+            if self.walker_test(wid, node)? == W_ACCEPT {
+                if let Some(st) = self.walkers.get_mut(&wid) {
+                    st.current = node;
+                }
+                return Ok(Some(node));
+            }
+        }
+    }
+}
+
+/// Walker id behind a step/accessor call: the bound __walker (the __node
+/// pattern), else `this` itself when it is a walker (detached method).
+fn walker_of(it: &Interp, this: Value) -> Option<u32> {
+    for v in [it.cur_native, this] {
+        let Value::Obj(id) = v else {
+            continue;
+        };
+        if let Ok(Value::Num(n)) = get_prop(&it.heap, &it.protos, Value::Obj(id), "__walker") {
+            return Some(n as u32);
+        }
+        if it.walkers.contains_key(&id) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+fn n_walker_next(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let Some(wid) = walker_of(it, this) else {
+        return Err(err("nextNode needs a TreeWalker"));
+    };
+    let next = it.walker_next(wid)?;
+    it.opt_node(next)
+}
+
+fn n_walker_prev(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let Some(wid) = walker_of(it, this) else {
+        return Err(err("previousNode needs a TreeWalker"));
+    };
+    let prev = it.walker_prev(wid)?;
+    it.opt_node(prev)
+}
+
+fn n_walker_root_get(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let Some(wid) = walker_of(it, this) else {
+        return Err(err("root needs a TreeWalker"));
+    };
+    let n = it
+        .walkers
+        .get(&wid)
+        .map(|s| s.root)
+        .ok_or_else(|| err("bad TreeWalker"))?;
+    it.dom_wrap(n)
+}
+
+fn n_walker_what_get(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let Some(wid) = walker_of(it, this) else {
+        return Err(err("whatToShow needs a TreeWalker"));
+    };
+    let w = it
+        .walkers
+        .get(&wid)
+        .map(|s| s.what)
+        .ok_or_else(|| err("bad TreeWalker"))?;
+    Ok(Value::Num(w as f64))
+}
+
+fn n_walker_what_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(wid) = walker_of(it, this) else {
+        return Err(err("whatToShow needs a TreeWalker"));
+    };
+    let v = args.first().copied().unwrap_or(Value::Undef);
+    let n = to_num(&it.heap, v);
+    if let Some(s) = it.walkers.get_mut(&wid) {
+        s.what = n as u32;
+    }
+    Ok(Value::Undef)
+}
+
+fn n_walker_filter_get(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let Some(wid) = walker_of(it, this) else {
+        return Err(err("filter needs a TreeWalker"));
+    };
+    it.walkers
+        .get(&wid)
+        .map(|s| s.filter)
+        .ok_or_else(|| err("bad TreeWalker"))
+}
+
+fn n_walker_filter_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(wid) = walker_of(it, this) else {
+        return Err(err("filter needs a TreeWalker"));
+    };
+    let v = args.first().copied().unwrap_or(Value::Undef);
+    it.walker_check_filter(v)?;
+    if let Some(s) = it.walkers.get_mut(&wid) {
+        s.filter = v;
+    }
+    Ok(Value::Undef)
+}
+
+fn n_walker_cur_get(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let Some(wid) = walker_of(it, this) else {
+        return Err(err("currentNode needs a TreeWalker"));
+    };
+    let n = it
+        .walkers
+        .get(&wid)
+        .map(|s| s.current)
+        .ok_or_else(|| err("bad TreeWalker"))?;
+    it.dom_wrap(n)
+}
+
+fn n_walker_cur_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(wid) = walker_of(it, this) else {
+        return Err(err("currentNode needs a TreeWalker"));
+    };
+    let v = args.first().copied().unwrap_or(Value::Undef);
+    let Some(n) = it.as_node(v) else {
+        return Err(err("currentNode needs a node"));
+    };
+    if let Some(s) = it.walkers.get_mut(&wid) {
+        s.current = n;
+    }
+    Ok(Value::Undef)
 }
 
 // ---- event natives ------------------------------------------------------
@@ -3738,6 +4141,113 @@ mod tests {
             "0"
         );
         assert!(errmsg(&mut it, "document.querySelector('[')").contains("css"));
+    }
+
+    const WALK_PAGE: &str = r#"<html><head><title>t</title></head><body><div id="w"><p>a<b>b</b></p><span>c</span><!--note--></div></body></html>"#;
+
+    #[test]
+    fn tree_walker_order() {
+        let mut it = interp(WALK_PAGE);
+        // elements-only over nested HTML, exact document order
+        assert_eq!(
+            ev(&mut it, "var wd=document.getElementById('w');var wk=document.createTreeWalker(wd,1);var o=[];var n=wk.nextNode();while(n){o.push(n.tagName);n=wk.nextNode();}o.join(',')"),
+            "P,B,SPAN"
+        );
+        // exhausted: null twice, currentNode stays on the last hit
+        assert_eq!(ev(&mut it, "wk.nextNode()"), "null");
+        assert_eq!(ev(&mut it, "wk.nextNode()"), "null");
+        assert_eq!(ev(&mut it, "wk.currentNode.tagName"), "SPAN");
+        // text nodes join with mask 5 (elements + text)
+        assert_eq!(
+            ev(&mut it, "var w2=document.createTreeWalker(wd,5);var o2=[];var m=w2.nextNode();while(m){o2.push(m.nodeType==1?m.tagName:'['+m.textContent+']');m=w2.nextNode();}o2.join(',')"),
+            "P,[a],B,[b],SPAN,[c]"
+        );
+        // comments join with mask 129 (elements + comments)
+        assert_eq!(
+            ev(&mut it, "var w3=document.createTreeWalker(wd,129);var o3=[];var k=w3.nextNode();while(k){o3.push(k.nodeType==8?'#comment:'+k.textContent:k.tagName);k=w3.nextNode();}o3.join(',')"),
+            "P,B,SPAN,#comment:note"
+        );
+    }
+
+    #[test]
+    fn tree_walker_filter() {
+        let mut it = interp(WALK_PAGE);
+        // REJECT prunes the whole subtree (P and its B vanish)
+        assert_eq!(
+            ev(&mut it, "var wd=document.getElementById('w');var wr=document.createTreeWalker(wd,1,function(n){return n.tagName=='P'?2:1});var o=[];var n=wr.nextNode();while(n){o.push(n.tagName);n=wr.nextNode();}o.join(',')"),
+            "SPAN"
+        );
+        // SKIP skips the node but still descends into it
+        assert_eq!(
+            ev(&mut it, "var ws=document.createTreeWalker(wd,1,function(n){return n.tagName=='P'?3:1});var o2=[];var m=ws.nextNode();while(m){o2.push(m.tagName);m=ws.nextNode();}o2.join(',')"),
+            "B,SPAN"
+        );
+        // {acceptNode} objects work too
+        assert_eq!(
+            ev(&mut it, "var wa=document.createTreeWalker(wd,1,{acceptNode:function(n){return n.tagName=='SPAN'?1:3}});var o3=[];var k=wa.nextNode();while(k){o3.push(k.tagName);k=wa.nextNode();}o3.join(',')"),
+            "SPAN"
+        );
+        // a throwing filter propagates instead of stalling the walk
+        assert!(
+            errmsg(
+                &mut it,
+                "var wt=document.createTreeWalker(wd,1,function(n){throw 'boom-'+n.tagName});wt.nextNode()"
+            )
+            .contains("boom-P")
+        );
+        // bad filter verdicts throw
+        assert!(
+            errmsg(
+                &mut it,
+                "var wv=document.createTreeWalker(wd,1,function(n){return 7});wv.nextNode()"
+            )
+            .contains("1, 2 or 3")
+        );
+        // non-function filters throw at creation
+        assert!(
+            errmsg(&mut it, "document.createTreeWalker(wd,1,42)").contains("not a function")
+        );
+    }
+
+    #[test]
+    fn tree_walker_prev_and_current() {
+        let mut it = interp(WALK_PAGE);
+        assert_eq!(
+            ev(&mut it, "var wd=document.getElementById('w');var wp=document.createTreeWalker(wd,1);while(wp.nextNode()){}wp.currentNode.tagName"),
+            "SPAN"
+        );
+        // previousNode mirrors in reverse, root included, then null twice
+        assert_eq!(
+            ev(&mut it, "var o=[];var n=wp.previousNode();while(n){o.push(n.tagName);n=wp.previousNode();}o.join(',')"),
+            "B,P,DIV"
+        );
+        assert_eq!(ev(&mut it, "wp.previousNode()"), "null");
+        assert_eq!(ev(&mut it, "wp.previousNode()"), "null");
+        // currentNode starts at root, same wrapper back (=== identity)
+        assert_eq!(
+            ev(&mut it, "var wc=document.createTreeWalker(wd,1);wc.currentNode===wd"),
+            "true"
+        );
+        assert_eq!(ev(&mut it, "wc.root===wd"), "true");
+        assert_eq!(ev(&mut it, "wc.whatToShow"), "1");
+        assert_eq!(ev(&mut it, "document.createTreeWalker(wd).whatToShow"), "4294967295");
+        assert_eq!(
+            ev(&mut it, "var wf=function(n){return 1};document.createTreeWalker(wd,1,wf).filter===wf"),
+            "true"
+        );
+        // the setter retargets the walk; non-nodes throw
+        assert_eq!(
+            ev(&mut it, "wc.currentNode=wd.querySelector('b');wc.nextNode().tagName"),
+            "SPAN"
+        );
+        assert!(errmsg(&mut it, "wc.currentNode='x'").contains("needs a node"));
+        assert!(errmsg(&mut it, "document.createTreeWalker(null)").contains("needs a node"));
+        assert!(errmsg(&mut it, "document.createTreeWalker({})").contains("needs a node"));
+        // live arena: nodes inserted mid-walk are visited
+        assert_eq!(
+            ev(&mut it, "var wl=document.createTreeWalker(wd,1);wl.nextNode().tagName;var ni=document.createElement('i');wd.appendChild(ni);var o2=[];var q=wl.nextNode();while(q){o2.push(q.tagName);q=wl.nextNode();}o2.join(',')"),
+            "B,SPAN,I"
+        );
     }
 
     #[test]

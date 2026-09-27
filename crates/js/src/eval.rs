@@ -1687,7 +1687,11 @@ impl Interp {
             "Array",
             n_array,
             pr.array,
-            &[("isArray", n_is_array), ("of", n_array_of)],
+            &[
+                ("isArray", n_is_array),
+                ("of", n_array_of),
+                ("from", n_array_from),
+            ],
         );
         self.ctor(
             "String",
@@ -1720,7 +1724,7 @@ impl Interp {
         self.ctor("Map", n_map_ctor, pr.map, &[]);
         self.ctor("Set", n_set_ctor, pr.set, &[]);
         self.ctor("WeakMap", n_weakmap_ctor, pr.weakmap, &[]);
-        self.ctor("ArrayBuffer", n_buf_ctor, pr.buffer, &[]);
+        self.ctor("ArrayBuffer", n_buf_ctor, pr.buffer, &[("isView", n_buf_is_view)]);
         self.ctor(
             "Uint8Array",
             n_u8_ctor,
@@ -1965,6 +1969,29 @@ impl Interp {
         // Numeric globals (writable in sloppy reality; plain slots here).
         self.env_declare(0, "NaN", Value::Num(f64::NAN));
         self.env_declare(0, "Infinity", Value::Num(f64::INFINITY));
+        // window.performance (ruxit probes exactly this surface).
+        {
+            let mut pp: Vec<(String, Value)> = Vec::new();
+            for (n, f) in [
+                ("now", n_perf_now as NativeFn),
+                ("getEntries", n_perf_empty_arr),
+                ("getEntriesByType", n_perf_empty_arr),
+                ("getEntriesByName", n_perf_empty_arr),
+                ("setResourceTimingBufferSize", n_perf_noop),
+                ("clearResourceTimings", n_perf_noop),
+            ] {
+                match self.heap.alloc_obj(nat(n, f)) {
+                    Ok(id) => pp.push((n.into(), Value::Obj(id))),
+                    Err(_) => break,
+                }
+            }
+            pp.push(("timeOrigin".into(), Value::Num(self.perf_t0 as f64)));
+            if let Ok(p) = self.obj_pairs(pp) {
+                self.env_declare(0, "performance", Value::Obj(p));
+            }
+        }
+        // PerformanceResourceTiming ctor guard (ruxit: function or object).
+        self.ctor("PerformanceResourceTiming", n_dom_illegal, pr.object, &[]);
         // Reflect: plain object (no constructor). Reads/writes honor
         // proxy traps; the rest forwards to the shared free-fn paths.
         let mut rp: Vec<(String, Value)> = Vec::new();
@@ -1992,6 +2019,12 @@ impl Interp {
 
     fn tick(&mut self) -> Result<(), JsError> {
         self.steps += 1;
+        // Progress sampler: every 2M steps with VIGIA_JSTICK, print the
+        // live chain - a stuck chain means an infinite loop, a moving one
+        // means slow-but-alive boot.
+        if std::env::var_os("VIGIA_JSTICK").is_some() && self.steps % 2_000_000 == 0 {
+            eprintln!("js? steps={} chain={}", self.steps, self.js_chain());
+        }
         if self.steps > self.max_steps {
             return Err(fatal("step limit exceeded"));
         }
@@ -2030,6 +2063,21 @@ impl Interp {
 
     pub(crate) fn env_declare(&mut self, env: u32, name: &str, v: Value) {
         self.envs[env as usize].vars.insert(name.to_string(), v);
+    }
+
+    /// Sloppy-mode receiver: the window object when a DOM is installed,
+    /// Undef on bare runs (plain `vigia js` has no global object).
+    pub(crate) fn sloppy_this(&self) -> Value {
+        self.wind.map(Value::Obj).unwrap_or(Value::Undef)
+    }
+
+    /// Elapsed wall ms since creation (performance.now).
+    pub(crate) fn perf_elapsed(&self) -> f64 {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(self.perf_t0);
+        now.saturating_sub(self.perf_t0) as f64
     }
 
     pub(crate) fn env_get(&self, env: u32, name: &str) -> Option<Value> {
@@ -4019,6 +4067,7 @@ impl Interp {
                 // declarations before params: defaults may read them.
                 // Truncated with the rest below (hoisted-list discipline).
                 let hbase = self.hoisted.len();
+                let saved_last = self.last;
                 self.hoist_vars(&def.body, cenv)?;
                 for (i, (p, d)) in def.params.iter().enumerate() {
                     let mut v = args.get(i).copied().unwrap_or(Value::Undef);
@@ -4063,10 +4112,16 @@ impl Interp {
                     self.env_declare(cenv, "arguments", Value::Obj(argarr));
                 }
                 // Arrows capture `this` lexically from the defining env.
+                // Sloppy calls coerce nullish receivers to the global
+                // object (bound nulls included - documented deviation;
+                // V8 keeps bound thisArgs raw).
                 let this_val = if def.is_arrow {
                     self.env_get(fenv, "this").unwrap_or(Value::Undef)
                 } else {
-                    this
+                    match this {
+                        Value::Undef | Value::Null => self.sloppy_this(),
+                        _ => this,
+                    }
                 };
                 self.env_declare(cenv, "this", this_val);
                 // `await` binds to the nearest enclosing fn, so the flag
@@ -4135,6 +4190,10 @@ impl Interp {
                 self.fn_async = prev_async;
                 self.func_env = prev_fenv;
                 self.hoisted.truncate(hbase);
+                // Function-body statements must not leak into the
+                // top-level completion value (timer callbacks were
+                // overwriting it mid-drain).
+                self.last = saved_last;
                 (def.is_async, r)
             }
             C::Nat(nf) => {
@@ -5165,6 +5224,30 @@ fn n_is_array(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, Js
 
 fn n_array_of(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Obj(it.arr_obj(args.to_vec())?))
+}
+
+/// Array.from(arrayLike, mapFn?, thisArg?): strings feed chars, like V8.
+fn n_array_from(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let raw = from_raw(it, arg(args, 0))?;
+    let mapped: Vec<Value> = match arg(args, 1) {
+        Value::Obj(mid)
+            if matches!(it.heap.obj(mid), Obj::Func { .. } | Obj::Native { .. }) =>
+        {
+            let this_arg = arg(args, 2);
+            let mut out = Vec::with_capacity(raw.len());
+            for (i, v) in raw.into_iter().enumerate() {
+                out.push(it.call_value(
+                    Value::Obj(mid),
+                    this_arg,
+                    &[v, Value::Num(i as f64)],
+                    None,
+                )?);
+            }
+            out
+        }
+        _ => raw,
+    };
+    Ok(Value::Obj(it.arr_obj(mapped)?))
 }
 
 // -- primitive casts + number globals -------------------------------------------
@@ -7040,8 +7123,20 @@ fn n_u8_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsE
     })?))
 }
 
-fn n_buf_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
-    let n = match arg(args, 0) {
+/// ArrayBuffer.isView(v): typed views and DataViews (not plain
+/// arrays, buffers, or objects).
+fn n_buf_is_view(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let hit = match arg(args, 0) {
+        Value::Obj(id) => matches!(
+            it.heap.obj(id),
+            Obj::Bytes { .. } | Obj::Typed { .. } | Obj::DView { .. }
+        ),
+        _ => false,
+    };
+    Ok(Value::Bool(hit))
+}
+
+fn n_buf_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {    let n = match arg(args, 0) {
         Value::Undef => 0,
         v => typed_len(&it.heap, v)?,
     };
@@ -8756,6 +8851,22 @@ fn n_match_media(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value,
     Ok(Value::Obj(it.obj_pairs(ids)?))
 }
 
+/// window.performance: wall-clock now()/timeOrigin plus empty entry
+/// lists and no-op buffer controls (ruxit gates its timing features on
+/// exactly this surface). No navigation entries are ever recorded.
+fn n_perf_now(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(it.perf_elapsed()))
+}
+
+fn n_perf_empty_arr(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Obj(it.arr_obj(Vec::new())?))
+}
+
+fn n_perf_noop(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(Value::Undef)
+}
+
 /// `Function(p1, .., pn, body)` / `new Function(...)`: params and body
 /// are source fragments, compiled in global scope like V8 (sloppy).
 /// Parse errors surface as plain errors (SyntaxError shape at catch).
@@ -9087,7 +9198,10 @@ impl Interp {
             let Some(i) = pick else { break };
             fires += 1;
             if fires > MAX_TIMER_FIRES {
-                errs.push(fatal("timer cap exceeded (4096 fires in one drain)"));
+                // Snapshot model: live pages re-arm timers forever
+                // (heartbeats, polling chains). Park the rest silently
+                // instead of failing the script - CPU runaway is still
+                // guarded by max_steps, and convergence needs far fewer.
                 break 'outer;
             }
             self.now_ms = self.now_ms.max(self.timers[i].deadline_ms);
@@ -9621,6 +9735,14 @@ mod tests {
     }
 
     #[test]
+    fn completion_isolation() {
+        // Statements inside called functions (incl. timer callbacks)
+        // never leak into the top-level completion value.
+        assert_eq!(disp("function f(){var q=1;q+1}f();42"), "42");
+        assert_eq!(disp("var r='';[1,2].forEach(function(x){r+=x;'inner'});'outer'"), "outer");
+    }
+
+    #[test]
     fn spreads() {
         assert_eq!(num("function s(a,b,c){return a+b+c}s(...[1,2,3])"), 6.0);
         assert_eq!(disp("[0, ...[1,2], 3]"), "[0,1,2,3]");
@@ -9791,6 +9913,15 @@ mod tests {
         assert_eq!(disp("var p=new Promise(function(){});p.x=1;p.x"), "1");
         assert_eq!(disp("var p=new Promise(function(){});p.x=1;Object.keys(p).join()"), "x");
         assert_eq!(disp("var p=new Promise(function(){});p.x=1;delete p.x;('x' in p)"), "false");
+    }
+
+    #[test]
+    fn sloppy_this() {
+        // Bare calls coerce nullish receivers (V8 sloppy; Undef without
+        // a DOM since there is no global object there).
+        assert_eq!(disp("function f(){return this}f()"), "undefined");
+        assert_eq!(disp("function f(){return this}f.call(null)"), "undefined");
+        assert_eq!(disp("var o={m:function(){return this}};o.m()===o"), "true");
     }
 
     #[test]
@@ -9971,6 +10102,16 @@ mod tests {
         // Reflect.getOwnPropertyDescriptor reads through (trap gap).
         assert_eq!(disp("Reflect.getOwnPropertyDescriptor(new Proxy({v:9},{}),'v').value"), "9");
         assert_eq!(disp("typeof Reflect"), "object");
+    }
+
+    #[test]
+    fn buffer_is_view() {
+        assert_eq!(disp("ArrayBuffer.isView(new Uint8Array(1))"), "true");
+        assert_eq!(disp("ArrayBuffer.isView(new Uint16Array(1))"), "true");
+        assert_eq!(disp("ArrayBuffer.isView(new DataView(new ArrayBuffer(1)))"), "true");
+        assert_eq!(disp("ArrayBuffer.isView([])"), "false");
+        assert_eq!(disp("ArrayBuffer.isView({})"), "false");
+        assert_eq!(disp("ArrayBuffer.isView(new ArrayBuffer(1))"), "false");
     }
 
     #[test]
@@ -10255,6 +10396,16 @@ mod tests {
         assert_eq!(disp("var a=[1];a['1']=9;a[1]"), "9");
         assert_eq!(disp("var a=[];a[3]=7;a.length"), "4");
         assert_eq!(disp("var a=[1];a[1e15]=2;a.length"), "1");
+    }
+
+    #[test]
+    fn array_from() {
+        assert_eq!(disp("Array.from([1,2,3]).join()"), "1,2,3");
+        assert_eq!(disp("Array.from('hi').join()"), "h,i");
+        assert_eq!(disp("Array.from([1,2],function(x){return x*2}).join()"), "2,4");
+        assert_eq!(disp("Array.from([1,2],function(x){return x+this.t},{t:10}).join()"), "11,12");
+        assert_eq!(disp("Array.from({length:2}).length"), "2");
+        assert_eq!(disp("Array.from([]).length"), "0");
     }
 
     #[test]
@@ -11555,10 +11706,13 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("step"));
-        // an uncleared interval hits the timer cap, not a hang
+        // an uncleared interval parks silently at the timer cap (live
+        // pages re-arm forever; failing the snapshot over it helps no
+        // one) - and its callbacks did run. Callbacks must not leak into
+        // the top-level completion value either (last save/restore).
         let mut it = Interp::new();
-        let e = it.run("setInterval(function(){},1)").unwrap_err();
-        assert!(e.to_string().contains("timer cap"), "{e}");
+        it.run("var n=0;setInterval(function(){n++},1)").unwrap();
+        assert!(it.run("n>100").unwrap() == Value::Bool(true));
     }
 
     // ---- throw / try / catch / finally --------------------------------

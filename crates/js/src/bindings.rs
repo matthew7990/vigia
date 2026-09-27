@@ -92,8 +92,8 @@ const MAX_EXT_SCRIPTS: u32 = 32;
 /// One runnable <script> in document order: inline source, or an external
 /// `src` attr value (raw - resolving needs the page URL out of NetCtx).
 enum ScriptSource {
-    Inline(String),
-    External(String),
+    Inline(NodeId, String),
+    External(NodeId, String),
 }
 
 /// Runnable <script> sources in document order. A `src` attr wins over any
@@ -117,11 +117,11 @@ fn collect_scripts(dom: &Dom) -> Vec<ScriptSource> {
             continue;
         }
         match dom.attr(id, "src") {
-            Some(src) => out.push(ScriptSource::External(src.to_string())),
+            Some(src) => out.push(ScriptSource::External(id, src.to_string())),
             None => {
                 let mut s = String::new();
                 raw_text(dom, id, &mut s);
-                out.push(ScriptSource::Inline(s));
+                out.push(ScriptSource::Inline(id, s));
             }
         }
     }
@@ -311,14 +311,21 @@ impl Interp {
         let mut fetched = 0;
         for (n, s) in scripts.iter().enumerate() {
             match s {
-                ScriptSource::Inline(src) => {
-                    if let Err(e) = self.run(src) {
+                ScriptSource::Inline(id, src) => {
+                    // document.currentScript during this run (V8 parity).
+                    let prev = self.cur_script.replace(*id);
+                    let r = self.run(src);
+                    self.cur_script = prev;
+                    if let Err(e) = r {
                         errs.push(Self::tag_err(format!("inline#{n}"), e));
                     }
                 }
-                ScriptSource::External(raw) => match self.fetch_script(raw, &mut fetched) {
+                ScriptSource::External(id, raw) => match self.fetch_script(raw, &mut fetched) {
                     Ok(Some(body)) => {
-                        if let Err(e) = self.run(&body) {
+                        let prev = self.cur_script.replace(*id);
+                        let r = self.run(&body);
+                        self.cur_script = prev;
+                        if let Err(e) = r {
                             errs.push(Self::tag_err(format!("src {raw}"), e));
                         }
                     }
@@ -1163,6 +1170,7 @@ impl Interp {
                 }
                 "textContent" => Ok(Value::Null),
                 "implementation" => self.impl_obj(),
+                "currentScript" => self.opt_node(self.cur_script),
                 "cookie" => {
                     // document.cookie: jar view minus HttpOnly. Page URL
                     // prefers the net ctx base, else the live location.
@@ -2272,6 +2280,23 @@ mod tests {
         assert_eq!(ev(&mut it, "this.dT_"), "undefined");
         // Sloppy this-write creates a real global through window.
         assert_eq!(ev(&mut it, "function f(){this.wx9=7} f();wx9"), "7");
+    }
+
+    #[test]
+    fn performance_surface() {
+        let mut it = interp(PAGE);
+        assert_eq!(ev(&mut it, "typeof performance.now()"), "number");
+        assert_eq!(ev(&mut it, "typeof performance.timeOrigin"), "number");
+        assert_eq!(ev(&mut it, "performance.getEntriesByType('x').length"), "0");
+        assert_eq!(ev(&mut it, "typeof PerformanceResourceTiming"), "function");
+        // document.currentScript tracks the running element.
+        let mut it2 = interp("<html><head><script id=s>var x=1</script></head><body></body></html>");
+        let dom = it2.take_dom();
+        let s = vigia_css::query(&dom, "script").unwrap()[0];
+        it2.set_dom(dom);
+        it2.cur_script = Some(s);
+        assert_eq!(ev(&mut it2, "document.currentScript.tagName"), "SCRIPT");
+        assert_eq!(ev(&mut it2, "document.currentScript === document.getElementsByTagName('script')[0]"), "true");
     }
 
     #[test]

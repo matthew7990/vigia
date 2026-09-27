@@ -592,6 +592,9 @@ pub struct Interp {
     pub dom: Option<vigia_dom::Dom>,
     /// node -> wrapper obj cache so `a === b` identity holds per node
     pub(crate) dom_objs: HashMap<NodeId, u32>,
+    /// Element id of the <script> currently running, if any
+    /// (document.currentScript; restored around each run).
+    pub(crate) cur_script: Option<NodeId>,
     /// style/link node -> CSSStyleSheet facade (ownerNode/cssRules/
     /// insertRule), so `el.sheet === el.sheet`. Cleared by set_dom.
     pub(crate) sheets: HashMap<NodeId, u32>,
@@ -651,6 +654,8 @@ pub struct Interp {
     pub(crate) throw_chain: Option<String>,
     /// Blob URL counter for createObjectURL (opaque handles only).
     pub(crate) blob_next: u32,
+    /// Wall ms at Interp creation: performance.timeOrigin / now() base.
+    pub(crate) perf_t0: u64,
     /// Label of the directly-enclosing `name:` when it wraps the loop
     /// about to run (taken by it at start). Lets `continue name` resume
     /// the right loop instead of an inner one restarting itself.
@@ -707,6 +712,7 @@ impl Interp {
             }],
             dom: None,
             dom_objs: HashMap::new(),
+            cur_script: None,
             sheets: HashMap::new(),
             listeners: HashMap::new(),
             net: None,
@@ -731,6 +737,10 @@ impl Interp {
             js_stack: Vec::new(),
             throw_chain: None,
             blob_next: 0,
+            perf_t0: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
             label_direct: None,
             free_envs: Vec::new(),
             symbol_registry: HashMap::new(),
@@ -739,7 +749,7 @@ impl Interp {
             hoisted: Vec::new(),
             gc_runs: 0,
             wind: None,
-            max_steps: 5_000_000,
+            max_steps: 50_000_000,
             max_call_depth: 1_000,
             max_envs: 200_000,
         };
@@ -762,8 +772,11 @@ impl Interp {
         self.install_builtins();
         let stmts = parse::parse_program(src)?;
         // Top-level `var`s hoist to the global scope (func_env is 0).
+        // Sloppy top-level `this` is the global object (ruxit reads
+        // `this.dT_` at top level; Undef on bare runs without a DOM).
         self.func_env = 0;
         self.throw_chain = None;
+        self.env_declare(0, "this", self.sloppy_this());
         let hbase = self.hoisted.len();
         self.hoist_vars(&stmts, 0)?;
         let r = self.exec_block(&stmts, 0);

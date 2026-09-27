@@ -50,10 +50,11 @@ impl CookieJar {
             if let Some((k, v)) = part.split_once('=') {
                 match k.to_ascii_lowercase().as_str() {
                     "domain" => {
-                        cookie.domain = v.trim_start_matches('.').to_string();
+                        let d = v.trim().trim_start_matches('.').trim();
+                        cookie.domain = d.to_string();
                         cookie.host_only = false;
                     }
-                    "path" => cookie.path = v.to_string(),
+                    "path" => cookie.path = v.trim().to_string(),
                     _ => {}
                 }
             } else if part.eq_ignore_ascii_case("secure") {
@@ -62,8 +63,24 @@ impl CookieJar {
                 cookie.http_only = true;
             }
         }
+        if !cookie.host_only {
+            let domain = cookie.domain.to_ascii_lowercase();
+            if domain.is_empty() {
+                return;
+            }
+            cookie.domain = domain;
+            // RFC 6265 section 5.3 step 6: ignore the cookie when the
+            // request host does not domain-match the Domain attribute.
+            // This blocks supercookies (evil.com setting Domain=victim.com).
+            if !domain_match(&url.host.to_ascii_lowercase(), &cookie.domain) {
+                return;
+            }
+        }
+        if !cookie.path.starts_with('/') {
+            cookie.path = default_path(&url.path);
+        }
         self.cookies
-            .retain(|c| !(c.name == cookie.name && c.domain == cookie.domain));
+            .retain(|c| !(c.name == cookie.name && c.domain == cookie.domain && c.path == cookie.path));
         self.cookies.push(cookie);
     }
 
@@ -237,5 +254,24 @@ mod tests {
             Some("s=1".into())
         );
         assert_eq!(jar.header_for(&u("https://a.com/apple")), None);
+    }
+
+    #[test]
+    fn supercookie_rejected() {
+        let mut jar = CookieJar::new();
+        jar.store_header(&u("https://evil.com/"), "s=1; Domain=victim.com; Path=/");
+        assert_eq!(jar.header_for(&u("https://victim.com/")), None);
+        assert_eq!(jar.header_for(&u("https://evil.com/")), None);
+        assert!(jar.is_empty());
+    }
+
+    #[test]
+    fn domain_match_case_insensitive() {
+        let mut jar = CookieJar::new();
+        jar.store_header(&u("https://a.com/"), "w=1; Domain=A.COM; Path=/");
+        assert_eq!(
+            jar.header_for(&u("https://sub.a.com/")),
+            Some("w=1".into())
+        );
     }
 }

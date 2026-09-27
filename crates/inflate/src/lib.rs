@@ -394,19 +394,28 @@ pub fn gzip_decode(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
             return Err(Error::Truncated);
         }
         let xlen = u16::from_le_bytes([data[i], data[i + 1]]) as usize;
-        i += 2 + xlen;
+        i = i
+            .checked_add(2 + xlen)
+            .filter(|&n| n <= data.len())
+            .ok_or(Error::Truncated)?;
     }
     for mask in [0x08u8, 0x10] {
         // FNAME, FCOMMENT - zero-terminated
         if flg & mask != 0 {
-            match data[i..].iter().position(|&b| b == 0) {
-                Some(n) => i += n + 1,
+            let tail = data.get(i..).ok_or(Error::Truncated)?;
+            match tail.iter().position(|&b| b == 0) {
+                Some(n) => {
+                    i = i
+                        .checked_add(n + 1)
+                        .filter(|&n| n <= data.len())
+                        .ok_or(Error::Truncated)?
+                }
                 None => return Err(Error::Truncated),
             }
         }
     }
     if flg & 0x02 != 0 {
-        i += 2; // FHCRC - skipped, trailer CRC covers output
+        i = i.checked_add(2).filter(|&n| n <= data.len()).ok_or(Error::Truncated)?; // FHCRC - skipped, trailer CRC covers output
     }
     if i >= data.len() {
         return Err(Error::Truncated);
@@ -464,4 +473,18 @@ pub fn adler32(data: &[u8]) -> u32 {
         b = (b + a) % MOD;
     }
     (b << 16) | a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gzip_oversized_xlen_no_panic() {
+        // FLG=FEXTRA with xlen far beyond input: must be Truncated, not panic.
+        let mut bad = vec![0x1Fu8, 0x8B, 8, 0x04, 0, 0, 0, 0, 0, 0, 0xFF, 0x00];
+        bad.extend_from_slice(&[0u8; 6]);
+        let r = gzip_decode(&bad, 1024);
+        assert!(matches!(r, Err(Error::Truncated) | Err(Error::BadGzip)));
+    }
 }

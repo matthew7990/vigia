@@ -206,9 +206,14 @@ impl Url {
 
     /// "host" or "host:port" - for the Host header and SNI display.
     pub fn host_header(&self) -> String {
+        let bare = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
         match self.port {
-            Some(p) if Some(p) != default_port(&self.scheme) => format!("{}:{}", self.host, p),
-            _ => self.host.clone(),
+            Some(p) if Some(p) != default_port(&self.scheme) => format!("{bare}:{p}"),
+            _ => bare,
         }
     }
 
@@ -400,5 +405,13 @@ mod tests {
         let u = Url::parse("http://[::1]:8080/x").unwrap();
         assert_eq!(u.host, "::1");
         assert_eq!(u.port, Some(8080));
+    }
+
+    #[test]
+    fn host_header_brackets_ipv6() {
+        let u = Url::parse("http://[::1]:8080/x").unwrap();
+        assert_eq!(u.host_header(), "[::1]:8080");
+        let v = Url::parse("http://[::1]/x").unwrap();
+        assert_eq!(v.host_header(), "[::1]");
     }
 }

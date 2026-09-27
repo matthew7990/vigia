@@ -157,6 +157,12 @@ impl<C: Read> Metered<C> {
             0 => Ok(None),
             _ => {
                 self.n += 1;
+                if self.n > MAX_WIRE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "wire cap exceeded",
+                    ));
+                }
                 Ok(Some(b[0]))
             }
         }
@@ -194,13 +200,20 @@ fn run(
     headers: &[(String, String)],
     jar: &mut CookieJar,
 ) -> Result<Response, Error> {
+    reject_crlf(method)?;
+    for (k, v) in headers {
+        reject_crlf(k)?;
+        reject_crlf(v)?;
+    }
     let mut current = Url::parse(url)?;
+    check_scheme(&current)?;
+    let mut active: Vec<(String, String)> = headers.to_vec();
     let mut method = method;
     let mut body = body;
     let mut redirects = 0;
     let mut timings = Timings::default();
     loop {
-        let res = request(&current, jar, method, body, headers)?;
+        let res = request(&current, jar, method, body, &active)?;
         timings.connect += res.timings.connect;
         timings.tls += res.timings.tls;
         timings.ttfb += res.timings.ttfb;
@@ -216,7 +229,17 @@ fn run(
                 .find(|(k, _)| k == "location")
                 .map(|(_, v)| v.trim().to_string())
                 .ok_or(Error::Protocol("redirect without location"))?;
-            current = res.final_url.join(&loc)?;
+            let next = res.final_url.join(&loc).map_err(Error::Url)?;
+            check_scheme(&next)?;
+            if !same_origin(&res.final_url, &next) {
+                // Do not forward credentials cross-origin.
+                active.retain(|(k, _)| {
+                    !(k.eq_ignore_ascii_case("authorization")
+                        || k.eq_ignore_ascii_case("proxy-authorization")
+                        || k.eq_ignore_ascii_case("cookie"))
+                });
+            }
+            current = next;
             if matches!(status, 301..=303) && method != "GET" {
                 method = "GET";
                 body = None;
@@ -261,11 +284,12 @@ fn request(
     } else {
         format!("{host}:{port}")
     };
-    let tcp = TcpStream::connect(
-        addr.to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address for host"))?,
-    )?;
+    let addrs: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
+    let sock = addrs
+        .into_iter()
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address for host"))?;
+    let tcp = TcpStream::connect_timeout(&sock, Duration::from_secs(20))?;
     tcp.set_read_timeout(Some(Duration::from_secs(20)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(20)))?;
     tcp.set_nodelay(true)?;
@@ -377,6 +401,27 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, v)| v.as_str())
 }
 
+fn reject_crlf(s: &str) -> Result<(), Error> {
+    if s.bytes().any(|b| b == b'\r' || b == b'\n') {
+        return Err(Error::Protocol("invalid header value"));
+    }
+    Ok(())
+}
+
+fn check_scheme(url: &Url) -> Result<(), Error> {
+    if url.scheme != "http" && url.scheme != "https" {
+        return Err(Error::Protocol("unsupported redirect scheme"));
+    }
+    if url.host.is_empty() {
+        return Err(Error::Protocol("redirect without host"));
+    }
+    Ok(())
+}
+
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme == b.scheme && a.host == b.host && a.port_or_default() == b.port_or_default()
+}
+
 fn parse_status(line: &str) -> Result<u16, Error> {
     if !line.starts_with("HTTP/") {
         return Err(Error::Protocol("bad status line"));
@@ -471,4 +516,33 @@ fn read_to_end(m: &mut Metered<Conn>) -> Result<Vec<u8>, Error> {
         }
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_crlf_in_headers() {
+        assert!(reject_crlf("GET\r\nEvil:").is_err());
+        assert!(reject_crlf("v\r\nInject:").is_err());
+        assert!(reject_crlf("GET").is_ok());
+    }
+
+    #[test]
+    fn rejects_non_http_scheme() {
+        let u = Url::parse("ftp://a.com/x").unwrap();
+        assert!(check_scheme(&u).is_err());
+        let v = Url::parse("https://a.com/").unwrap();
+        assert!(check_scheme(&v).is_ok());
+    }
+
+    #[test]
+    fn origin_split() {
+        let a = Url::parse("https://a.com/x").unwrap();
+        let b = Url::parse("https://b.com/y").unwrap();
+        let c = Url::parse("https://a.com/z").unwrap();
+        assert!(!same_origin(&a, &b));
+        assert!(same_origin(&a, &c));
+    }
 }

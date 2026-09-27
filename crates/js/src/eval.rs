@@ -12,8 +12,8 @@ use crate::ast::{
 };
 use crate::{
     bindings::{
-        WIN_EVENTS, n_dom_method, n_win_add_event_listener, n_win_dispatch_event,
-        n_win_remove_event_listener,
+        WIN_EVENTS, n_dom_method, n_get_computed_style, n_image_ctor, n_win_add_event_listener,
+        n_win_dispatch_event, n_win_remove_event_listener,
     },
     err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
     Protos, ThenHandler, Timer, TypedKind, Value,
@@ -1446,6 +1446,7 @@ impl Interp {
             ("HTMLButtonElement", "HTMLElement"),
             ("HTMLAnchorElement", "HTMLElement"),
             ("HTMLImageElement", "HTMLElement"),
+            ("HTMLCanvasElement", "HTMLElement"),
             ("HTMLIFrameElement", "HTMLElement"),
             ("SVGElement", "Element"),
         ];
@@ -1465,6 +1466,7 @@ impl Interp {
                 "HTMLButtonElement" => it.protos.dom_button = bag,
                 "HTMLAnchorElement" => it.protos.dom_anchor = bag,
                 "HTMLImageElement" => it.protos.dom_image = bag,
+                "HTMLCanvasElement" => it.protos.dom_canvas = bag,
                 "HTMLIFrameElement" => it.protos.dom_iframe = bag,
                 "SVGElement" => it.protos.dom_svg = bag,
                 _ => {}
@@ -1484,6 +1486,7 @@ impl Interp {
             "HTMLButtonElement" => it.protos.dom_button,
             "HTMLAnchorElement" => it.protos.dom_anchor,
             "HTMLImageElement" => it.protos.dom_image,
+            "HTMLCanvasElement" => it.protos.dom_canvas,
             "HTMLIFrameElement" => it.protos.dom_iframe,
             "SVGElement" => it.protos.dom_svg,
             _ => u32::MAX,
@@ -1568,6 +1571,7 @@ impl Interp {
                 ][..],
             ),
             ("HTMLFormElement", &["submit"][..]),
+            ("HTMLCanvasElement", &["getContext", "toDataURL"][..]),
         ] {
             let bag = get_bag(self, bag_name);
             if bag == u32::MAX {
@@ -1796,6 +1800,8 @@ impl Interp {
         self.ctor("IDBCursor", n_dom_illegal, pr.object, &[]);
         self.ctor("IDBTransaction", n_dom_illegal, pr.object, &[]);
         self.ctor("IDBKeyRange", n_dom_illegal, pr.object, &[]);
+        // `new Image()` builds a detached <img> (needs a document).
+        self.ctor("Image", n_image_ctor, pr.dom_image, &[]);
         self.ctor("Function", n_function_ctor, pr.function_, &[]);
         // Numeric statics the bundle reads (BYTES_PER_ELEMENT per view).
         for (name, bpe) in [
@@ -1863,6 +1869,7 @@ impl Interp {
             ("removeEventListener", n_win_remove_event_listener),
             ("dispatchEvent", n_win_dispatch_event),
             ("matchMedia", n_match_media),
+            ("getComputedStyle", n_get_computed_style),
         ] {
             if let Ok(id) = self.heap.alloc_obj(nat(n, f)) {
                 self.env_declare(0, n, Value::Obj(id));
@@ -3865,6 +3872,15 @@ impl Interp {
                 // DOM node methods dispatch on the node, not the property map
                 if let Some(n) = self.as_node(recv) {
                     return self.call_dom(n, name, env, arg_es);
+                }
+                // Style declaration methods (setProperty & co live on no
+                // property map either): resolve through the live style.
+                if let Some(n) = self.as_style(recv) {
+                    let args = self.eval_args(env, arg_es)?;
+                    let f = self.style_get(n, name)?;
+                    return self
+                        .call_value(f, recv, &args, Some(name.as_str()))
+                        .map_err(|e| self.chain_msg(e));
                 }
                 // Window event methods (addEventListener & co live on no
                 // node): route to the sentinel registry, else fall through

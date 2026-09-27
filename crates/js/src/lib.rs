@@ -397,6 +397,7 @@ pub struct Protos {
     pub dom_button: u32,
     pub dom_anchor: u32,
     pub dom_image: u32,
+    pub dom_canvas: u32,
     pub dom_iframe: u32,
     pub dom_svg: u32,
 }
@@ -446,6 +447,7 @@ impl Protos {
             dom_button: u32::MAX,
             dom_anchor: u32::MAX,
             dom_image: u32::MAX,
+            dom_canvas: u32::MAX,
             dom_iframe: u32::MAX,
             dom_svg: u32::MAX,
         }

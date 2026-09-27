@@ -358,6 +358,7 @@ impl Interp {
             self.protos.dom_button,
             self.protos.dom_anchor,
             self.protos.dom_image,
+            self.protos.dom_canvas,
             self.protos.dom_iframe,
             self.protos.dom_svg,
         ] {

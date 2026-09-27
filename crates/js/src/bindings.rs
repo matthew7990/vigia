@@ -529,8 +529,65 @@ impl Interp {
             .join("; ")
     }
 
-    /// Live read of one style property (or cssText/length).
+    /// camelCase -> kebab-case ("backgroundColor" -> "background-color").
+    /// Single words and already-kebab names pass through; CSS variables
+    /// (--*) keep their case.
+    fn style_key(key: &str) -> String {
+        if key.starts_with("--") || (!key.contains(char::is_uppercase)) {
+            return key.to_lowercase();
+        }
+        let mut out = String::with_capacity(key.len() + 4);
+        for c in key.chars() {
+            if c.is_ascii_uppercase() {
+                out.push('-');
+                out.push(c.to_ascii_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// kebab-case -> camelCase ("font-size" -> "fontSize"; "--*" untouched).
+    fn style_camel(key: &str) -> String {
+        if key.starts_with("--") || !key.contains('-') {
+            return key.to_string();
+        }
+        let mut out = String::with_capacity(key.len());
+        let mut up = false;
+        for c in key.chars() {
+            if c == '-' {
+                up = true;
+            } else if up {
+                out.extend(c.to_uppercase());
+                up = false;
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Live read of one style property (or cssText/length). Property
+    /// methods (setProperty/getPropertyValue/removeProperty) arrive as
+    /// natives carrying the node id, like the IDB denial timer does.
     pub(crate) fn style_get(&mut self, node: NodeId, key: &str) -> Result<Value, JsError> {
+        for (n, f) in [
+            ("setProperty", n_style_set_prop as NativeFn),
+            ("getPropertyValue", n_style_get_prop),
+            ("removeProperty", n_style_remove_prop),
+        ] {
+            if key == n {
+                let m = self.heap.alloc_obj(nat(n, f))?;
+                let _ = set_prop(
+                    &mut self.heap,
+                    Value::Obj(m),
+                    "__node",
+                    Value::Num(node as f64),
+                );
+                return Ok(Value::Obj(m));
+            }
+        }
         let attr = self
             .dom_ref()?
             .attr(node, "style")
@@ -543,7 +600,7 @@ impl Interp {
         if key == "length" {
             return Ok(Value::Num(decls.len() as f64));
         }
-        let key = key.to_lowercase();
+        let key = Self::style_key(key);
         match decls.iter().find(|(k, _)| *k == key) {
             Some((_, v)) => self.str_val(v.clone()),
             None => Ok(Value::Undef),
@@ -566,7 +623,7 @@ impl Interp {
             .unwrap_or("")
             .to_string();
         let mut decls = Self::parse_style(&attr);
-        let key = key.to_lowercase();
+        let key = Self::style_key(key);
         let t = to_str(&self.heap, val);
         if t.trim().is_empty() {
             decls.retain(|(k, _)| *k != key);
@@ -603,6 +660,7 @@ impl Interp {
                         "button" => po(pr.dom_button),
                         "a" => po(pr.dom_anchor),
                         "img" => po(pr.dom_image),
+                        "canvas" => po(pr.dom_canvas),
                         "iframe" => po(pr.dom_iframe),
                         "svg" => po(pr.dom_svg),
                         _ => po(pr.dom_htmlelement),
@@ -1413,6 +1471,27 @@ impl Interp {
                 "className" => self.attr_val(id, "class"),
                 "value" => self.attr_val(id, "value"),
                 "href" => self.attr_val(id, "href"),
+                "width" | "height" => {
+                    // Canvas defaults (300x150 like V8); other tags only
+                    // reflect an explicit attribute.
+                    let (tag, a) = {
+                        let d = self.dom_ref()?;
+                        (
+                            d.tag_name(id).unwrap_or("").to_string(),
+                            d.attr(id, key).unwrap_or("").to_string(),
+                        )
+                    };
+                    if !a.is_empty() {
+                        match a.parse::<f64>() {
+                            Ok(n) => Ok(Value::Num(n)),
+                            Err(_) => Ok(Value::Undef),
+                        }
+                    } else if tag == "canvas" {
+                        Ok(Value::Num(if key == "width" { 300.0 } else { 150.0 }))
+                    } else {
+                        Ok(Value::Undef)
+                    }
+                },
                 "style" => {
                     let s = self.heap.alloc_obj(Obj::Style { node: id })?;
                     Ok(Value::Obj(s))
@@ -1497,6 +1576,18 @@ impl Interp {
                 let name = if key == "className" { "class" } else { key };
                 let t = to_str(&self.heap, v);
                 self.dom_mut()?.set_attr(id, name, &t);
+            }
+            "width" | "height" => {
+                // Reflected dimension (canvas/img): stored as attribute.
+                let tag = self.dom_ref()?.tag_name(id).unwrap_or("").to_string();
+                if tag == "canvas" || tag == "img" {
+                    let n = to_num(&self.heap, v);
+                    if !n.is_nan() {
+                        let _ = self
+                            .dom_mut()?
+                            .set_attr(id, key, &format!("{}", n.max(0.0) as u32));
+                    }
+                }
             }
             "checked" | "disabled" => {
                 let on = truthy(&self.heap, v);
@@ -1838,6 +1929,27 @@ impl Interp {
                 self.record_submit(id)?;
                 Ok(Value::Undef)
             }
+            "getContext" => {
+                // Only <canvas> has it; anything else reads "not a
+                // function". "2d" (default) yields the stub context;
+                // webgl/others are null (no GPU backend here).
+                if self.dom_ref()?.tag_name(id) != Some("canvas") {
+                    return Err(err("getContext is not a function"));
+                }
+                let mode = to_str(&self.heap, arg(0)).to_ascii_lowercase();
+                if mode == "2d" {
+                    canvas_ctx2d(self, id)
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            "toDataURL" => {
+                if self.dom_ref()?.tag_name(id) != Some("canvas") {
+                    return Err(err("toDataURL is not a function"));
+                }
+                // No rasterizer behind the stub: the empty document.
+                self.str_val("data:,".into())
+            }
             "querySelector" => {
                 let hits = self.select(id, arg(0))?;
                 self.opt_node(hits.into_iter().next())
@@ -1937,6 +2049,262 @@ pub(crate) fn n_dom_method(it: &mut Interp, this: Value, args: &[Value]) -> Resu
         return Err(err("DOM method needs a node receiver"));
     };
     it.call_dom_vals(n, name, args)
+}
+
+// ---- canvas -------------------------------------------------------------
+
+/// 2d context for a canvas node: ordinary object (props like fillStyle
+/// are plain expandos) with the drawing methods main.js-class bundles
+/// call. Everything draws nowhere - the methods only must not throw,
+/// measureText reports zero width, pixel reads come back blank.
+fn canvas_ctx2d(it: &mut Interp, node: NodeId) -> Result<Value, JsError> {
+    let mut pairs: Vec<(String, Value)> = Vec::new();
+    for (n, f) in [
+        ("fillRect", n_ctx_noop as NativeFn),
+        ("clearRect", n_ctx_noop),
+        ("strokeRect", n_ctx_noop),
+        ("fillText", n_ctx_noop),
+        ("strokeText", n_ctx_noop),
+        ("drawImage", n_ctx_noop),
+        ("putImageData", n_ctx_noop),
+        ("beginPath", n_ctx_noop),
+        ("closePath", n_ctx_noop),
+        ("moveTo", n_ctx_noop),
+        ("lineTo", n_ctx_noop),
+        ("arc", n_ctx_noop),
+        ("rect", n_ctx_noop),
+        ("fill", n_ctx_noop),
+        ("stroke", n_ctx_noop),
+        ("clip", n_ctx_noop),
+        ("save", n_ctx_noop),
+        ("restore", n_ctx_noop),
+        ("translate", n_ctx_noop),
+        ("scale", n_ctx_noop),
+        ("rotate", n_ctx_noop),
+        ("setTransform", n_ctx_noop),
+        ("transform", n_ctx_noop),
+        ("measureText", n_ctx_measure),
+        ("getImageData", n_ctx_image_data),
+        ("createImageData", n_ctx_image_data),
+        ("createLinearGradient", n_ctx_gradient),
+        ("createRadialGradient", n_ctx_gradient),
+        ("createPattern", n_ctx_pattern),
+    ] {
+        pairs.push((n.into(), Value::Obj(it.heap.alloc_obj(nat(n, f))?)));
+    }
+    let o = it.obj_pairs(pairs)?;
+    // ctx.canvas backref (wraps the same node, identity preserved).
+    if let Ok(w) = it.dom_wrap(node) {
+        let _ = set_prop(&mut it.heap, Value::Obj(o), "canvas", w);
+    }
+    Ok(Value::Obj(o))
+}
+
+fn n_ctx_noop(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(Value::Undef)
+}
+
+/// measureText(): zero-width metrics (no font engine behind it).
+fn n_ctx_measure(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Obj(it.obj_pairs(vec![(
+        "width".into(),
+        Value::Num(0.0),
+    )])?))
+}
+
+/// getImageData/createImageData: blank {width,height,data:[]}.
+fn n_ctx_image_data(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let w = to_num(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    let h = to_num(&it.heap, args.get(1).copied().unwrap_or(Value::Undef));
+    let (w, h) = (
+        if w.is_nan() { 0.0 } else { w },
+        if h.is_nan() { 0.0 } else { h },
+    );
+    let data = Value::Obj(it.arr_obj(Vec::new())?);
+    Ok(Value::Obj(it.obj_pairs(vec![
+        ("width".into(), Value::Num(w)),
+        ("height".into(), Value::Num(h)),
+        ("data".into(), data),
+    ])?))
+}
+
+/// Gradient stub: only addColorStop, a no-op.
+fn n_ctx_gradient(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let stop = Value::Obj(it.heap.alloc_obj(nat("addColorStop", n_ctx_noop))?);
+    Ok(Value::Obj(it.obj_pairs(vec![("addColorStop".into(), stop)])?))
+}
+
+/// createPattern(): null (no rasterizer to source a pattern from).
+fn n_ctx_pattern(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(Value::Null)
+}
+
+// ---- Image --------------------------------------------------------------
+
+/// `new Image(w?, h?)`: detached <img> like browsers (width/height
+/// reflected when numeric). No document in bare runs - throw there.
+pub(crate) fn n_image_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = {
+        // dom_mut errors with no document installed.
+        let d = it.dom_mut().map_err(|_| err("Image needs a document"))?;
+        let root = d.root();
+        let n = d.element(root, "img", vec![]);
+        d.detach(n);
+        n
+    };
+    for (i, dim) in ["width", "height"].iter().enumerate() {
+        let v = to_num(&it.heap, args.get(i).copied().unwrap_or(Value::Undef));
+        if !v.is_nan() {
+            it.dom_mut()?.set_attr(n, dim, &format!("{}", v.max(0.0) as u32));
+        }
+    }
+    it.dom_wrap(n)
+}
+
+// ---- getComputedStyle ----------------------------------------------------
+
+/// window.getComputedStyle(el): snapshot object (not live). Inline
+/// declarations win under both kebab and camel keys; the props the
+/// collectors read (backgroundColor, font*, visibility, position,
+/// transitions, opacity) fall back to desktop defaults. No cascade
+/// runs here - documented gap. getPropertyValue returns "" when
+/// absent, like V8.
+pub(crate) fn n_get_computed_style(
+    it: &mut Interp,
+    _this: Value,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let el = args.first().copied().unwrap_or(Value::Undef);
+    let Some(n) = it.as_node(el) else {
+        return Err(err("getComputedStyle needs an element"));
+    };
+    let attr = it.dom_ref()?.attr(n, "style").unwrap_or("").to_string();
+    let decls = Interp::parse_style(&attr);
+    let clean = |mut v: String| {
+        // Computed values never carry the priority suffix.
+        if let Some(b) = v.to_ascii_lowercase().rfind("!important") {
+            v.truncate(b);
+        }
+        v.trim().to_string()
+    };
+    let mut resolved: Vec<(String, String)> = decls
+        .iter()
+        .map(|(k, v)| (k.clone(), clean(v.clone())))
+        .collect();
+    let defaults = [
+        ("background-color", "rgba(0, 0, 0, 0)"),
+        ("color", "rgb(0, 0, 0)"),
+        ("font-family", "Arial"),
+        ("font-size", "16px"),
+        ("font-weight", "400"),
+        ("visibility", "visible"),
+        ("position", "static"),
+        ("display", "block"),
+        ("opacity", "1"),
+        ("transition-duration", "0s"),
+        ("transition-delay", "0s"),
+    ];
+    // `font: 12px Arial` shorthand feeds font-family when no longhand.
+    let mut shorthand_font: Option<String> = None;
+    for (k, v) in &resolved {
+        if k == "font" {
+            if let Some(fam) = v.split_whitespace().last() {
+                shorthand_font = Some(fam.replace(['"', '\''], ""));
+            }
+        }
+    }
+    for (k, d) in defaults {
+        if !resolved.iter().any(|(kk, _)| kk == k) {
+            let v = if k == "font-family" {
+                shorthand_font.clone().unwrap_or_else(|| d.to_string())
+            } else {
+                d.to_string()
+            };
+            resolved.push((k.to_string(), v));
+        }
+    }
+    let mut pairs: Vec<(String, Value)> = Vec::with_capacity(resolved.len() * 2 + 2);
+    for (k, v) in &resolved {
+        let s = Value::Str(it.heap.alloc_str(v.clone())?);
+        pairs.push((k.clone(), s));
+        let c = Interp::style_camel(k);
+        if c != *k {
+            pairs.push((c, Value::Str(it.heap.alloc_str(v.clone())?)));
+        }
+    }
+    pairs.push(("length".into(), Value::Num(resolved.len() as f64)));
+    let gpv = Value::Obj(it.heap.alloc_obj(nat("getPropertyValue", n_computed_get_prop))?);
+    pairs.push(("getPropertyValue".into(), gpv));
+    Ok(Value::Obj(it.obj_pairs(pairs)?))
+}
+
+/// Computed getPropertyValue(name): resolved value or "" (never
+/// undefined, like V8). Custom properties (--*) read verbatim.
+fn n_computed_get_prop(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let raw = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    let key = if raw.starts_with("--") {
+        raw
+    } else {
+        Interp::style_key(&raw)
+    };
+    match get_prop(&it.heap, &it.protos, this, &key)? {
+        Value::Str(id) => Ok(Value::Str(id)),
+        Value::Num(n) => Ok(Value::Str(it.heap.alloc_str(n.to_string())?)),
+        _ => {
+            let e = it.heap.alloc_str(String::new())?;
+            Ok(Value::Str(e))
+        }
+    }
+}
+
+// ---- style property methods ----------------------------------------------
+
+fn style_native_node(it: &Interp) -> Option<NodeId> {
+    match get_prop(&it.heap, &it.protos, it.cur_native, "__node").ok()? {
+        Value::Num(n) => Some(n as NodeId),
+        _ => None,
+    }
+}
+
+/// style.setProperty(name, value): upsert; empty value removes.
+fn n_style_set_prop(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(n) = style_native_node(it) else {
+        return Err(err("setProperty needs a style"));
+    };
+    let name = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    let val = to_str(&it.heap, args.get(1).copied().unwrap_or(Value::Undef));
+    let slot = it.heap.alloc_str(val)?;
+    it.style_set(n, &name, Value::Str(slot))?;
+    Ok(Value::Undef)
+}
+
+/// style.getPropertyValue(name): value or "" (V8 parity).
+fn n_style_get_prop(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(n) = style_native_node(it) else {
+        return Err(err("getPropertyValue needs a style"));
+    };
+    let name = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    match it.style_get(n, &name)? {
+        Value::Undef => Ok(Value::Str(it.heap.alloc_str(String::new())?)),
+        v => Ok(v),
+    }
+}
+
+/// style.removeProperty(name): drop it, return the old value or "".
+fn n_style_remove_prop(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(n) = style_native_node(it) else {
+        return Err(err("removeProperty needs a style"));
+    };
+    let name = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    let old = it.style_get(n, &name)?;
+    let empty = it.heap.alloc_str(String::new())?;
+    it.style_set(n, &name, Value::Str(empty))?;
+    match old {
+        Value::Undef => Ok(Value::Str(it.heap.alloc_str(String::new())?)),
+        v => Ok(v),
+    }
 }
 
 /// sheet.insertRule(rule, index=0): store a {cssText} stub, return index.
@@ -2465,6 +2833,51 @@ mod tests {
         assert_eq!(ev(&mut it, "navigator.mimeTypes.length"), "2");
         assert_eq!(ev(&mut it, "navigator.mimeTypes[0].type"), "application/pdf");
         assert_eq!(ev(&mut it, "navigator.plugins.item(5)"), "null");
+    }
+
+    #[test]
+    fn canvas_and_computed() {
+        let mut it = interp(PAGE);
+        // Canvas iface + 2d stub (stormcaster monkey-patch signals read
+        // native fns; main.js drawing calls must not throw).
+        assert_eq!(ev(&mut it, "typeof HTMLCanvasElement"), "function");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c instanceof HTMLCanvasElement"), "true");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');typeof c.getContext"), "function");
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');var x=c.getContext('2d');x.fillStyle='red';x.fillRect(0,0,10,10);x.measureText('hi').width"),
+            "0"
+        );
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.getContext('webgl')"), "null");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.toDataURL()"), "data:,");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.width"), "300");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.width=100;c.width"), "100");
+        assert_eq!(ev(&mut it, "var d=document.createElement('div');try{d.getContext('2d')}catch(e){'throws'}"), "throws");
+        // Image ctor builds a detached img.
+        assert_eq!(ev(&mut it, "var i=new Image();i instanceof HTMLImageElement"), "true");
+        assert_eq!(ev(&mut it, "var i=new Image(16,32);i.width"), "16");
+        // getComputedStyle snapshot + style property methods.
+        assert_eq!(ev(&mut it, "var d=document.createElement('div');typeof getComputedStyle(d).length"), "number");
+        assert_eq!(ev(&mut it, "var d=document.createElement('div');getComputedStyle(d).visibility"), "visible");
+        assert_eq!(
+            ev(&mut it, "var d=document.createElement('div');d.style.cssText='background-color: red !important';getComputedStyle(d).backgroundColor"),
+            "red"
+        );
+        assert_eq!(
+            ev(&mut it, "var d=document.createElement('div');d.style.cssText='font: 12px Arial !important';getComputedStyle(d).fontFamily"),
+            "Arial"
+        );
+        assert_eq!(
+            ev(&mut it, "var d=document.createElement('div');getComputedStyle(d).getPropertyValue('--bs-position')"),
+            ""
+        );
+        assert_eq!(
+            ev(&mut it, "var d=document.createElement('div');d.style.setProperty('display','none');d.style.display"),
+            "none"
+        );
+        assert_eq!(
+            ev(&mut it, "var d=document.createElement('div');d.style.backgroundColor='blue';d.style.getPropertyValue('background-color')"),
+            "blue"
+        );
     }
 
     #[test]

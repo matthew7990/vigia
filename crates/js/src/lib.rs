@@ -73,6 +73,7 @@ mod eval;
 mod gc;
 mod lex;
 mod parse;
+pub mod regex;
 
 pub use ast::{Expr, FnDef, Stmt};
 pub use bindings::ScriptsOutcome;
@@ -186,6 +187,15 @@ pub enum Obj {
     },
     /// JS handle over a DOM node; valid only while Interp.dom is installed.
     Dom(NodeId),
+    /// Compiled regex: `pat`/`flags` are Str ids (GC roots), `last_index`
+    /// counts chars (not bytes). The compiled AST is immutable Rust data.
+    RegExp {
+        pat: u32,
+        flags: u32,
+        last_index: f64,
+        compiled: Rc<regex::Compiled>,
+        proto: Option<u32>,
+    },
     /// Promise cell; Promise.prototype is a virtual proto (proto_of).
     Promise(PromiseState),
     /// GC tombstone: a swept slot awaiting freelist reuse. Reads on a
@@ -254,6 +264,7 @@ pub struct Protos {
     pub date: u32,
     pub promise: u32,
     pub error: u32,
+    pub regexp: u32,
 }
 
 impl Protos {
@@ -267,6 +278,7 @@ impl Protos {
             date: u32::MAX,
             promise: u32::MAX,
             error: u32::MAX,
+            regexp: u32::MAX,
         }
     }
 }

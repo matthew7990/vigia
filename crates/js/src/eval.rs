@@ -105,6 +105,9 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
             Obj::Native { name, .. } => format!("function {name}() {{ [native code] }}"),
             Obj::Dom(_) => "[object Node]".into(),
             Obj::Promise(_) => "[object Promise]".into(),
+            Obj::RegExp { pat, flags, .. } => {
+                format!("/{}/{}", h.get_str(*pat), h.get_str(*flags))
+            }
             Obj::Freed => "[object Object]".into(),
         },
     }
@@ -198,6 +201,22 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
                 .and_then(|i| items.get(i))
                 .copied()
         }
+        Obj::RegExp {
+            pat,
+            flags,
+            last_index,
+            compiled,
+            ..
+        } => match key {
+            "source" => Some(Value::Str(*pat)),
+            "flags" => Some(Value::Str(*flags)),
+            "lastIndex" => Some(Value::Num(*last_index)),
+            "global" => Some(Value::Bool(compiled.flags.global)),
+            "ignoreCase" => Some(Value::Bool(compiled.flags.ignore_case)),
+            "multiline" => Some(Value::Bool(compiled.flags.multiline)),
+            "dotAll" => Some(Value::Bool(compiled.flags.dot_all)),
+            _ => None,
+        },
         Obj::Dom(_) | Obj::Promise(_) | Obj::Freed => None,
     }
 }
@@ -209,6 +228,7 @@ fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
         Obj::Ordinary { proto, .. } | Obj::Arr { proto, .. } | Obj::Func { proto, .. } => *proto,
         Obj::Native { .. } => po(protos.function_),
         Obj::Promise(_) => po(protos.promise),
+        Obj::RegExp { proto, .. } => *proto,
         Obj::Dom(_) | Obj::Freed => None,
     }
 }
@@ -270,6 +290,8 @@ pub(crate) fn get_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> Result
 
 /// Writes to own pairs only (Ordinary/Func/Native), like standard JS.
 pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<(), JsError> {
+    // Computed before the mutable borrow below.
+    let last_num = to_num(&*h, val);
     match v {
         Value::Obj(id) => match h.obj_mut(id) {
             Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
@@ -277,6 +299,10 @@ pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<
                     Some(slot) => slot.1 = val,
                     None => pairs.push((key.to_string(), val)),
                 }
+                Ok(())
+            }
+            Obj::RegExp { last_index, .. } if key == "lastIndex" => {
+                *last_index = last_num;
                 Ok(())
             }
             _ => Err(err("cannot set property on this object")),
@@ -497,6 +523,8 @@ impl Interp {
             ("charAt", n_str_char_at),
             ("charCodeAt", n_str_char_code_at),
             ("replace", n_str_replace),
+            ("match", n_str_match),
+            ("search", n_str_search),
             ("concat", n_str_concat),
             ("repeat", n_str_repeat),
             ("padStart", n_str_pad_start),
@@ -513,6 +541,7 @@ impl Interp {
             ("toISOString", n_date_iso),
             ("valueOf", n_date_get_time),
         ]);
+        self.protos.regexp = self.proto_bag(&[("test", n_regexp_test), ("exec", n_regexp_exec)]);
         // Error.prototype: `name` as a data prop + a real toString method
         let mut eps: Vec<(String, Value)> = Vec::new();
         if let Ok(nm) = self.heap.intern_str("Error") {
@@ -554,6 +583,7 @@ impl Interp {
         self.ctor("Number", n_number_cast, pr.number, &[]);
         self.ctor("Boolean", n_boolean_cast, u32::MAX, &[]);
         self.ctor("Date", n_date, pr.date, &[("now", n_date_now)]);
+        self.ctor("RegExp", n_regexp_ctor, pr.regexp, &[]);
         self.ctor("Error", n_error, pr.error, &[]);
         self.ctor(
             "Promise",
@@ -1003,6 +1033,7 @@ impl Interp {
                     None => get_prop(&self.heap, &self.protos, v, name),
                 }
             }
+            Expr::Regex { pat, flags } => make_regexp(self, pat, flags),
             Expr::OptChain(b, ops) => self.opt_chain(env, b, ops),
             Expr::Index(o, ix) => {
                 let v = self.expr(env, o)?;
@@ -1817,6 +1848,7 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
             Obj::Func { .. } | Obj::Native { .. } | Obj::Dom(_) | Obj::Promise(_) | Obj::Freed => {
                 Json::Null
             }
+            Obj::RegExp { .. } => Json::Obj(vec![]),
         },
     })
 }
@@ -1879,6 +1911,7 @@ fn n_obj_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
             Obj::Func { .. } | Obj::Native { .. } => "[object Function]",
             Obj::Dom(_) => "[object Node]",
             Obj::Promise(_) => "[object Promise]",
+            Obj::RegExp { .. } => "[object RegExp]",
             Obj::Ordinary { .. } | Obj::Freed => "[object Object]",
         },
     };
@@ -1908,7 +1941,7 @@ fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
                 .enumerate()
                 .map(|(i, x)| (i.to_string(), *x))
                 .collect(),
-            Obj::Dom(_) | Obj::Promise(_) | Obj::Freed => Vec::new(),
+            Obj::Dom(_) | Obj::Promise(_) | Obj::RegExp { .. } | Obj::Freed => Vec::new(),
         },
         _ => Vec::new(),
     }
@@ -2493,6 +2526,7 @@ fn n_str_split(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Js
     let s = this_str(it, this);
     let parts: Vec<String> = match arg(args, 0) {
         Value::Undef => vec![s],
+        sep if is_regexp(it, sep) => split_regex(it, &s, sep)?,
         sep => {
             let sep = to_str(&it.heap, sep);
             if sep.is_empty() {
@@ -2648,6 +2682,9 @@ fn n_str_char_code_at(it: &mut Interp, this: Value, args: &[Value]) -> Result<Va
 /// no $-patterns (no regex in this engine).
 fn n_str_replace(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
     let s = this_str(it, this);
+    if let Some(src) = regexp_arg(it, arg(args, 0))? {
+        return replace_regex(it, &s, &src, arg(args, 1));
+    }
     let needle = to_str(&it.heap, arg(args, 0));
     let repl = to_str(&it.heap, arg(args, 1));
     Ok(Value::Str(
@@ -2792,6 +2829,456 @@ fn n_date_iso(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Js
     );
     let t = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms3:03}Z");
     Ok(Value::Str(it.heap.alloc_str(t)?))
+}
+
+// -- RegExp --------------------------------------------------------------------------
+
+/// Fuel per regex exec: bounds catastrophic backtracking into an error.
+const REGEX_FUEL: u64 = 500_000;
+
+/// Canonical flag order for the stored `flags` string.
+fn canon_flags(fl: &crate::regex::Flags) -> String {
+    let mut s = String::new();
+    if fl.global {
+        s.push('g');
+    }
+    if fl.ignore_case {
+        s.push('i');
+    }
+    if fl.multiline {
+        s.push('m');
+    }
+    if fl.dot_all {
+        s.push('s');
+    }
+    s
+}
+
+fn make_regexp(it: &mut Interp, source: &str, flags: &str) -> Result<Value, JsError> {
+    let compiled =
+        crate::regex::compile(source, flags).map_err(|m| err(format!("invalid regex: {m}")))?;
+    let canon = canon_flags(&compiled.flags);
+    let pat = it.heap.intern_str(source)?;
+    let fl = it.heap.intern_str(&canon)?;
+    let proto = po(it.protos.regexp);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::RegExp {
+        pat,
+        flags: fl,
+        last_index: 0.0,
+        compiled: std::rc::Rc::new(compiled),
+        proto,
+    })?))
+}
+
+/// Byte offset of char index `ci` in `s` (clamped).
+fn char_to_byte(s: &str, ci: usize) -> usize {
+    s.char_indices().nth(ci).map(|(i, _)| i).unwrap_or(s.len())
+}
+
+fn set_last_index(it: &mut Interp, id: u32, v: f64) {
+    if let Obj::RegExp { last_index, .. } = it.heap.obj_mut(id) {
+        *last_index = v;
+    }
+}
+
+/// Core exec: honors global/lastIndex, updates it, maps fuel-out to error.
+fn regexp_exec_inner(
+    it: &mut Interp,
+    id: u32,
+    text: &str,
+) -> Result<Option<crate::regex::Match>, JsError> {
+    let (compiled, global, last) = match it.heap.obj(id) {
+        Obj::RegExp {
+            compiled,
+            last_index,
+            ..
+        } => (compiled.clone(), compiled.flags.global, *last_index),
+        _ => return Err(err("not a regexp")),
+    };
+    let chars = text.chars().count();
+    let mut from_char = if global {
+        (last as usize).min(chars)
+    } else {
+        0
+    };
+    if last.is_nan() || last < 0.0 {
+        from_char = 0;
+    }
+    let from_byte = char_to_byte(text, from_char);
+    match crate::regex::exec_from(&compiled, text, from_byte, REGEX_FUEL) {
+        Err(_) => Err(err("regex fuel exhausted")),
+        Ok(None) => {
+            if global {
+                set_last_index(it, id, 0.0);
+            }
+            Ok(None)
+        }
+        Ok(Some(m)) => {
+            if global {
+                let end_chars = text[..m.end].chars().count();
+                // Empty match must still advance (spec AdvanceStringIndex).
+                let next = if m.end == from_byte {
+                    (end_chars + 1).min(chars)
+                } else {
+                    end_chars
+                };
+                set_last_index(it, id, next as f64);
+            }
+            Ok(Some(m))
+        }
+    }
+}
+
+/// [full, g1, ...] with Undef for unmatched groups.
+fn match_to_array(it: &mut Interp, text: &str, m: &crate::regex::Match) -> Result<Value, JsError> {
+    let mut vals = Vec::with_capacity(m.groups.len() + 1);
+    vals.push(Value::Str(
+        it.heap.alloc_str(text[m.start..m.end].to_string())?,
+    ));
+    for g in &m.groups {
+        match g {
+            Some((a, b)) => vals.push(Value::Str(it.heap.alloc_str(text[*a..*b].to_string())?)),
+            None => vals.push(Value::Undef),
+        }
+    }
+    Ok(Value::Obj(it.arr_obj(vals)?))
+}
+
+/// RegExp(pat, flags): called or `new`ed alike (ctors allocate their own).
+fn n_regexp_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let has_flags = !matches!(arg(args, 1), Value::Undef);
+    if let Value::Obj(id) = arg(args, 0) {
+        if let Obj::RegExp { pat, flags, .. } = it.heap.obj(id) {
+            if has_flags {
+                return Err(err("cannot supply flags when constructing from RegExp"));
+            }
+            let (source, fl) = (
+                it.heap.get_str(*pat).to_string(),
+                it.heap.get_str(*flags).to_string(),
+            );
+            return make_regexp(it, &source, &fl);
+        }
+    }
+    let source = match arg(args, 0) {
+        Value::Undef => String::new(),
+        v => to_str(&it.heap, v),
+    };
+    let flags = match arg(args, 1) {
+        Value::Undef => String::new(),
+        v => to_str(&it.heap, v),
+    };
+    make_regexp(it, &source, &flags)
+}
+
+fn n_regexp_exec(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Value::Obj(id) = this else {
+        return Err(err("exec on a non-RegExp"));
+    };
+    if !matches!(it.heap.obj(id), Obj::RegExp { .. }) {
+        return Err(err("exec on a non-RegExp"));
+    }
+    let text = to_str(&it.heap, arg(args, 0));
+    match regexp_exec_inner(it, id, &text)? {
+        None => Ok(Value::Null),
+        Some(m) => match_to_array(it, &text, &m),
+    }
+}
+
+fn n_regexp_test(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Value::Obj(id) = this else {
+        return Err(err("test on a non-RegExp"));
+    };
+    if !matches!(it.heap.obj(id), Obj::RegExp { .. }) {
+        return Err(err("test on a non-RegExp"));
+    }
+    let text = to_str(&it.heap, arg(args, 0));
+    Ok(Value::Bool(regexp_exec_inner(it, id, &text)?.is_some()))
+}
+
+fn is_regexp(it: &Interp, v: Value) -> bool {
+    matches!(v, Value::Obj(id) if matches!(it.heap.obj(id), Obj::RegExp { .. }))
+}
+
+/// Pattern source for a String-method argument: a RegExp object, or a
+/// freshly compiled pattern from any other value (Undef means absent).
+enum PatSrc {
+    Obj(u32),
+    Fresh(crate::regex::Compiled),
+}
+
+fn regexp_arg(it: &mut Interp, v: Value) -> Result<Option<PatSrc>, JsError> {
+    match v {
+        Value::Undef => Ok(None),
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::RegExp { .. }) => {
+            Ok(Some(PatSrc::Obj(id)))
+        }
+        other => {
+            let pat = to_str(&it.heap, other);
+            let c =
+                crate::regex::compile(&pat, "").map_err(|m| err(format!("invalid regex: {m}")))?;
+            Ok(Some(PatSrc::Fresh(c)))
+        }
+    }
+}
+
+fn compiled_of(it: &Interp, src: &PatSrc) -> std::rc::Rc<crate::regex::Compiled> {
+    match src {
+        PatSrc::Obj(id) => match it.heap.obj(*id) {
+            Obj::RegExp { compiled, .. } => compiled.clone(),
+            _ => unreachable!("checked by caller"),
+        },
+        PatSrc::Fresh(c) => std::rc::Rc::new(c.clone()),
+    }
+}
+
+/// Byte offset one char past `byte_pos` (clamped to the end).
+fn advance_char(text: &str, byte_pos: usize) -> usize {
+    let chars = text[..byte_pos.min(text.len())].chars().count();
+    char_to_byte(text, chars + 1)
+}
+
+/// All matches from `from`, advancing past empty ones. Caps total matches.
+fn collect_matches(
+    rc: &std::rc::Rc<crate::regex::Compiled>,
+    text: &str,
+    from: usize,
+) -> Result<Vec<crate::regex::Match>, JsError> {
+    let mut out = Vec::new();
+    let mut p = from.min(text.len());
+    loop {
+        if p > text.len() {
+            break;
+        }
+        match crate::regex::exec_from(rc, text, p, REGEX_FUEL) {
+            Err(_) => return Err(err("regex fuel exhausted")),
+            Ok(None) => break,
+            Ok(Some(m)) => {
+                let empty = m.start == m.end;
+                let end = m.end;
+                out.push(m);
+                if out.len() > text.len() + 2 {
+                    return Err(err("too many regex matches"));
+                }
+                p = if empty { advance_char(text, end) } else { end };
+                if empty && p > text.len() {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn n_str_match(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    let Some(src) = regexp_arg(it, arg(args, 0))? else {
+        // match() with no arg matches the empty pattern once.
+        let empty = Value::Str(it.heap.alloc_str(String::new())?);
+        return Ok(Value::Obj(it.arr_obj(vec![empty])?));
+    };
+    let rc = compiled_of(it, &src);
+    if rc.flags.global {
+        let mut vals = Vec::new();
+        for m in collect_matches(&rc, &s, 0)? {
+            vals.push(Value::Str(
+                it.heap.alloc_str(s[m.start..m.end].to_string())?,
+            ));
+        }
+        if vals.is_empty() {
+            return Ok(Value::Null);
+        }
+        return Ok(Value::Obj(it.arr_obj(vals)?));
+    }
+    match crate::regex::exec_from(&rc, &s, 0, REGEX_FUEL) {
+        Err(_) => Err(err("regex fuel exhausted")),
+        Ok(None) => Ok(Value::Null),
+        Ok(Some(m)) => match_to_array(it, &s, &m),
+    }
+}
+
+fn n_str_search(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = this_str(it, this);
+    // search() with no arg searches the empty pattern (index 0).
+    let src = match regexp_arg(it, arg(args, 0))? {
+        Some(src) => src,
+        None => PatSrc::Fresh(crate::regex::compile("", "").unwrap()),
+    };
+    let rc = compiled_of(it, &src);
+    match crate::regex::exec_from(&rc, &s, 0, REGEX_FUEL) {
+        Err(_) => Err(err("regex fuel exhausted")),
+        Ok(None) => Ok(Value::Num(-1.0)),
+        Ok(Some(m)) => Ok(Value::Num(s[..m.start].chars().count() as f64)),
+    }
+}
+
+/// Split on a RegExp: segments plus captured groups (Undef when a group
+/// did not participate). Empty input matches nothing unless the pattern
+/// matches empty at 0, in which case the result is empty.
+fn split_regex(it: &mut Interp, s: &str, sep: Value) -> Result<Vec<String>, JsError> {
+    let Value::Obj(id) = sep else {
+        return Err(err("split on a non-RegExp"));
+    };
+    let rc = match it.heap.obj(id) {
+        Obj::RegExp { compiled, .. } => compiled.clone(),
+        _ => return Err(err("split on a non-RegExp")),
+    };
+    if s.is_empty() {
+        match crate::regex::exec_from(&rc, s, 0, REGEX_FUEL) {
+            Err(_) => return Err(err("regex fuel exhausted")),
+            Ok(None) => return Ok(vec![String::new()]),
+            Ok(_) => return Ok(vec![]),
+        }
+    }
+    // Markers keep group holes: Some(text) or None (group absent).
+    let mut parts: Vec<Option<String>> = Vec::new();
+    let mut q = 0usize;
+    let mut p = 0usize;
+    let mut guard = 0usize;
+    while p <= s.len() {
+        guard += 1;
+        if guard > s.len() * 2 + 4 {
+            return Err(err("too many regex matches"));
+        }
+        let m = match crate::regex::exec_from(&rc, s, p, REGEX_FUEL) {
+            Err(_) => return Err(err("regex fuel exhausted")),
+            Ok(m) => m,
+        };
+        let Some(m) = m else {
+            break;
+        };
+        if m.start == m.end {
+            // Empty match: advance, no segment.
+            p = advance_char(s, p);
+            continue;
+        }
+        parts.push(Some(s[q..m.start].to_string()));
+        for g in &m.groups {
+            parts.push(g.map(|(a, b)| s[a..b].to_string()));
+        }
+        q = m.end;
+        p = m.end;
+    }
+    parts.push(Some(s[q..].to_string()));
+    // The public split() truncates by limit; group holes become NaN-like
+    // Undef there - encode them via a sentinel the caller expands. To
+    // keep split()'s Vec<String> shape, join holes as empty here and let
+    // match/replace paths (which keep Values) carry Undef instead. Split
+    // holes are an accepted deviation: JS puts `undefined` in the array.
+    Ok(parts.into_iter().map(|p| p.unwrap_or_default()).collect())
+}
+
+/// Expand `$`-patterns in a replacement string: $$, $&, $`, $', $n.
+fn expand_repl(
+    tpl: &str,
+    text: &str,
+    full_start: usize,
+    full_end: usize,
+    groups: &[Option<(usize, usize)>],
+) -> String {
+    let mut out = String::new();
+    let b = tpl.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] != b'$' || i + 1 >= b.len() {
+            out.push(b[i] as char);
+            i += 1;
+            continue;
+        }
+        match b[i + 1] {
+            b'$' => {
+                out.push('$');
+                i += 2;
+            }
+            b'&' => {
+                out.push_str(&text[full_start..full_end]);
+                i += 2;
+            }
+            b'`' => {
+                out.push_str(&text[..full_start]);
+                i += 2;
+            }
+            b'\'' => {
+                out.push_str(&text[full_end..]);
+                i += 2;
+            }
+            d if d.is_ascii_digit() => {
+                let mut n = (d - b'0') as usize;
+                let mut w = 1;
+                if i + 2 < b.len() && b[i + 2].is_ascii_digit() {
+                    let n2 = n * 10 + ((b[i + 2] - b'0') as usize);
+                    if n2 <= groups.len() && n2 > 0 {
+                        n = n2;
+                        w = 2;
+                    }
+                }
+                if n >= 1 && n <= groups.len() {
+                    if let Some((a, e)) = groups[n - 1] {
+                        out.push_str(&text[a..e]);
+                    }
+                } else {
+                    out.push('$');
+                    out.push_str(&tpl[i + 1..i + 1 + w]);
+                }
+                i += 1 + w;
+            }
+            _ => {
+                out.push('$');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn replace_regex(it: &mut Interp, s: &str, src: &PatSrc, repl: Value) -> Result<Value, JsError> {
+    let rc = compiled_of(it, src);
+    let matches = if rc.flags.global {
+        collect_matches(&rc, s, 0)?
+    } else {
+        match crate::regex::exec_from(&rc, s, 0, REGEX_FUEL) {
+            Err(_) => return Err(err("regex fuel exhausted")),
+            Ok(None) => return Ok(Value::Str(it.heap.alloc_str(s.to_string())?)),
+            Ok(Some(m)) => vec![m],
+        }
+    };
+    if matches.is_empty() {
+        return Ok(Value::Str(it.heap.alloc_str(s.to_string())?));
+    }
+    let is_fn = matches!(
+        repl,
+        Value::Obj(id)
+            if matches!(it.heap.obj(id), Obj::Func { .. } | Obj::Native { .. })
+    );
+    let mut out = String::new();
+    let mut last = 0usize;
+    for m in &matches {
+        out.push_str(&s[last..m.start]);
+        if is_fn {
+            let mut fargs = Vec::with_capacity(m.groups.len() + 3);
+            fargs.push(Value::Str(
+                it.heap.alloc_str(s[m.start..m.end].to_string())?,
+            ));
+            for g in &m.groups {
+                match g {
+                    Some((a, b)) => {
+                        fargs.push(Value::Str(it.heap.alloc_str(s[*a..*b].to_string())?))
+                    }
+                    None => fargs.push(Value::Undef),
+                }
+            }
+            // Offset counts chars (UTF-16 units in real JS).
+            fargs.push(Value::Num(s[..m.start].chars().count() as f64));
+            fargs.push(Value::Str(it.heap.alloc_str(s.to_string())?));
+            let r = it.call_value(repl, Value::Undef, &fargs, None)?;
+            out.push_str(&to_str(&it.heap, r));
+        } else {
+            let tpl = to_str(&it.heap, repl);
+            out.push_str(&expand_repl(&tpl, s, m.start, m.end, &m.groups));
+        }
+        last = m.end;
+    }
+    out.push_str(&s[last..]);
+    Ok(Value::Str(it.heap.alloc_str(out)?))
 }
 
 // -- Error ---------------------------------------------------------------------------
@@ -3648,6 +4135,28 @@ mod tests {
 
     fn errmsg(src: &str) -> String {
         ev(src).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn regexps() {
+        assert_eq!(disp("var r=/ab+c/gi;r.source"), "ab+c");
+        assert_eq!(disp("var r=/ab+c/gi;r.flags"), "gi");
+        assert_eq!(boolean("var r=/ab+c/gi;r.global"), true);
+        assert_eq!(boolean("/a+/.test('baa')"), true);
+        assert_eq!(boolean("/^b/m.test('a\\nb')"), true);
+        assert_eq!(disp("'a<b@c>d'.match(/<([^>]+@[^>]+)>/)[1]"), "b@c");
+        assert_eq!(
+            out("console.log('a;b,c'.split(/[,;]/))"),
+            "[\"a\",\"b\",\"c\"]\n"
+        );
+        assert_eq!(disp("'a-b-c'.replace(/-/g,'+')"), "a+b+c");
+        assert_eq!(disp("'abc123'.replace(/(\\d+)/,'[$1]')"), "abc[123]");
+        assert_eq!(num("'xx'.search(/x/)"), 0.0);
+        assert_eq!(num("'xx'.search(/y/)"), -1.0);
+        assert_eq!(num("6/2"), 3.0);
+        assert_eq!(disp("var r=/a/g;r.test('a');r.lastIndex"), "1");
+        assert!(errmsg("var r=/a{2,1}/").contains("invalid regex"));
+        assert!(errmsg("new RegExp('(')").contains("invalid regex"));
     }
 
     #[test]

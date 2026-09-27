@@ -23,6 +23,11 @@ pub enum Expr {
     Call(Box<Expr>, Vec<Expr>),
     Member(Box<Expr>, String),
     Index(Box<Expr>, Box<Expr>),
+    /// Regex literal source + flags (validated at parse time).
+    Regex {
+        pat: String,
+        flags: String,
+    },
     /// Optional chain: base + steps. Each step carries its own `?.` flag.
     /// `a?.b.c(d)` is Chain(a, [Member(b,true), Member(c,false), Call(d,false)]).
     OptChain(Box<Expr>, Vec<OptOp>),

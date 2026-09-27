@@ -808,6 +808,11 @@ impl P {
             Tok::Kw("false") => Ok(Expr::Bool(false)),
             Tok::Kw("null") => Ok(Expr::Null),
             Tok::Kw("undefined") => Ok(Expr::Undef),
+            Tok::Regex { pat, flags } => {
+                crate::regex::compile(&pat, &flags)
+                    .map_err(|m| err(format!("invalid regex: {m}")))?;
+                Ok(Expr::Regex { pat, flags })
+            }
             Tok::Kw("function") => {
                 let name = if matches!(self.peek(), Tok::Ident(_)) {
                     Some(self.ident()?)

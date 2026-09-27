@@ -11,6 +11,7 @@ pub enum Tok {
     Ident(String),
     Kw(&'static str),
     P(&'static str),
+    Regex { pat: String, flags: String },
     Eof,
 }
 
@@ -104,6 +105,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, JsError> {
             b'.' if b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => num(b, &mut i)?,
             b'"' | b'\'' => string(b, &mut i)?,
             c if is_ident_start(c) => word(src, b, &mut i),
+            b'/' if !matches!(b.get(i + 1), Some(b'/') | Some(b'*')) && regex_allowed(&out) => {
+                regex(src, &mut i)?
+            }
             b'?' if b.get(i + 1) == Some(&b'?') => {
                 i += 2;
                 Tok::P("??")
@@ -298,6 +302,88 @@ fn word(src: &str, b: &[u8], i: &mut usize) -> Tok {
     }
 }
 
+/// `/` opens a regex when an operand is expected: start of input, or the
+/// previous token is not a value-end (`)`, `]`, number, string, name) and
+/// not a keyword that ends an expression.
+fn regex_allowed(out: &[Token]) -> bool {
+    let Some(prev) = out.last() else {
+        return true;
+    };
+    match &prev.t {
+        Tok::P(p) => !matches!(*p, ")" | "]"),
+        Tok::Kw(k) => matches!(
+            *k,
+            "return"
+                | "typeof"
+                | "new"
+                | "in"
+                | "instanceof"
+                | "throw"
+                | "delete"
+                | "void"
+                | "do"
+                | "else"
+                | "case"
+                | "yield"
+        ),
+        // Num/Str/Ident/Regex/Eof end a value: `/` divides.
+        _ => false,
+    }
+}
+
+/// Scan `/pat/flags` from the opening `/` (already confirmed not to be a
+/// comment). Returns the Regex token.
+fn regex(src: &str, i: &mut usize) -> Result<Tok, JsError> {
+    let b = src.as_bytes();
+    let start = *i + 1;
+    *i += 1;
+    let mut in_class = false;
+    let mut class_first = false;
+    loop {
+        let Some(&c) = b.get(*i) else {
+            return Err(err("unterminated regex"));
+        };
+        match c {
+            b'\n' | b'\r' => return Err(err("newline in regex literal")),
+            b'\\' => {
+                *i += 1;
+                match b.get(*i) {
+                    None => return Err(err("unterminated regex")),
+                    Some(b'\n') | Some(b'\r') => return Err(err("newline in regex literal")),
+                    Some(_) => {
+                        class_first = false;
+                        *i += 1;
+                    }
+                }
+            }
+            b'[' if !in_class => {
+                in_class = true;
+                class_first = true;
+                *i += 1;
+            }
+            b']' if in_class && !class_first => {
+                in_class = false;
+                *i += 1;
+            }
+            b'/' if !in_class => break,
+            _ => {
+                class_first = false;
+                *i += 1;
+            }
+        }
+    }
+    let pat = src[start..*i].to_string();
+    *i += 1; // closing '/'
+    let fs = *i;
+    while b.get(*i).is_some_and(|c| c.is_ascii_alphabetic()) {
+        *i += 1;
+    }
+    Ok(Tok::Regex {
+        pat,
+        flags: src[fs..*i].to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +464,40 @@ mod tests {
                 Tok::Ident("letx".into()),
                 Tok::Ident("functiony".into()),
                 Tok::Kw("in"),
+            ]
+        );
+    }
+
+    #[test]
+    fn regex_vs_division() {
+        assert_eq!(
+            tt("a/b"),
+            vec![Tok::Ident("a".into()), Tok::P("/"), Tok::Ident("b".into())]
+        );
+        assert_eq!(
+            tt("x=/ab+/gi"),
+            vec![
+                Tok::Ident("x".into()),
+                Tok::P("="),
+                Tok::Regex {
+                    pat: "ab+".into(),
+                    flags: "gi".into()
+                },
+            ]
+        );
+        assert_eq!(
+            tt("return /x/.test(y)"),
+            vec![
+                Tok::Kw("return"),
+                Tok::Regex {
+                    pat: "x".into(),
+                    flags: "".into()
+                },
+                Tok::P("."),
+                Tok::Ident("test".into()),
+                Tok::P("("),
+                Tok::Ident("y".into()),
+                Tok::P(")"),
             ]
         );
     }

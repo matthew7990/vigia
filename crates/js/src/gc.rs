@@ -106,6 +106,15 @@ impl Marker {
                         }
                         PromiseState::Fulfilled(v) | PromiseState::Rejected(v) => self.val(*v),
                     },
+                    Obj::RegExp {
+                        pat, flags, proto, ..
+                    } => {
+                        self.sw.push(*pat);
+                        self.sw.push(*flags);
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
                     Obj::Dom(_) | Obj::Freed => {}
                 }
             }

@@ -21,6 +21,9 @@ pub struct Cookie {
 #[derive(Debug, Default)]
 pub struct CookieJar {
     cookies: Vec<Cookie>,
+    /// Chrome-like request profile (UA + navigation headers). Runtime
+    /// only: `--stealth` sets it after load, `save` never persists it.
+    pub stealth: bool,
 }
 
 impl CookieJar {

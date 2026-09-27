@@ -27,6 +27,7 @@ const USAGE: &str = "vigia - AI-native browser runtime
 
   --profile <name>                       persistent cookie jar (~/.vigia/profiles)
   --js                                   run page <script>s before reading the DOM
+  --stealth                              Chrome-like request profile (UA + Sec-Fetch-*)
 
 Own HTTP/1.1 + URL parser + inflate + HTML parser + arena DOM.
 Metrics on stderr: bytes in/out, ~tokens, ms per phase, heap peak, RSS peak.
@@ -268,6 +269,14 @@ fn main() {
         false
     };
 
+    // --stealth anywhere: Chrome-like request profile (UA + headers).
+    let stealth = if let Some(i) = args.iter().position(|a| a == "--stealth") {
+        args.remove(i);
+        true
+    } else {
+        false
+    };
+
     if args.is_empty() {
         eprint!("{USAGE}");
         std::process::exit(1);
@@ -293,6 +302,9 @@ fn main() {
         .as_ref()
         .map(|p| CookieJar::load(p))
         .unwrap_or_default();
+    if stealth {
+        jar.stealth = true;
+    }
 
     match cmd.as_str() {
         "fetch" => {
@@ -650,7 +662,7 @@ fn main() {
                         }
                     })
                     .collect();
-                let outcomes = vigia_run::run_tabs(&stmts, &specs, js);
+                let outcomes = vigia_run::run_tabs(&stmts, &specs, js, stealth);
                 let multi = outcomes.len() > 1;
                 for o in &outcomes {
                     if multi {

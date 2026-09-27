@@ -656,7 +656,7 @@ fn panic_msg(p: Box<dyn std::any::Any + Send>) -> String {
 /// even on failure, so partial cookie updates are not lost; save errors
 /// append a warning to the tab's output), its own page state, and its own
 /// captured output. Outcomes come back in `tabs` order.
-pub fn run_tabs(stmts: &[Stmt], tabs: &[TabSpec], js: bool) -> Vec<TabOutcome> {
+pub fn run_tabs(stmts: &[Stmt], tabs: &[TabSpec], js: bool, stealth: bool) -> Vec<TabOutcome> {
     let mut handles = Vec::with_capacity(tabs.len());
     for tab in tabs {
         let name = tab.name.clone();
@@ -670,6 +670,7 @@ pub fn run_tabs(stmts: &[Stmt], tabs: &[TabSpec], js: bool) -> Vec<TabOutcome> {
                     Some(p) => CookieJar::load(p),
                     None => CookieJar::new(),
                 };
+                jar.stealth = stealth;
                 let mut audit = Vec::new();
                 let mut out = String::new();
                 let result = run_with(
@@ -1027,7 +1028,7 @@ expect bare
             },
         ];
         let stmts = parse_script(&format!("snap http://127.0.0.1:{port}/$TAB")).unwrap();
-        let outcomes = run_tabs(&stmts, &tabs, false);
+        let outcomes = run_tabs(&stmts, &tabs, false, false);
         assert_eq!(outcomes.len(), 2);
         assert_eq!(outcomes[0].name, "alice");
         assert_eq!(outcomes[1].name, "bob");
@@ -1077,7 +1078,7 @@ expect bare
             "snap http://127.0.0.1:{port}/$TAB\nexpect page-$WANT"
         ))
         .unwrap();
-        let outcomes = run_tabs(&stmts, &tabs, false);
+        let outcomes = run_tabs(&stmts, &tabs, false, false);
         assert!(outcomes[0].result.is_ok(), "{:?}", outcomes[0].result);
         let e = outcomes[1].result.as_ref().unwrap_err();
         assert_eq!(e.0, 2);

@@ -17,6 +17,8 @@ const MAX_HEADER: usize = 64 * 1024;
 const MAX_WIRE: usize = 8 * 1024 * 1024;
 const MAX_BODY: usize = 16 * 1024 * 1024;
 const UA: &str = "vigia/0.1 (+https://github.com/matthew7990/vigia)";
+/// Chrome on Linux: what `--stealth` sends instead of `UA`.
+const UA_STEALTH: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
 #[derive(Debug)]
 pub enum Error {
@@ -213,7 +215,8 @@ fn run(
     let mut redirects = 0;
     let mut timings = Timings::default();
     loop {
-        let res = request(&current, jar, method, body, &active)?;
+        let first = redirects == 0;
+        let res = request(&current, jar, method, body, &active, first)?;
         timings.connect += res.timings.connect;
         timings.tls += res.timings.tls;
         timings.ttfb += res.timings.ttfb;
@@ -274,6 +277,7 @@ fn request(
     method: &str,
     body: Option<&[u8]>,
     extra_headers: &[(String, String)],
+    first: bool,
 ) -> Result<StepResponse, Error> {
     let t_total = Instant::now();
 
@@ -304,10 +308,20 @@ fn request(
     let t_tls = Instant::now();
 
     let mut req = format!(
-        "{method} {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: {UA}\r\nAccept: text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.5\r\nAccept-Encoding: gzip, deflate\r\nAccept-Language: en-US,en;q=0.9\r\nConnection: close\r\n",
+        "{method} {} HTTP/1.1\r\nHost: {}\r\n",
         url.request_target(),
         url.host_header(),
     );
+    if jar.stealth {
+        push_stealth_headers(&mut req, method, body.is_some(), first, extra_headers);
+    } else {
+        let _ = fmt::Write::write_fmt(
+            &mut req,
+            format_args!(
+                "User-Agent: {UA}\r\nAccept: text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.5\r\nAccept-Encoding: gzip, deflate\r\nAccept-Language: en-US,en;q=0.9\r\nConnection: close\r\n"
+            ),
+        );
+    }
     if let Some(cookie) = jar.header_for(url) {
         let _ = fmt::Write::write_fmt(&mut req, format_args!("Cookie: {cookie}\r\n"));
     }
@@ -399,6 +413,68 @@ fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .iter()
         .find(|(k, _)| k == name)
         .map(|(_, v)| v.as_str())
+}
+
+/// Caller-supplied header present (case-insensitive)? Stealth never
+/// overrides an explicit caller header.
+fn caller_has(headers: &[(String, String)], name: &str) -> bool {
+    headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(name))
+}
+
+/// Chrome-like request headers for `--stealth`. Navigations (GET without
+/// body) get the full document set; anything else gets the CORS subset.
+/// Honest deviations: `Accept-Encoding` stays `gzip, deflate` (brotli/zstd
+/// are not decodable here), `Connection: close` (no keep-alive pool yet),
+/// and redirect hops claim `same-origin` even cross-host.
+fn push_stealth_headers(
+    req: &mut String,
+    method: &str,
+    has_body: bool,
+    first: bool,
+    extra: &[(String, String)],
+) {
+    let nav = method == "GET" && !has_body;
+    let _ = fmt::Write::write_fmt(req, format_args!("User-Agent: {UA_STEALTH}\r\n"));
+    if nav {
+        req.push_str(
+            "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8\r\n",
+        );
+    } else {
+        req.push_str("Accept: */*\r\n");
+    }
+    req.push_str("Accept-Encoding: gzip, deflate\r\nAccept-Language: en-US,en;q=0.9\r\n");
+    if nav {
+        req.push_str("Upgrade-Insecure-Requests: 1\r\n");
+        if !caller_has(extra, "sec-fetch-dest") {
+            req.push_str("Sec-Fetch-Dest: document\r\n");
+        }
+        if !caller_has(extra, "sec-fetch-mode") {
+            req.push_str("Sec-Fetch-Mode: navigate\r\n");
+        }
+        if !caller_has(extra, "sec-fetch-site") {
+            let _ = fmt::Write::write_fmt(
+                req,
+                format_args!(
+                    "Sec-Fetch-Site: {}\r\n",
+                    if first { "none" } else { "same-origin" }
+                ),
+            );
+        }
+        if !caller_has(extra, "sec-fetch-user") {
+            req.push_str("Sec-Fetch-User: ?1\r\n");
+        }
+    } else {
+        if !caller_has(extra, "sec-fetch-dest") {
+            req.push_str("Sec-Fetch-Dest: empty\r\n");
+        }
+        if !caller_has(extra, "sec-fetch-mode") {
+            req.push_str("Sec-Fetch-Mode: cors\r\n");
+        }
+        if !caller_has(extra, "sec-fetch-site") {
+            req.push_str("Sec-Fetch-Site: same-origin\r\n");
+        }
+    }
+    req.push_str("Connection: close\r\n");
 }
 
 fn reject_crlf(s: &str) -> Result<(), Error> {
@@ -521,6 +597,46 @@ fn read_to_end(m: &mut Metered<Conn>) -> Result<Vec<u8>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stealth_head(method: &str, body: bool, first: bool) -> String {
+        let mut req = String::new();
+        push_stealth_headers(&mut req, method, body, first, &[]);
+        req
+    }
+
+    #[test]
+    fn stealth_navigation_profile() {
+        let h = stealth_head("GET", false, true);
+        assert!(h.contains("Chrome/126.0.0.0"), "{h}");
+        assert!(h.contains("Sec-Fetch-Dest: document"), "{h}");
+        assert!(h.contains("Sec-Fetch-Mode: navigate"), "{h}");
+        assert!(h.contains("Sec-Fetch-Site: none"), "{h}");
+        assert!(h.contains("Sec-Fetch-User: ?1"), "{h}");
+        assert!(h.contains("Upgrade-Insecure-Requests: 1"), "{h}");
+        assert!(h.contains("image/avif"), "{h}");
+        assert!(!h.contains("vigia/0.1"), "{h}");
+        // Redirect hop claims same-origin instead of none.
+        let h2 = stealth_head("GET", false, false);
+        assert!(h2.contains("Sec-Fetch-Site: same-origin"), "{h2}");
+    }
+
+    #[test]
+    fn stealth_api_subset() {
+        let h = stealth_head("POST", true, true);
+        assert!(h.contains("Accept: */*"), "{h}");
+        assert!(h.contains("Sec-Fetch-Dest: empty"), "{h}");
+        assert!(h.contains("Sec-Fetch-Mode: cors"), "{h}");
+        assert!(!h.contains("Sec-Fetch-User"), "{h}");
+        assert!(!h.contains("Upgrade-Insecure"), "{h}");
+    }
+
+    #[test]
+    fn stealth_never_overrides_caller() {
+        let mut req = String::new();
+        let extra = vec![("Sec-Fetch-Mode".into(), "no-cors".into())];
+        push_stealth_headers(&mut req, "GET", false, true, &extra);
+        assert!(!req.contains("Sec-Fetch-Mode: navigate"), "{req}");
+    }
 
     #[test]
     fn rejects_crlf_in_headers() {

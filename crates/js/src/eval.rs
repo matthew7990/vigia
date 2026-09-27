@@ -3081,8 +3081,14 @@ impl Interp {
                     .copied()
                     .ok_or_else(|| err("unexpected super"))?;
                 let this = self.env_get(env, "this").unwrap_or(Value::Undef);
+                // Base frames see the derived newTarget (spec propagates it
+                // down the whole super chain); read it from this frame.
+                let nt = self.env_get(env, "new.target").unwrap_or(Value::Undef);
                 let a = self.eval_args(env, args)?;
-                self.call_value(sup, this, &a, Some("super"))
+                self.pending_new_target = Some(nt);
+                let r = self.call_value(sup, this, &a, Some("super"));
+                self.pending_new_target.take();
+                r
             }
             Expr::SuperProp(k) => {
                 let sup = self
@@ -3115,6 +3121,9 @@ impl Interp {
                 let args = self.eval_args(env, args)?;
                 self.construct_value(f, &args)
             }
+            // Constructor frames declare this binding (see call_value);
+            // arrows inherit it via the env chain, like `this`.
+            Expr::NewTarget => Ok(self.env_get(env, "new.target").unwrap_or(Value::Undef)),
         }
     }
 
@@ -3149,6 +3158,11 @@ impl Interp {
                     }
                     break;
                 }
+                // `new Symbol()` throws like V8 (bare calls never reach
+                // here; bound-Symbol unwraps to this arm too).
+                Obj::Native { name, .. } if *name == "Symbol" => {
+                    return Err(err("Symbol is not a constructor"));
+                }
                 Obj::Native { .. } => break, // natives take `this` as given
                 _ => return Err(err("not a constructor")),
             }
@@ -3163,7 +3177,13 @@ impl Interp {
             pairs: vec![],
             proto,
         })?;
-        let r = self.call_value(target, Value::Obj(obj), &full, None)?;
+        // newTarget is the pre-unwrap `f` (`new C` sees C, `new` on a
+        // bound fn sees the bound fn). Cleared after: natives never take
+        // the handoff, and no stale value may leak into a later call.
+        self.pending_new_target = Some(f);
+        let r = self.call_value(target, Value::Obj(obj), &full, None);
+        self.pending_new_target.take();
+        let r = r?;
         Ok(match r {
             Value::Obj(_) => r,
             _ => Value::Obj(obj),
@@ -4333,6 +4353,14 @@ impl Interp {
                 let hbase = self.hoisted.len();
                 let saved_last = self.last;
                 self.hoist_vars(&def.body, cenv)?;
+                // `new.target` per frame: the construct handoff, else
+                // undefined (plain calls shadow any outer value). Arrows
+                // declare nothing and inherit lexically. Declared before
+                // params so defaults (`(a = new.target)`) see it.
+                if !def.is_arrow {
+                    let nt = self.pending_new_target.take().unwrap_or(Value::Undef);
+                    self.env_declare(cenv, "new.target", nt);
+                }
                 for (i, (p, d)) in def.params.iter().enumerate() {
                     let mut v = args.get(i).copied().unwrap_or(Value::Undef);
                     if matches!(v, Value::Undef) {
@@ -4463,6 +4491,10 @@ impl Interp {
             C::Nat(nf) => {
                 // cur_native exposes the callee object to natives that
                 // carry bound state in their own props ("__p", "__f", ...).
+                // A construct handoff never belongs to a native frame, so
+                // drop it: sync JS callbacks the native invokes (Promise
+                // executors, Reflect.construct targets) start clean.
+                self.pending_new_target.take();
                 let prev = self.cur_native;
                 self.cur_native = f;
                 self.js_stack.push(id);
@@ -7072,13 +7104,9 @@ fn make_symbol(it: &mut Interp, desc: Option<u32>) -> Result<Value, JsError> {
     Ok(Value::Obj(it.heap.alloc_obj(Obj::Symbol { desc, proto })?))
 }
 
-/// Symbol(desc?): never a constructor.
-fn n_symbol(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
-    if let Value::Obj(id) = this {
-        if matches!(it.heap.obj(id), Obj::Ordinary { .. }) {
-            return Err(err("Symbol is not a constructor"));
-        }
-    }
+/// Symbol(desc?): never called with `new` (construct_value rejects
+/// it before dispatch); bare calls always produce a symbol.
+fn n_symbol(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     let desc = match arg(args, 0) {
         Value::Undef => None,
         v => Some(it.heap.alloc_str(to_str(&it.heap, v))?),
@@ -8770,7 +8798,10 @@ fn n_reflect_construct(it: &mut Interp, _this: Value, args: &[Value]) -> Result<
         pairs: Vec::new(),
         proto,
     })?;
-    let r = it.call_value(target, Value::Obj(obj), &argv, None)?;
+    it.pending_new_target = Some(nt);
+    let r = it.call_value(target, Value::Obj(obj), &argv, None);
+    it.pending_new_target.take();
+    let r = r?;
     Ok(match r {
         Value::Obj(_) => r,
         _ => Value::Obj(obj),
@@ -11981,6 +12012,72 @@ mod tests {
     }
 
     #[test]
+    fn new_target() {
+        // `new C()` sees C; `.prototype` resolves on it.
+        assert_eq!(disp("function C(){this.t=new.target}new C().t===C"), "true");
+        assert_eq!(
+            disp("function C(){this.p=new.target.prototype}new C().p===C.prototype"),
+            "true"
+        );
+        // Plain calls (functions, methods, getters) see undefined.
+        assert_eq!(disp("function f(){return new.target}f()===undefined"), "true");
+        assert_eq!(disp("function f(){return new.target===undefined}f()"), "true");
+        assert_eq!(
+            disp("class A{m(){return new.target}}new A().m()===undefined"),
+            "true"
+        );
+        assert_eq!(
+            disp("class A{get x(){return new.target}}new A().x===undefined"),
+            "true"
+        );
+        assert_eq!(disp("new.target===undefined"), "true");
+        // Reflect.construct with explicit newTarget.
+        assert_eq!(
+            disp("function P(){this.nt=new.target}function N(){}Reflect.construct(P,[],N).nt===N"),
+            "true"
+        );
+        assert_eq!(
+            disp("function P(){this.p=1}function C(){}C.prototype={};var o=Reflect.construct(P,[],C);(o instanceof C)+'|'+o.p"),
+            "true|1"
+        );
+        // Derived ctors see the derived ctor, incl. through super().
+        assert_eq!(
+            disp("class B extends Object{constructor(){super();this.nt=new.target}}new B().nt===B"),
+            "true"
+        );
+        assert_eq!(
+            disp("class P{}class C extends P{constructor(){super();this.nt=new.target}}new C().nt===C"),
+            "true"
+        );
+        // Base default params run with the derived newTarget.
+        assert_eq!(
+            disp("class P{constructor(a=new.target){this.nt=a}}class C extends P{}new C().nt===C"),
+            "true"
+        );
+        // Arrows inside constructors inherit, like `this`.
+        assert_eq!(
+            disp("function C(){var f=()=>new.target;this.t=f()}new C().t===C"),
+            "true"
+        );
+        assert_eq!(
+            disp("class B extends Object{constructor(){super();var f=()=>new.target;this.t=f()}}new B().t===B"),
+            "true"
+        );
+        // Helper calls inside a ctor still see undefined.
+        assert_eq!(
+            disp("function h(){return new.target}function C(){this.t=h()}new C().t===undefined"),
+            "true"
+        );
+        // Real-world shape: base fixes the proto from newTarget.
+        assert_eq!(
+            disp("function Base(){Object.setPrototypeOf(this,new.target.prototype)}class D extends Base{}var d=new D();(d instanceof D)+'|'+(d instanceof Base)"),
+            "true|true"
+        );
+        // Errors: `new.foo` is not a meta-property.
+        assert!(errmsg("new.foo()").contains("target"));
+    }
+
+    #[test]
     fn computed_class_members() {
         assert_eq!(disp("var K='k';var o={[K]:1};o.k"), "1");
         assert_eq!(
@@ -12206,6 +12303,10 @@ mod tests {
         assert_eq!(disp("Symbol.keyFor(Symbol.for('k'))"), "k");
         assert_eq!(disp("var o={};o[Symbol.for('rk')]=7;o['Symbol(rk)']"), "7");
         assert!(errmsg("new Symbol()").contains("not a constructor"));
+        // Bare calls stay legal nested in constructors (sloppy `this`
+        // is the window object there, not a fresh instance).
+        assert_eq!(disp("function F(){this.s=Symbol('s')}var o=new F();typeof o.s"), "symbol");
+        assert!(errmsg("Reflect.construct(Symbol,[])").contains("not a constructor"));
     }
 
     #[test]

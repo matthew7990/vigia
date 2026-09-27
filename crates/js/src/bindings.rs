@@ -11,7 +11,7 @@ use vigia_session::CookieJar;
 
 use crate::ast::{Expr, Stmt};
 use crate::eval::{get_prop, nat, set_prop, to_str, truthy};
-use crate::{err, Interp, JsError, NetCtx, Obj, Value};
+use crate::{err, Interp, JsError, NetCtx, Obj, PendingSubmit, Value};
 
 /// Same list as vigia-html: these never get a close tag when serializing.
 const VOID: &[&str] = &[
@@ -61,14 +61,16 @@ fn raw_text(dom: &Dom, id: NodeId, out: &mut String) {
 }
 
 /// What a page script run leaves behind: the (possibly mutated) DOM,
-/// per-script errors, the cookie jar back out of the net context, and a
-/// pending navigation requested by el.click() on <a href>. Following
-/// pending_nav is the host's call (v1 navigation bridge).
+/// per-script errors, the cookie jar back out of the net context, a
+/// pending navigation requested by el.click() on <a href>, and a pending
+/// form submit requested by form.submit() or __doPostBack. Following
+/// either is the host's call (v1 navigation bridge).
 pub struct ScriptsOutcome {
     pub dom: Dom,
     pub errors: Vec<JsError>,
     pub jar: Option<CookieJar>,
     pub pending_nav: Option<String>,
+    pub pending_submit: Option<PendingSubmit>,
 }
 
 /// Most external <script src> fetches one page run may do (runaway guard).
@@ -189,6 +191,7 @@ impl Interp {
         self.dom_objs.clear();
         self.listeners.clear();
         self.pending_nav = None;
+        self.pending_submit = None;
         self.install_builtins();
         // Heap-cap edges skip installs silently, same as install_builtins.
         let (Ok(doc), Ok(ua), Ok(href)) = (
@@ -221,6 +224,11 @@ impl Interp {
             self.env_declare(0, "window", Value::Obj(w));
             self.env_declare(0, "self", Value::Obj(w));
             self.env_declare(0, "globalThis", Value::Obj(w));
+        }
+        // WebForms postback helper: __doPostBack('target','arg') sets the
+        // hidden fields and submits the first form.
+        if let Ok(f) = self.heap.alloc_obj(nat("__doPostBack", n_do_post_back)) {
+            self.env_declare(0, "__doPostBack", Value::Obj(f));
         }
     }
 
@@ -280,6 +288,7 @@ impl Interp {
             errors: errs,
             jar: self.net.take().map(|c| c.jar),
             pending_nav: self.pending_nav.take(),
+            pending_submit: self.pending_submit.take(),
         }
     }
 
@@ -669,23 +678,40 @@ impl Interp {
                         _ => None,
                     };
                     if let Some(href) = href {
-                        match &self.net {
-                            Some(ctx) => {
-                                let u = ctx
-                                    .base
-                                    .join(&href)
-                                    .map_err(|e| err(format!("click: {e}")))?;
-                                // javascript:/mailto: etc aren't navigable
-                                if matches!(u.scheme.as_str(), "http" | "https") {
-                                    let s = u.to_string();
-                                    self.set_location_href(&s)?;
-                                    self.pending_nav = Some(s);
+                        // `javascript:` links run their body as page code,
+                        // like browsers (WebForms postbacks live here).
+                        let trimmed = href.trim_start();
+                        let js_body = if trimmed.len() >= 11
+                            && trimmed[..11].eq_ignore_ascii_case("javascript:")
+                        {
+                            Some(&trimmed[11..])
+                        } else {
+                            None
+                        };
+                        if let Some(code) = js_body {
+                            let code = code.trim_start_matches(|c| {
+                                c == ' ' || c == '\t' || c == '\n' || c == '\r'
+                            });
+                            self.run(code)?;
+                        } else {
+                            match &self.net {
+                                Some(ctx) => {
+                                    let u = ctx
+                                        .base
+                                        .join(&href)
+                                        .map_err(|e| err(format!("click: {e}")))?;
+                                    // javascript:/mailto: etc aren't navigable
+                                    if matches!(u.scheme.as_str(), "http" | "https") {
+                                        let s = u.to_string();
+                                        self.set_location_href(&s)?;
+                                        self.pending_nav = Some(s);
+                                    }
                                 }
-                            }
-                            // no base: record the raw href for the host
-                            None => {
-                                self.set_location_href(&href)?;
-                                self.pending_nav = Some(href);
+                                // no base: record the raw href for the host
+                                None => {
+                                    self.set_location_href(&href)?;
+                                    self.pending_nav = Some(href);
+                                }
                             }
                         }
                     }
@@ -765,6 +791,20 @@ impl Interp {
                     self.str_val(t)
                 }
                 "textContent" => Ok(Value::Null),
+                // Snapshot, not live: forms present at access time.
+                "forms" => {
+                    let ids: Vec<NodeId> = {
+                        let d = self.dom_ref()?;
+                        (1..d.nodes.len() as NodeId)
+                            .filter(|&i| {
+                                matches!(d.node(i).data, NodeData::Element(_))
+                                    && is_desc(d, 0, i)
+                                    && d.tag_name(i) == Some("form")
+                            })
+                            .collect()
+                    };
+                    self.node_arr(ids)
+                }
                 _ => Ok(Value::Undef),
             },
             NodeData::Text(_) | NodeData::Comment(_) => match key {
@@ -886,6 +926,43 @@ impl Interp {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    /// Capture a form submit at submit() time: current fields plus the
+    /// action resolved against the page base (or the raw action with no
+    /// net context - the host reports the failure). The host performs
+    /// the HTTP, like pending_nav.
+    pub(crate) fn record_submit(&mut self, form: NodeId) -> Result<(), JsError> {
+        let (method, action) = {
+            let dom = self.dom_ref()?;
+            if dom.tag_name(form) != Some("form") {
+                return Err(err("submit() needs a form"));
+            }
+            (
+                dom.attr(form, "method")
+                    .unwrap_or("get")
+                    .to_ascii_lowercase(),
+                dom.attr(form, "action").unwrap_or("").to_string(),
+            )
+        };
+        let fields = {
+            let dom = self.dom_ref()?;
+            vigia_actions::form_fields(dom, form)
+        };
+        let url = match &self.net {
+            Some(ctx) => ctx
+                .base
+                .join(action.trim())
+                .map_err(|e| err(format!("submit: {e}")))?
+                .to_string(),
+            None => action,
+        };
+        self.pending_submit = Some(PendingSubmit {
+            method,
+            url,
+            fields,
+        });
         Ok(())
     }
 
@@ -1041,6 +1118,15 @@ impl Interp {
                 self.dom_mut()?.detach(id);
                 Ok(Value::Undef)
             }
+            "submit" => {
+                // Only <form> submits; anything else falls to "not a
+                // function" below, like browsers (only forms have it).
+                if self.dom_ref()?.tag_name(id) != Some("form") {
+                    return Err(err("submit is not a function"));
+                }
+                self.record_submit(id)?;
+                Ok(Value::Undef)
+            }
             "querySelector" => {
                 let hits = self.select(id, arg(0))?;
                 self.opt_node(hits.into_iter().next())
@@ -1071,6 +1157,50 @@ fn n_event_stop_propagation(
 ) -> Result<Value, JsError> {
     // internal flag the dispatch loop checks between nodes
     set_prop(&mut it.heap, this, "__stopped", Value::Bool(true)).map(|()| Value::Undef)
+}
+
+/// WebForms `__doPostBack(eventTarget, eventArgument)`: stash both into
+/// the first form's hidden fields (creating them when absent) and record
+/// the submit. The host performs the HTTP.
+fn n_do_post_back(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let target = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    let argument = to_str(&it.heap, args.get(1).copied().unwrap_or(Value::Undef));
+    let form = {
+        let dom = it.dom_ref()?;
+        (1..dom.nodes.len() as NodeId)
+            .find(|&i| {
+                matches!(dom.node(i).data, NodeData::Element(_))
+                    && is_desc(dom, 0, i)
+                    && dom.tag_name(i) == Some("form")
+            })
+            .ok_or_else(|| err("__doPostBack: no form"))?
+    };
+    for (name, val) in [("__EVENTTARGET", target), ("__EVENTARGUMENT", argument)] {
+        let hit = {
+            let dom = it.dom_ref()?;
+            (1..dom.nodes.len() as NodeId).find(|&i| {
+                is_desc(dom, form, i)
+                    && dom.tag_name(i) == Some("input")
+                    && dom.attr(i, "name") == Some(name)
+            })
+        };
+        match hit {
+            Some(n) => it.dom_mut()?.set_attr(n, "value", &val),
+            None => {
+                it.dom_mut()?.element(
+                    form,
+                    "input",
+                    vec![
+                        ("type".into(), "hidden".into()),
+                        ("name".into(), name.into()),
+                        ("value".into(), val),
+                    ],
+                );
+            }
+        }
+    }
+    it.record_submit(form)?;
+    Ok(Value::Undef)
 }
 
 #[cfg(test)]
@@ -1338,6 +1468,59 @@ mod tests {
         it.run("e.style.display=''").unwrap();
         assert_eq!(ev(&mut it, "e.style.length"), "1");
         assert_eq!(ev(&mut it, "e.style.missing"), "undefined");
+    }
+
+    #[test]
+    fn webforms_postback() {
+        let mut it = interp(
+            r#"<html><body><form id=f method=post action="/go">
+            <input name=user value=u><input name=__VIEWSTATE value=vs>
+            </form></body></html>"#,
+        );
+        // document.forms snapshot.
+        assert_eq!(ev(&mut it, "document.forms.length"), "1");
+        assert_eq!(ev(&mut it, "document.forms[0].tagName"), "FORM");
+        // form.submit() captures fields + target, performs no HTTP.
+        it.run("document.forms[0].submit()").unwrap();
+        let sub = it.pending_submit.clone().expect("pending submit");
+        assert_eq!((sub.method.as_str(), sub.url.as_str()), ("post", "/go"));
+        assert!(sub.fields.contains(&("user".into(), "u".into())));
+        assert!(sub.fields.contains(&("__VIEWSTATE".into(), "vs".into())));
+        // submit on a non-form is a TypeError-shaped error.
+        assert!(errmsg(&mut it, "document.body.submit()").contains("not a function"));
+        // __doPostBack injects the hidden pair, then submits.
+        it.run("__doPostBack('ctl00$btn','')").unwrap();
+        let sub = it.pending_submit.clone().expect("pending submit");
+        assert!(sub
+            .fields
+            .contains(&("__EVENTTARGET".into(), "ctl00$btn".into())));
+        let dom = it.take_dom();
+        let t = vigia_css::query(&dom, "input[name=__EVENTTARGET]").unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!(dom.attr(t[0], "value"), Some("ctl00$btn"));
+        // WebForms without a form errors clearly.
+        let mut bare = interp("<html><body></body></html>");
+        assert!(errmsg(&mut bare, "__doPostBack('a','b')").contains("no form"));
+    }
+
+    #[test]
+    fn javascript_href_runs() {
+        let mut it = interp(
+            r#"<html><body><a id=j href="javascript:document.title='pb'">go</a></body></html>"#,
+        );
+        it.run("document.getElementById('j').click()").unwrap();
+        assert!(it.pending_nav.is_none());
+        let dom = it.take_dom();
+        let t = vigia_css::query(&dom, "title").unwrap();
+        assert_eq!(vigia_actions::text_content(&dom, t[0]), "pb");
+        // A postback link records a submit instead of navigating.
+        let mut it = interp(
+            r#"<html><body><form method=post action="/p"></form>
+            <a id=j href="javascript:__doPostBack('t','a')">go</a></body></html>"#,
+        );
+        it.run("document.getElementById('j').click()").unwrap();
+        assert!(it.pending_nav.is_none());
+        assert!(it.pending_submit.is_some());
     }
 
     #[test]

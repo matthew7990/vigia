@@ -450,6 +450,16 @@ pub(crate) struct Env {
     pub free: bool,
 }
 
+/// A form submit captured at submit() time (fields as they were then).
+/// The host performs the HTTP, following the same method semantics as a
+/// plain form submit.
+#[derive(Debug, Clone)]
+pub struct PendingSubmit {
+    pub method: String,
+    pub url: String,
+    pub fields: Vec<(String, String)>,
+}
+
 pub struct Interp {
     pub heap: Heap,
     /// env 0 is global
@@ -466,6 +476,11 @@ pub struct Interp {
     /// Set by click() on <a href> when default isn't prevented. The host
     /// decides whether to follow it (v1 navigation bridge).
     pub pending_nav: Option<String>,
+    /// A form submission requested by page JS (`form.submit()` or the
+    /// WebForms `__doPostBack` helper): captured fields plus the resolved
+    /// target. Following it (the actual HTTP) is the host's call, like
+    /// pending_nav.
+    pub pending_submit: Option<PendingSubmit>,
     /// Well-known prototypes, allocated by install_protos in with_cap.
     pub protos: Protos,
     /// Math.random state (xorshift64*; not crypto).
@@ -536,6 +551,7 @@ impl Interp {
             listeners: HashMap::new(),
             net: None,
             pending_nav: None,
+            pending_submit: None,
             protos: Protos::none(),
             rng,
             out: String::new(),

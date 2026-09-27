@@ -310,6 +310,18 @@ fn load_follow(res: vigia_net::Response, js: bool, jar: &mut CookieJar, follow: 
                 eprintln!("warn: js: navigation to {nav} not followed");
             }
         }
+        // Same bridge for form.submit() / __doPostBack: fields were
+        // captured at submit time, the host only performs the HTTP.
+        if let Some(sub) = out.pending_submit {
+            if follow {
+                match follow_submit(&sub, jar) {
+                    Ok(res2) => return load_follow(res2, js, jar, false),
+                    Err(e) => eprintln!("warn: js submit {}: {e}", sub.url),
+                }
+            } else {
+                eprintln!("warn: js: form submit to {} not followed", sub.url);
+            }
+        }
     }
     Page {
         dom,
@@ -320,6 +332,29 @@ fn load_follow(res: vigia_net::Response, js: bool, jar: &mut CookieJar, follow: 
 }
 
 const NO_PAGE: &str = "no page yet (first op must be snap)";
+
+/// Perform a JS-captured form submit: POST encodes the fields, anything
+/// else appends them as the query (mirrors submit_node semantics).
+fn follow_submit(
+    sub: &vigia_js::PendingSubmit,
+    jar: &mut CookieJar,
+) -> Result<vigia_net::Response, String> {
+    let url = Url::parse(&sub.url).map_err(|e| e.to_string())?;
+    let encoded = vigia_actions::urlencode(&sub.fields);
+    if sub.method == "post" {
+        vigia_net::post_form(&url, &encoded, jar).map_err(|e| e.to_string())
+    } else {
+        let u = if sub.fields.is_empty() {
+            url
+        } else {
+            Url {
+                query: Some(encoded),
+                ..url
+            }
+        };
+        vigia_net::fetch(&u.to_string(), jar).map_err(|e| e.to_string())
+    }
+}
 
 const JSON_SELECTORS: &[&str] = &[
     "script#__NEXT_DATA__",

@@ -22,3 +22,4 @@ vigia-run = { path = "../run" }
 vigia-serve = { path = "../serve" }
 vigia-session = { path = "../session" }
 vigia-snapshot = { path = "../snapshot" }
+vigia-url = { path = "../url" }

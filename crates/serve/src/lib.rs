@@ -476,6 +476,28 @@ fn op(sess: &mut Session, name: &str, args: &Json) -> OpResult {
     }
 }
 
+/// Perform a JS-captured form submit (mirrors submit_node semantics).
+fn follow_submit(
+    sub: &vigia_js::PendingSubmit,
+    jar: &mut CookieJar,
+) -> Result<vigia_net::Response, String> {
+    let url = Url::parse(&sub.url).map_err(|e| e.to_string())?;
+    let encoded = vigia_actions::urlencode(&sub.fields);
+    if sub.method == "post" {
+        vigia_net::post_form(&url, &encoded, jar).map_err(|e| e.to_string())
+    } else {
+        let u = if sub.fields.is_empty() {
+            url
+        } else {
+            Url {
+                query: Some(encoded),
+                ..url
+            }
+        };
+        vigia_net::fetch(&u.to_string(), jar).map_err(|e| e.to_string())
+    }
+}
+
 /// Parse + optional script run over one response. When the session's `js`
 /// flag is on, a fresh Interp runs the page <script>s (returned so the
 /// session can keep it for eval); pending_nav is followed once, matching
@@ -533,6 +555,21 @@ fn load_follow(
                 }
             } else {
                 errs.push(format!("js: navigation to {nav} not followed"));
+            }
+        }
+        // Same bridge for form.submit() / __doPostBack.
+        if let Some(sub) = out.pending_submit {
+            if follow {
+                match follow_submit(&sub, jar) {
+                    Ok(res2) => {
+                        let (p2, it2, e2) = load_follow(res2, js, jar, false);
+                        errs.extend(e2);
+                        return (p2, it2, errs);
+                    }
+                    Err(e) => errs.push(format!("js submit {}: {e}", sub.url)),
+                }
+            } else {
+                errs.push(format!("js: form submit to {} not followed", sub.url));
             }
         }
     }

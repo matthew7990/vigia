@@ -626,6 +626,15 @@ pub struct Interp {
     /// node -> (event type, handler) listeners. JS values, so they live
     /// here rather than on DOM nodes. Cleared by set_dom.
     pub(crate) listeners: HashMap<NodeId, Vec<(String, Value)>>,
+    /// Dynamic <script src> errors: insertion-time loads have no local
+    /// errs vec, so they push here; run_scripts appends + clears these
+    /// into the outcome at the end. Cleared by set_dom.
+    pub(crate) dyn_errs: Vec<JsError>,
+    /// Absolute URLs of external scripts already executed this page;
+    /// re-insertion fires load without re-running. Cleared by set_dom.
+    pub(crate) exec_scripts: HashSet<String>,
+    /// External script fetches so far; static + dynamic share the cap.
+    pub(crate) script_fetched: u32,
     /// Net context for fetch()/click resolution; moved in per script run.
     pub net: Option<NetCtx>,
     /// Set by click() on <a href> when default isn't prevented. The host
@@ -744,6 +753,9 @@ impl Interp {
             ctx2ds: HashMap::new(),
             ctxgls: HashMap::new(),
             listeners: HashMap::new(),
+            dyn_errs: Vec::new(),
+            exec_scripts: HashSet::new(),
+            script_fetched: 0,
             net: None,
             pending_nav: None,
             pending_submit: None,

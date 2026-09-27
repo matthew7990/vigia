@@ -215,6 +215,9 @@ impl Interp {
         self.ctx2ds.clear();
         self.ctxgls.clear();
         self.listeners.clear();
+        self.dyn_errs.clear();
+        self.exec_scripts.clear();
+        self.script_fetched = 0;
         self.pending_nav = None;
         self.pending_submit = None;
         self.install_builtins();
@@ -375,7 +378,6 @@ impl Interp {
             self.apply_stealth_ua();
         }
         let mut errs = Vec::new();
-        let mut fetched = 0;
         for (n, s) in scripts.iter().enumerate() {
             match s {
                 ScriptSource::Inline(id, src) => {
@@ -387,19 +389,35 @@ impl Interp {
                         errs.push(Self::tag_err(format!("inline#{n}"), e));
                     }
                 }
-                ScriptSource::External(id, raw) => match self.fetch_script(raw, &mut fetched) {
-                    Ok(Some(body)) => {
-                        let prev = self.cur_script.replace(*id);
-                        let r = self.run(&body);
-                        self.cur_script = prev;
-                        if let Err(e) = r {
-                            errs.push(Self::tag_err(format!("src {raw}"), e));
+                ScriptSource::External(id, raw) => {
+                    // Counter lives on self so dynamic loads nested inside
+                    // these runs share the same cap.
+                    let mut f = self.script_fetched;
+                    let r = self.fetch_script(raw, &mut f);
+                    self.script_fetched = f;
+                    match r {
+                        Ok(Some(body)) => {
+                            // Mark executed before running so a re-insert
+                            // during the run reports load, not a re-run.
+                            let abs: Option<String> =
+                                self.net.as_ref().and_then(|c| c.base.join(raw).ok()).filter(
+                                    |u| matches!(u.scheme.as_str(), "http" | "https"),
+                                ).map(|u| u.to_string());
+                            if let Some(k) = abs {
+                                self.exec_scripts.insert(k);
+                            }
+                            let prev = self.cur_script.replace(*id);
+                            let r = self.run(&body);
+                            self.cur_script = prev;
+                            if let Err(e) = r {
+                                errs.push(Self::tag_err(format!("src {raw}"), e));
+                            }
                         }
+                        // no net ctx installed: skip silently
+                        Ok(None) => {}
+                        Err(e) => errs.push(e),
                     }
-                    // no net ctx installed: skip silently
-                    Ok(None) => {}
-                    Err(e) => errs.push(e),
-                },
+                }
             }
         }
         if let Err(e) = self.fire(0, "DOMContentLoaded") {
@@ -408,6 +426,9 @@ impl Interp {
             let e = self.bound_err(e);
             errs.push(e);
         }
+        // Dynamic loads nest (a load handler can insert another script),
+        // so flush their sink last.
+        errs.extend(std::mem::take(&mut self.dyn_errs));
         ScriptsOutcome {
             dom: self.take_dom(),
             errors: errs,
@@ -475,6 +496,81 @@ impl Interp {
         let res = vigia_net::fetch(&url.to_string(), &mut ctx.jar)
             .map_err(|e| err(format!("script src {url}: {e}")))?;
         Ok(Some(res.text()))
+    }
+
+    /// Dynamic <script src> load at insertion time: fetch through the page
+    /// net ctx, run nested, then fire load/error on the node. Synchronous
+    /// (browsers go async here - deterministic instead). Non-http(s) src
+    /// (incl. data:) is ignored silently, like no net ctx. All DOM state
+    /// is snapshotted into owned values first: no dom borrow is held
+    /// across the nested run/fire below.
+    fn dynamic_script_load(&mut self, n: NodeId) {
+        let (src, connected) = match self.dom.as_ref() {
+            Some(dom) => {
+                if dom.tag_name(n) != Some("script") {
+                    return;
+                }
+                let src = dom.attr(n, "src").unwrap_or("").to_string();
+                (src, is_desc(dom, 0, n))
+            }
+            None => return,
+        };
+        if src.trim().is_empty() || !connected || self.net.is_none() {
+            return;
+        }
+        let abs = self
+            .net
+            .as_ref()
+            .and_then(|c| c.base.join(&src).ok())
+            .filter(|u| matches!(u.scheme.as_str(), "http" | "https"));
+        let Some(abs) = abs else { return };
+        let key = abs.to_string();
+        if self.exec_scripts.contains(&key) {
+            if let Err(e) = self.fire(n, "load") {
+                let e = self.bound_err(e);
+                self.dyn_errs.push(e);
+            }
+            return;
+        }
+        let mut f = self.script_fetched;
+        let r = self.fetch_script(&src, &mut f);
+        self.script_fetched = f;
+        match r {
+            Ok(Some(body)) => {
+                // Mark executed before running so a re-insert during the
+                // run reports load instead of double-executing.
+                self.exec_scripts.insert(key);
+                let saved = self.last;
+                let prev = self.cur_script.replace(n);
+                let res = self.run(&body);
+                self.cur_script = prev;
+                self.last = saved;
+                match res {
+                    Ok(_) => {
+                        if let Err(e) = self.fire(n, "load") {
+                            let e = self.bound_err(e);
+                            self.dyn_errs.push(e);
+                        }
+                    }
+                    Err(e) => {
+                        self.dyn_errs.push(Self::tag_err(format!("src {src}"), e));
+                        if let Err(e) = self.fire(n, "error") {
+                            let e = self.bound_err(e);
+                            self.dyn_errs.push(e);
+                        }
+                    }
+                }
+            }
+            // no net ctx (raced): skip silently, like static externals
+            Ok(None) => {}
+            Err(e) => {
+                self.dyn_errs.push(e);
+                if let Err(e) = self.fire(n, "error") {
+                    let e = self.bound_err(e);
+                    self.dyn_errs.push(e);
+                }
+            }
+        }
     }
 
     pub(crate) fn dom_ref(&self) -> Result<&Dom, JsError> {
@@ -1522,6 +1618,7 @@ impl Interp {
                 "className" => self.attr_val(id, "class"),
                 "value" => self.attr_val(id, "value"),
                 "href" => self.attr_val(id, "href"),
+                "src" => self.attr_val(id, "src"),
                 "width" | "height" => {
                     // Canvas defaults (300x150 like V8); other tags only
                     // reflect an explicit attribute.
@@ -1624,7 +1721,7 @@ impl Interp {
                     dom.adopt_children(&scratch, w, id);
                 }
             }
-            "id" | "className" | "value" | "href" => {
+            "id" | "className" | "value" | "href" | "src" => {
                 let name = if key == "className" { "class" } else { key };
                 let t = to_str(&self.heap, v);
                 self.dom_mut()?.set_attr(id, name, &t);
@@ -1657,7 +1754,25 @@ impl Interp {
                     dom.remove_attr(id, key);
                 }
             }
-            _ => {}
+            _ => {
+                // `on*` property handlers (s.onload/s.onerror) land in the
+                // listener registry with addEventListener dedupe, so fire
+                // delivers them; non-functions stay ignored (no expandos).
+                if key.len() > 2
+                    && key.starts_with("on")
+                    && matches!(self.dom_ref()?.node(id).data, NodeData::Element(_))
+                {
+                    let is_fn = matches!(v, Value::Obj(o)
+                        if matches!(self.heap.obj(o), Obj::Func { .. } | Obj::Native { .. }));
+                    if is_fn {
+                        let ty = key[2..].to_string();
+                        let ls = self.listeners.entry(id).or_default();
+                        if !ls.iter().any(|(t, g)| *t == ty && *g == v) {
+                            ls.push((ty, v));
+                        }
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1926,9 +2041,12 @@ impl Interp {
                 if matches!(self.dom_ref()?.node(n).data, NodeData::Fragment) {
                     let kids: Vec<NodeId> = self.dom_ref()?.children(n).to_vec();
                     let dom = self.dom_mut()?;
-                    for k in kids {
+                    for k in kids.iter().copied() {
                         dom.detach(k);
                         dom.append_child_node(id, k);
+                    }
+                    for k in kids {
+                        self.dynamic_script_load(k);
                     }
                     return Ok(a);
                 }
@@ -1936,6 +2054,7 @@ impl Interp {
                 let dom = self.dom_mut()?;
                 dom.detach(n);
                 dom.append_child_node(id, n);
+                self.dynamic_script_load(n);
                 Ok(a)
             }
             "insertBefore" => {
@@ -1958,9 +2077,12 @@ impl Interp {
                 if matches!(self.dom_ref()?.node(n).data, NodeData::Fragment) {
                     let kids: Vec<NodeId> = self.dom_ref()?.children(n).to_vec();
                     let dom = self.dom_mut()?;
-                    for k in kids {
+                    for k in kids.iter().copied() {
                         dom.detach(k);
                         dom.insert_before_node(id, k, before);
+                    }
+                    for k in kids {
+                        self.dynamic_script_load(k);
                     }
                     return Ok(a);
                 }
@@ -1968,6 +2090,7 @@ impl Interp {
                 let dom = self.dom_mut()?;
                 dom.detach(n);
                 dom.insert_before_node(id, n, before);
+                self.dynamic_script_load(n);
                 Ok(a)
             }
             "removeChild" => {
@@ -5272,5 +5395,137 @@ mod tests {
         let out = it.run_scripts(d, None);
         assert!(out.errors.is_empty(), "{:?}", out.errors);
         assert_eq!(page_title(&out.dom), "ok");
+    }
+
+    // ---- dynamic <script src> ---------------------------------------------
+
+    /// NetCtx for dynamic-insertion tests: no server, discard port 9
+    /// refuses instantly.
+    fn dyn_net() -> NetCtx {
+        NetCtx {
+            base: vigia_url::Url::parse("http://127.0.0.1:9/").unwrap(),
+            jar: CookieJar::new(),
+            trace: None,
+        }
+    }
+
+    #[test]
+    fn dynamic_insert_no_net_skipped() {
+        let mut it = interp("<html><head></head><body></body></html>");
+        it.run(
+            "var s=document.createElement('script');\
+             s.setAttribute('src','http://127.0.0.1:9/x.js');\
+             var log=[];\
+             s.addEventListener('load',function(){log.push('load')});\
+             s.addEventListener('error',function(){log.push('error')});\
+             document.head.appendChild(s)",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "log.join(',')"), "");
+        assert!(it.dyn_errs.is_empty());
+    }
+
+    #[test]
+    fn dynamic_insert_error_event() {
+        // `s.src = ...` property path (webpack shape) + refused fetch:
+        // the error listener fires and the sink holds the fetch error.
+        let mut it = interp("<html><head></head><body></body></html>");
+        it.net = Some(dyn_net());
+        it.run(
+            "var s=document.createElement('script');\
+             s.src='/chunk.js';\
+             var log=[];\
+             s.addEventListener('load',function(){log.push('load')});\
+             s.addEventListener('error',function(){log.push('error')});\
+             document.head.appendChild(s)",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "log.join(',')"), "error");
+        assert_eq!(it.dyn_errs.len(), 1);
+        assert!(
+            it.dyn_errs[0].to_string().contains("chunk.js"),
+            "{}",
+            it.dyn_errs[0]
+        );
+    }
+
+    #[test]
+    fn on_prop_handlers_via_fire() {
+        // `on*` function values route into listeners; non-functions do not.
+        let mut it = interp(r#"<body><div id=a></div></body>"#);
+        it.run(
+            "var log=[];var e=document.getElementById('a');\
+             e.onload=function(){log.push('fired')};\
+             e.onerror='nope';\
+             e.onbogus=7",
+        )
+        .unwrap();
+        let a = {
+            let d = it.dom_ref().unwrap();
+            vigia_css::query(d, "#a").unwrap()[0]
+        };
+        it.fire(a, "load").unwrap();
+        assert_eq!(ev(&mut it, "log.join(',')"), "fired");
+        it.fire(a, "error").unwrap();
+        assert_eq!(ev(&mut it, "log.join(',')"), "fired");
+    }
+
+    #[test]
+    fn run_scripts_static_and_dynamic_errors() {
+        // A static throw collects into the outcome and a dynamic insert
+        // nested inside another static script flushes its sink there too.
+        let mut d = Dom::new();
+        vigia_html::parse(
+            "<html><head><title>o</title>\
+             <script>throw new Error('static-boom')</script>\
+             <script>var s=document.createElement('script');\
+               s.setAttribute('src','http://127.0.0.1:9/dyn.js');\
+               document.head.appendChild(s)</script>\
+             <script>document.title='alive'</script></head><body></body></html>",
+            &mut d,
+        );
+        let mut it = Interp::new();
+        let out = it.run_scripts(d, Some(dyn_net()));
+        assert_eq!(page_title(&out.dom), "alive");
+        assert_eq!(out.errors.len(), 2);
+        assert!(out.errors[0].to_string().contains("static-boom"));
+        assert!(out.errors[1].to_string().contains("dyn.js"));
+        assert!(it.dyn_errs.is_empty());
+    }
+
+    #[test]
+    fn dynamic_dedupe_set_dom_reset() {
+        // A URL already executed fires load without re-fetching; a new
+        // page (set_dom) clears the set so the same URL fetches again.
+        let mut it = interp("<html><head></head><body></body></html>");
+        it.net = Some(dyn_net());
+        it.exec_scripts
+            .insert("http://127.0.0.1:9/u.js".to_string());
+        it.run(
+            "var s=document.createElement('script');\
+             s.setAttribute('src','/u.js');\
+             var log=[];\
+             s.addEventListener('load',function(){log.push('load')});\
+             s.addEventListener('error',function(){log.push('error')});\
+             document.head.appendChild(s)",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "log.join(',')"), "load");
+        assert!(it.dyn_errs.is_empty());
+        let mut d2 = Dom::new();
+        vigia_html::parse("<html><head></head><body></body></html>", &mut d2);
+        it.set_dom(d2);
+        it.net = Some(dyn_net());
+        it.run(
+            "var s2=document.createElement('script');\
+             s2.setAttribute('src','/u.js');\
+             var log2=[];\
+             s2.addEventListener('load',function(){log2.push('load')});\
+             s2.addEventListener('error',function(){log2.push('error')});\
+             document.head.appendChild(s2)",
+        )
+        .unwrap();
+        assert_eq!(ev(&mut it, "log2.join(',')"), "error");
+        assert_eq!(it.dyn_errs.len(), 1);
     }
 }

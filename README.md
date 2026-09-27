@@ -154,7 +154,7 @@ then `python3 bench/run.py`.
 | `vigia-actions` | Forms, submit, click, fill: actions resolved by snapshot ref |
 | `vigia-snapshot` | DOM -> semantic tree for agents: roles, inline names, `#n` refs |
 | `vigia-json` | JSON parser/serializer, order-preserving values, dotted-path lookup |
-| `vigia-js` | JS interpreter: lexer, parser, tree-walk eval, prototypes, async, mark-sweep GC |
+| `vigia-js` | JS interpreter: lexer, parser, tree-walk eval, prototypes, async, mark-sweep GC. Beyond ES5: `?.` `??` arrows `for-of/in` regex+RegExp templates spread/rest defaults destructuring `switch` `do-while` `void` methods/getters/setters Symbol Map/Set/WeakMap. No classes yet |
 | `vigia-run` | `.vig` script runner: sequential ops, shared session, parallel tabs, JSONL audit |
 | `vigia-mem` | Counting allocator and RSS peak: the total-load meter |
 | `vigia` (cli) | All commands above. Metrics on stderr, always |
@@ -182,22 +182,35 @@ Done:
 - Actions by ref (`click`/`fill`/`submit`); persistent profiles; parallel tabs
 - Embedded-JSON extraction (`__NEXT_DATA__`, `ld+json`)
 - `vigia-js`: own lexer/parser/eval, prototypes, builtin methods,
-  `new`/`instanceof`/`in`, DOM bindings, events with bubbling, external
-  `src=` scripts, Promise + microtasks + virtual-clock timers +
-  `async`/`await`, Promise-returning `fetch`, mark-sweep GC
+  `new`/`instanceof`/`in`, DOM bindings (`getElementById`,
+  `querySelector(All)`, `createElement/TextNode`, `appendChild`,
+  `insertBefore`, `remove`, live `style` block, `outerHTML`),
+  events with bubbling, external `src=` scripts, Promise + microtasks +
+  virtual-clock timers + `async`/`await`, Promise-returning `fetch`,
+  mark-sweep GC
+- `vigia-js` language coverage beyond ES5: `?.` `??` arrows `for-of/in`
+  regex literals + `RegExp` (`test`/`exec`/`match`/`replace`/`split`/
+  `search`) template literals (untagged) spread/rest params comma
+  operator default params destructuring `switch` `do-while` `void`
+  method/get/set shorthand `Symbol` `Map`/`Set`/`WeakMap`
+  `Object.freeze`/`defineProperty` `self`/`globalThis`
 - Replay: `.vig` scripts plus JSONL audit trail
 - `vigia serve`: HTTP session API + MCP `tools/call` surface (one
   worker thread per session, JSON in/out)
 
 Next:
 
-- JS: regex literals, `try`/`catch`, classes, `for-of`
+- JS: classes (`extends`/`super`), logical assignment, `**`, `delete`
 - Own TLS 1.3 (replace the rustls exception)
 - HTML5 tree-construction hardening (adoption agency, foster parenting)
 - Keep-alive pooling; parallel fetch engine (thread pool, RSS budget)
+- WebForms postbacks (`__doPostBack`, `form.submit()`); no UpdatePanel/AJAX yet
 
 Honest limits: pending `await` is unsupported (vigia settles eagerly);
 no capture phase on events; `Connection: close` per request today.
+No stealth / anti-bot evasion: a bot-manager CAPTCHA is a wall, not a
+puzzle — the strategy is valid sessions plus API replay (`net` + `req`),
+not fingerprint spoofing.
 
 ## Docs and contributing
 

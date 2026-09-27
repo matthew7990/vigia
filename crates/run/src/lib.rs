@@ -298,6 +298,14 @@ fn load_follow(res: vigia_net::Response, js: bool, jar: &mut CookieJar, follow: 
         for e in out.errors {
             eprintln!("warn: js: {e}");
         }
+        // Console output is diagnostics: stderr, never the snapshot.
+        let cons = it.output();
+        if !cons.is_empty() {
+            eprint!("{cons}");
+            if !cons.ends_with('\n') {
+                eprintln!();
+            }
+        }
         // v1 navigation bridge: a click() on <a href> inside page scripts
         // asks for a navigation - the host follows it once, no chains.
         if let Some(nav) = out.pending_nav {

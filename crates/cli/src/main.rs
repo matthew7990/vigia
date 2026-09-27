@@ -169,6 +169,14 @@ fn parse_dom(
         for e in out.errors {
             eprintln!("warn: js: {e}");
         }
+        // Console output is diagnostics: stderr, never the snapshot.
+        let cons = it.output();
+        if !cons.is_empty() {
+            eprint!("{cons}");
+            if !cons.ends_with('\n') {
+                eprintln!();
+            }
+        }
     }
     (dom, t0.elapsed(), nav, submit, events)
 }

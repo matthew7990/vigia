@@ -12,7 +12,7 @@ use crate::ast::{
 };
 use crate::{
     err, fatal, po, Env, Heap, Interp, JsError, Microtask, NativeFn, NetEvent, Obj, PromiseState,
-    Protos, ThenHandler, Timer, Value,
+    Protos, ThenHandler, Timer, TypedKind, Value,
 };
 
 pub(crate) enum Flow {
@@ -113,6 +113,19 @@ pub(crate) fn to_str(h: &Heap, v: Value) -> String {
             Obj::Map { .. } => "[object Map]".into(),
             Obj::Set { .. } => "[object Set]".into(),
             Obj::WeakMap { .. } => "[object WeakMap]".into(),
+            Obj::Bytes { bytes, .. } => bytes
+                .iter()
+                .map(|b| b.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            Obj::Typed { elems, .. } => elems
+                .iter()
+                .map(|e| to_str(h, Value::Num(*e)))
+                .collect::<Vec<_>>()
+                .join(","),
+            Obj::DView { .. } => "[object DataView]".into(),
+            Obj::Buf { .. } => "[object ArrayBuffer]".into(),
+            Obj::Proxy { target, .. } => to_str(h, Value::Obj(*target)),
             Obj::Symbol { desc, .. } => match desc {
                 Some(s) => format!("Symbol({})", h.get_str(*s)),
                 None => "Symbol()".into(),
@@ -147,6 +160,11 @@ fn to_i32(h: &Heap, v: Value) -> i32 {
 
 fn to_u32(h: &Heap, v: Value) -> u32 {
     to_i32(h, v) as u32
+}
+
+/// JS ToUint8: truncate, wrap mod 256 (NaN/Infinity -> 0 via the cast).
+fn to_u8(h: &Heap, v: Value) -> u8 {
+    to_u8_num(to_num(h, v))
 }
 
 fn strict_eq(h: &Heap, l: Value, r: Value) -> bool {
@@ -204,8 +222,22 @@ fn rel(h: &Heap, l: Value, r: Value, nf: fn(f64, f64) -> bool, sf: fn(&str, &str
 /// is set at allocation; the cap also bounds absurdly deep chains).
 const MAX_PROTO_HOPS: u32 = 64;
 
+/// Follow Proxy.target links (proxy-of-proxy is legal JS); caps at 8
+/// hops, then returns whatever id that lands on.
+fn proxy_resolve(h: &Heap, mut id: u32) -> u32 {
+    for _ in 0..8 {
+        match h.obj(id) {
+            Obj::Proxy { target, .. } => id = *target,
+            _ => return id,
+        }
+    }
+    id
+}
+
 /// An object's own (non-inherited) prop. Arr owns "length" + indices.
+/// Proxies forward transparently (traps run only at the recv_ level).
 fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
+    let id = proxy_resolve(h, id);
     match h.obj(id) {
         Obj::Ordinary { pairs, .. } | Obj::Native { pairs, .. } => {
             pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
@@ -231,6 +263,45 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
             }
             pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
         }
+        Obj::Bytes { bytes, pairs, .. } => {
+            if key == "length" || key == "byteLength" {
+                return Some(Value::Num(bytes.len() as f64));
+            }
+            if let Ok(i) = key.parse::<usize>() {
+                if let Some(b) = bytes.get(i) {
+                    return Some(Value::Num(*b as f64));
+                }
+            }
+            pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+        }
+        Obj::Buf { bytes, .. } => match key {
+            "byteLength" => Some(Value::Num(bytes.len() as f64)),
+            _ => None,
+        },
+        Obj::Typed {
+            kind,
+            elems,
+            pairs,
+            ..
+        } => {
+            if key == "length" {
+                return Some(Value::Num(elems.len() as f64));
+            }
+            if key == "byteLength" {
+                return Some(Value::Num((elems.len() * t_bpe(*kind)) as f64));
+            }
+            if let Ok(i) = key.parse::<usize>() {
+                if let Some(e) = elems.get(i) {
+                    return Some(Value::Num(*e));
+                }
+            }
+            pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+        }
+        Obj::DView { bytes, off, .. } => match key {
+            "byteLength" => Some(Value::Num(bytes.len() as f64)),
+            "byteOffset" => Some(Value::Num(*off as f64)),
+            _ => None,
+        },
         Obj::RegExp {
             pat,
             flags,
@@ -255,15 +326,24 @@ fn own_prop(h: &Heap, id: u32, key: &str) -> Option<Value> {
         | Obj::Map { .. }
         | Obj::Set { .. }
         | Obj::WeakMap { .. }
+        | Obj::Proxy { .. }
         | Obj::Freed => None,
     }
 }
 
 /// Heap id of `id`'s prototype. Natives get the Function proto virtually;
-/// Dom has none.
+/// Dom has none. Proxies forward live to the target's proto
+/// (getPrototypeOf trap is a documented gap).
 fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
+    let id = proxy_resolve(h, id);
     match h.obj(id) {
-        Obj::Ordinary { proto, .. } | Obj::Arr { proto, .. } | Obj::Func { proto, .. } => *proto,
+        Obj::Ordinary { proto, .. }
+        | Obj::Arr { proto, .. }
+        | Obj::Func { proto, .. }
+        | Obj::Bytes { proto, .. }
+        | Obj::Buf { proto, .. }
+        | Obj::Typed { proto, .. }
+        | Obj::DView { proto, .. } => *proto,
         Obj::Native { .. } => po(protos.function_),
         Obj::Promise(_) => po(protos.promise),
         Obj::RegExp { proto, .. } => *proto,
@@ -273,6 +353,8 @@ fn proto_of(h: &Heap, protos: &Protos, id: u32) -> Option<u32> {
         Obj::Set { proto, .. } => *proto,
         Obj::WeakMap { proto, .. } => *proto,
         Obj::Style { .. } => po(protos.object),
+        // Deep chains past the resolve cap read as proto-less (gap).
+        Obj::Proxy { .. } => None,
         Obj::Dom(_) | Obj::Freed => None,
     }
 }
@@ -308,9 +390,20 @@ fn has_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> bool {
     false
 }
 
-/// `v[key]`: DOM node, live style block, or plain lookup.
+/// `v[key]`: DOM node, live style block, proxy trap, or plain lookup.
+/// Failures carry the call chain (unless they already do) for debugging.
 impl Interp {
     fn recv_get(&mut self, v: Value, key: &str) -> Result<Value, JsError> {
+        let r = self.recv_get_raw(v, key);
+        r.map_err(|e| self.chain_msg(e))
+    }
+
+    fn recv_get_raw(&mut self, v: Value, key: &str) -> Result<Value, JsError> {
+        if let Value::Obj(id) = v {
+            if matches!(self.heap.obj(id), Obj::Proxy { .. }) {
+                return self.proxy_get(id, key, v);
+            }
+        }
         if let Some(n) = self.as_node(v) {
             return self.dom_get(n, key);
         }
@@ -322,6 +415,17 @@ impl Interp {
     }
 
     fn recv_get_idx(&mut self, v: Value, k: Value) -> Result<Value, JsError> {
+        let r = self.recv_get_idx_raw(v, k);
+        r.map_err(|e| self.chain_msg(e))
+    }
+
+    fn recv_get_idx_raw(&mut self, v: Value, k: Value) -> Result<Value, JsError> {
+        if let Value::Obj(id) = v {
+            if matches!(self.heap.obj(id), Obj::Proxy { .. }) {
+                let key = to_str(&self.heap, k);
+                return self.proxy_get(id, &key, v);
+            }
+        }
         if let Some(n) = self.as_node(v) {
             let key = to_str(&self.heap, k);
             return self.dom_get(n, &key);
@@ -350,6 +454,11 @@ impl Interp {
     }
 
     fn recv_set(&mut self, v: Value, key: &str, val: Value) -> Result<(), JsError> {
+        if let Value::Obj(id) = v {
+            if matches!(self.heap.obj(id), Obj::Proxy { .. }) {
+                return self.proxy_set(id, key, val, v);
+            }
+        }
         if let Some(n) = self.as_node(v) {
             return self.dom_set(n, key, val);
         }
@@ -364,6 +473,12 @@ impl Interp {
     }
 
     fn recv_set_idx(&mut self, v: Value, k: Value, val: Value) -> Result<(), JsError> {
+        if let Value::Obj(id) = v {
+            if matches!(self.heap.obj(id), Obj::Proxy { .. }) {
+                let key = to_str(&self.heap, k);
+                return self.proxy_set(id, &key, val, v);
+            }
+        }
         if let Some(n) = self.as_node(v) {
             let key = to_str(&self.heap, k);
             return self.dom_set(n, &key, val);
@@ -400,13 +515,87 @@ impl Interp {
         self.call_value(Value::Obj(sid), recv, &[val], Some(key))?;
         Ok(true)
     }
+
+    /// `(target, handler)` pair of a proxy id (caller checked the variant).
+    fn proxy_parts(&self, pid: u32) -> (Value, Value) {
+        match self.heap.obj(pid) {
+            Obj::Proxy { target, handler } => (Value::Obj(*target), Value::Obj(*handler)),
+            _ => (Value::Undef, Value::Undef),
+        }
+    }
+
+    /// A handler trap by name (Func/Native only; proxies-as-traps and
+    /// non-callables count as absent - documented gap).
+    fn trap(&self, handler: Value, name: &str) -> Option<Value> {
+        let t = get_prop(&self.heap, &self.protos, handler, name).ok()?;
+        match t {
+            Value::Obj(id) => match self.heap.obj(id) {
+                Obj::Func { .. } | Obj::Native { .. } => Some(t),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Proxy read: `handler.get(target, key, recv)` when present, else
+    /// the target's value (with its getters applied, receiver = proxy).
+    fn proxy_get(&mut self, pid: u32, key: &str, recv: Value) -> Result<Value, JsError> {
+        let (target, handler) = self.proxy_parts(pid);
+        if let Some(t) = self.trap(handler, "get") {
+            let ks = self.heap.alloc_str(key.to_string())?;
+            return self.call_value(t, handler, &[target, Value::Str(ks), recv], None);
+        }
+        let val = get_prop(&self.heap, &self.protos, target, key)?;
+        self.invoke_getter(val, recv, key)
+    }
+
+    /// Proxy write: `handler.set(target, key, val, recv)` when present
+    /// (return ignored, sloppy), else the target's setter/own slot.
+    fn proxy_set(&mut self, pid: u32, key: &str, val: Value, recv: Value) -> Result<(), JsError> {
+        let (target, handler) = self.proxy_parts(pid);
+        if let Some(t) = self.trap(handler, "set") {
+            let ks = self.heap.alloc_str(key.to_string())?;
+            self.call_value(t, handler, &[target, Value::Str(ks), val, recv], None)?;
+            return Ok(());
+        }
+        let cur = get_prop(&self.heap, &self.protos, target, key)?;
+        if self.invoke_setter(cur, recv, val, key)? {
+            return Ok(());
+        }
+        set_prop(&mut self.heap, target, key, val)
+    }
+
+    /// `key in proxy`: `handler.has(target, key)` when present, else the
+    /// target's chain.
+    fn proxy_has(&mut self, pid: u32, key: &str) -> Result<bool, JsError> {
+        let (target, handler) = self.proxy_parts(pid);
+        if let Some(t) = self.trap(handler, "has") {
+            let ks = self.heap.alloc_str(key.to_string())?;
+            let r = self.call_value(t, handler, &[target, Value::Str(ks)], None)?;
+            return Ok(truthy(&self.heap, r));
+        }
+        Ok(has_prop(&self.heap, &self.protos, target, key))
+    }
+
+    /// `delete proxy[key]`: `handler.deleteProperty(target, key)` when
+    /// present (sloppy return), else delete on the target itself.
+    fn proxy_delete(&mut self, pid: u32, key: &str, kval: Option<Value>) -> Result<Value, JsError> {
+        let (target, handler) = self.proxy_parts(pid);
+        if let Some(t) = self.trap(handler, "deleteProperty") {
+            let ks = self.heap.alloc_str(key.to_string())?;
+            let r = self.call_value(t, handler, &[target, Value::Str(ks)], None)?;
+            return Ok(Value::Bool(truthy(&self.heap, r)));
+        }
+        self.delete_key(target, key, kval)
+    }
 }
 
 /// `v[key]`: own props, then proto chain, then Undef. Primitives map to
-/// their protos (Str keeps `length` first).
+/// their protos (Str keeps `length` first). Proxies forward to the target
+/// here (no traps - the recv_ level runs those before calling this).
 pub(crate) fn get_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> Result<Value, JsError> {
     match v {
-        Value::Obj(id) => walk_props(h, protos, Some(id), key),
+        Value::Obj(id) => walk_props(h, protos, Some(proxy_resolve(h, id)), key),
         Value::Str(id) => {
             if key == "length" {
                 return Ok(Value::Num(h.get_str(id).chars().count() as f64));
@@ -426,9 +615,58 @@ pub(crate) fn get_prop(h: &Heap, protos: &Protos, v: Value, key: &str) -> Result
     }
 }
 
+/// Typed-array store: canonical indices clamp in range and drop
+/// out-of-range writes (sloppy); `length`/`byteLength` are read-only
+/// no-ops; anything else is an expando pair.
+fn bytes_set(h: &mut Heap, id: u32, key: &str, val: Value) -> Result<(), JsError> {
+    if key == "length" || key == "byteLength" {
+        return Ok(());
+    }
+    let nb = to_u8(&*h, val);
+    if let Ok(i) = key.parse::<usize>() {
+        if let Obj::Bytes { bytes, .. } = h.obj_mut(id) {
+            if let Some(slot) = bytes.get_mut(i) {
+                *slot = nb;
+            }
+        }
+        return Ok(());
+    }
+    if let Obj::Bytes { pairs, .. } = h.obj_mut(id) {
+        match pairs.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = val,
+            None => pairs.push((key.to_string(), val)),
+        }
+    }
+    Ok(())
+}
+
+/// Typed-view store (non-u8): canonical indices coerce in range and
+/// drop out-of-range writes (sloppy); `length`/`byteLength` are
+/// read-only no-ops; anything else is an expando pair.
+fn typed_set(h: &mut Heap, id: u32, kind: TypedKind, key: &str, val: Value) -> Result<(), JsError> {
+    if key == "length" || key == "byteLength" {
+        return Ok(());
+    }
+    let ne = t_write(kind, to_num(&*h, val));
+    if let Ok(i) = key.parse::<usize>() {
+        if let Obj::Typed { elems, .. } = h.obj_mut(id) {
+            if let Some(slot) = elems.get_mut(i) {
+                *slot = ne;
+            }
+        }
+        return Ok(());
+    }
+    if let Obj::Typed { pairs, .. } = h.obj_mut(id) {
+        match pairs.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = val,
+            None => pairs.push((key.to_string(), val)),
+        }
+    }
+    Ok(())
+}
+
 /// Writes to own pairs only (Ordinary/Func/Native), like standard JS.
-pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<(), JsError> {
-    // Computed before the mutable borrow below.
+pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<(), JsError> {    // Computed before the mutable borrow below.
     let last_num = to_num(&*h, val);
     let kind = match v {
         Value::Obj(id) => match h.obj(id) {
@@ -442,12 +680,37 @@ pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<
             Obj::Map { .. } => "map",
             Obj::Set { .. } => "set",
             Obj::WeakMap { .. } => "weakmap",
+            Obj::Bytes { .. } => "uint8array",
+            Obj::Buf { .. } => "arraybuffer",
+            Obj::Typed { kind, .. } => match kind {
+                TypedKind::I8 => "int8array",
+                TypedKind::U8C => "uint8clampedarray",
+                TypedKind::U16 => "uint16array",
+                TypedKind::I16 => "int16array",
+                TypedKind::U32 => "uint32array",
+                TypedKind::I32 => "int32array",
+                TypedKind::F32 => "float32array",
+                TypedKind::F64 => "float64array",
+            },
+            Obj::DView { .. } => "dataview",
             _ => "object",
         },
         _ => "value",
     };
     match v {
-        Value::Obj(id) => match h.obj_mut(id) {
+        // Proxies land on the target here (no set trap - recv_set runs it).
+        Value::Obj(id) => {
+            let rid = proxy_resolve(h, id);
+            // Typed-array stores clamp in a separate step (the clamp
+            // reads while the slot write below borrows mutably).
+            if matches!(h.obj(rid), Obj::Bytes { .. }) {
+                return bytes_set(h, rid, key, val);
+            }
+            if let Obj::Typed { kind, .. } = h.obj(rid) {
+                let kind = *kind;
+                return typed_set(h, rid, kind, key, val);
+            }
+            match h.obj_mut(rid) {
             Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
                 match pairs.iter_mut().find(|(k, _)| k == key) {
                     Some(slot) => slot.1 = val,
@@ -492,8 +755,12 @@ pub(crate) fn set_prop(h: &mut Heap, v: Value, key: &str, val: Value) -> Result<
                 *last_index = last_num;
                 Ok(())
             }
+            // Buffers and views are non-extensible: every write is a
+            // sloppy no-op.
+            Obj::Buf { .. } | Obj::DView { .. } => Ok(()),
             _ => Err(err(format!("cannot set '{key}' on {kind}"))),
-        },
+            }
+        }
         Value::Undef | Value::Null => Err(err("cannot set property of null/undefined")),
         _ => Ok(()), // primitives: sloppy no-op like real JS
     }
@@ -506,6 +773,12 @@ fn get_index(h: &mut Heap, protos: &Protos, v: Value, k: Value) -> Result<Value,
             match h.obj(id) {
                 Obj::Arr { items, .. } if n >= 0.0 && n.fract() == 0.0 => {
                     Ok(items.get(n as usize).copied().unwrap_or(Value::Undef))
+                }
+                Obj::Bytes { bytes, .. } if n >= 0.0 && n.fract() == 0.0 => {
+                    Ok(bytes.get(n as usize).map(|b| Value::Num(*b as f64)).unwrap_or(Value::Undef))
+                }
+                Obj::Typed { elems, .. } if n >= 0.0 && n.fract() == 0.0 => {
+                    Ok(elems.get(n as usize).map(|e| Value::Num(*e)).unwrap_or(Value::Undef))
                 }
                 Obj::Dom(_) => Ok(Value::Undef),
                 _ => {
@@ -540,6 +813,39 @@ fn get_index(h: &mut Heap, protos: &Protos, v: Value, k: Value) -> Result<Value,
 fn set_index(h: &mut Heap, v: Value, k: Value, val: Value) -> Result<(), JsError> {
     match v {
         Value::Obj(id) => {
+            if matches!(h.obj(id), Obj::Bytes { .. }) {
+                // Sloppy out-of-range writes drop; length is read-only.
+                let n = to_num(h, k);
+                if n >= 0.0 && n.fract() == 0.0 {
+                    let b = to_u8(&*h, val);
+                    if let Obj::Bytes { bytes, .. } = h.obj_mut(id) {
+                        if let Some(slot) = bytes.get_mut(n as usize) {
+                            *slot = b;
+                        }
+                    }
+                    return Ok(());
+                }
+                let key = to_str(h, k);
+                return set_prop(h, v, &key, val);
+            }
+            let tkind = match h.obj(id) {
+                Obj::Typed { kind, .. } => Some(*kind),
+                _ => None,
+            };
+            if let Some(kind) = tkind {
+                let n = to_num(h, k);
+                if n >= 0.0 && n.fract() == 0.0 {
+                    let ne = t_write(kind, to_num(&*h, val));
+                    if let Obj::Typed { elems, .. } = h.obj_mut(id) {
+                        if let Some(slot) = elems.get_mut(n as usize) {
+                            *slot = ne;
+                        }
+                    }
+                    return Ok(());
+                }
+                let key = to_str(h, k);
+                return set_prop(h, v, &key, val);
+            }
             if matches!(h.obj(id), Obj::Arr { .. }) {
                 let n = to_num(h, k);
                 if !(n >= 0.0 && n.fract() == 0.0 && n <= 10_000_000.0) {
@@ -935,6 +1241,9 @@ impl Interp {
         self.protos.object = object;
         self.put(object, "hasOwnProperty", n_has_own);
         self.put(object, "toString", n_obj_to_string);
+        self.put(object, "isPrototypeOf", n_is_proto);
+        self.put(object, "propertyIsEnumerable", n_prop_is_enum);
+        self.put(object, "valueOf", n_value_of);
 
         self.protos.function_ = self.proto_bag(&[
             ("call", n_fn_call),
@@ -989,7 +1298,10 @@ impl Interp {
             ("padStart", n_str_pad_start),
             ("padEnd", n_str_pad_end),
         ]);
-        self.protos.number = self.proto_bag(&[("toFixed", n_num_to_fixed)]);
+        self.protos.number = self.proto_bag(&[
+            ("toFixed", n_num_to_fixed),
+            ("toString", n_num_to_string),
+        ]);
         self.protos.promise = self.proto_bag(&[
             ("then", n_promise_then),
             ("catch", n_promise_catch),
@@ -1001,6 +1313,52 @@ impl Interp {
             ("valueOf", n_date_get_time),
         ]);
         self.protos.url = self.proto_bag(&[]);
+        self.protos.uint8array = self.proto_bag(&[
+            ("set", n_u8_set),
+            ("slice", n_u8_slice),
+            ("subarray", n_u8_subarray),
+            ("join", n_u8_join),
+            ("fill", n_u8_fill),
+            ("indexOf", n_u8_index_of),
+        ]);
+        self.protos.buffer = self.proto_bag(&[("slice", n_buf_slice)]);
+        // One method set shared across view kinds (kind rides the instance).
+        let t_methods = &[
+            ("set", n_t_set as NativeFn),
+            ("slice", n_t_slice),
+            ("subarray", n_t_subarray),
+            ("join", n_t_join),
+            ("fill", n_t_fill),
+            ("indexOf", n_t_index_of),
+        ];
+        self.protos.int8array = self.proto_bag(t_methods);
+        self.protos.uint8clampedarray = self.proto_bag(t_methods);
+        self.protos.uint16array = self.proto_bag(t_methods);
+        self.protos.int16array = self.proto_bag(t_methods);
+        self.protos.uint32array = self.proto_bag(t_methods);
+        self.protos.int32array = self.proto_bag(t_methods);
+        self.protos.float32array = self.proto_bag(t_methods);
+        self.protos.float64array = self.proto_bag(t_methods);
+        self.protos.dataview = self.proto_bag(&[
+            ("getUint8", n_dv_get_u8 as NativeFn),
+            ("getUint16", n_dv_get_u16),
+            ("getUint32", n_dv_get_u32),
+            ("getInt8", n_dv_get_i8),
+            ("getInt16", n_dv_get_i16),
+            ("getInt32", n_dv_get_i32),
+            ("getFloat32", n_dv_get_f32),
+            ("getFloat64", n_dv_get_f64),
+            ("setUint8", n_dv_set_u8),
+            ("setUint16", n_dv_set_u16),
+            ("setUint32", n_dv_set_u32),
+            ("setInt8", n_dv_set_i8),
+            ("setInt16", n_dv_set_i16),
+            ("setInt32", n_dv_set_i32),
+            ("setFloat32", n_dv_set_f32),
+            ("setFloat64", n_dv_set_f64),
+        ]);
+        self.protos.textencoder = self.proto_bag(&[("encode", n_te_encode)]);
+        self.protos.textdecoder = self.proto_bag(&[("decode", n_td_decode)]);
         // Map/Set/WeakMap prototypes; `size` is an accessor (no data slot).
         // (One block per kind: sharing `self` mutably across a table would
         // need unsafe, which this codebase forbids outside vigia-mem.)
@@ -1147,6 +1505,83 @@ impl Interp {
         self.ctor("Map", n_map_ctor, pr.map, &[]);
         self.ctor("Set", n_set_ctor, pr.set, &[]);
         self.ctor("WeakMap", n_weakmap_ctor, pr.weakmap, &[]);
+        self.ctor("ArrayBuffer", n_buf_ctor, pr.buffer, &[]);
+        self.ctor(
+            "Uint8Array",
+            n_u8_ctor,
+            pr.uint8array,
+            &[("of", n_u8_of), ("from", n_u8_from)],
+        );
+        self.ctor(
+            "Int8Array",
+            n_i8_ctor,
+            pr.int8array,
+            &[("of", n_i8_of), ("from", n_i8_from)],
+        );
+        self.ctor(
+            "Uint8ClampedArray",
+            n_u8c_ctor,
+            pr.uint8clampedarray,
+            &[("of", n_u8c_of), ("from", n_u8c_from)],
+        );
+        self.ctor(
+            "Uint16Array",
+            n_u16_ctor,
+            pr.uint16array,
+            &[("of", n_u16_of), ("from", n_u16_from)],
+        );
+        self.ctor(
+            "Int16Array",
+            n_i16_ctor,
+            pr.int16array,
+            &[("of", n_i16_of), ("from", n_i16_from)],
+        );
+        self.ctor(
+            "Uint32Array",
+            n_u32_ctor,
+            pr.uint32array,
+            &[("of", n_u32_of), ("from", n_u32_from)],
+        );
+        self.ctor(
+            "Int32Array",
+            n_i32_ctor,
+            pr.int32array,
+            &[("of", n_i32_of), ("from", n_i32_from)],
+        );
+        self.ctor(
+            "Float32Array",
+            n_f32_ctor,
+            pr.float32array,
+            &[("of", n_f32_of), ("from", n_f32_from)],
+        );
+        self.ctor(
+            "Float64Array",
+            n_f64_ctor,
+            pr.float64array,
+            &[("of", n_f64_of), ("from", n_f64_from)],
+        );
+        self.ctor("DataView", n_dv_ctor, pr.dataview, &[]);
+        self.ctor("TextEncoder", n_te_ctor, pr.textencoder, &[]);
+        self.ctor("TextDecoder", n_td_ctor, pr.textdecoder, &[]);
+        self.ctor("Function", n_function_ctor, pr.function_, &[]);
+        // Numeric statics the bundle reads (BYTES_PER_ELEMENT per view).
+        for (name, bpe) in [
+            ("Uint8Array", 1.0),
+            ("Int8Array", 1.0),
+            ("Uint8ClampedArray", 1.0),
+            ("Uint16Array", 2.0),
+            ("Int16Array", 2.0),
+            ("Uint32Array", 4.0),
+            ("Int32Array", 4.0),
+            ("Float32Array", 4.0),
+            ("Float64Array", 8.0),
+        ] {
+            if let Some(c) = self.env_get(0, name) {
+                let _ = set_prop(&mut self.heap, c, "BYTES_PER_ELEMENT", Value::Num(bpe));
+            }
+        }
+        let proxyp = self.proto_bag(&[]);
+        self.ctor("Proxy", n_proxy_ctor, proxyp, &[]);
         self.ctor("Error", n_error, pr.error, &[]);
         // Error subtypes: own prototype under Error.prototype (so
         // `instanceof Error` holds) with their `name`, same construct
@@ -1189,6 +1624,8 @@ impl Interp {
             ("clearTimeout", n_clear_timeout),
             ("clearInterval", n_clear_interval),
             ("queueMicrotask", n_queue_microtask),
+            ("atob", n_atob),
+            ("btoa", n_btoa),
         ] {
             if let Ok(id) = self.heap.alloc_obj(nat(n, f)) {
                 self.env_declare(0, n, Value::Obj(id));
@@ -1206,6 +1643,8 @@ impl Interp {
             ("abs", n_math_abs),
             ("pow", n_math_pow),
             ("sqrt", n_math_sqrt),
+            ("fround", n_math_fround),
+            ("trunc", n_math_trunc),
         ] {
             match self.heap.alloc_obj(nat(n, f)) {
                 Ok(id) => mp.push((n.into(), Value::Obj(id))),
@@ -1234,6 +1673,31 @@ impl Interp {
         }
         if let Ok(f) = self.heap.alloc_obj(nat("fetch", n_fetch)) {
             self.env_declare(0, "fetch", Value::Obj(f));
+        }
+        // Numeric globals (writable in sloppy reality; plain slots here).
+        self.env_declare(0, "NaN", Value::Num(f64::NAN));
+        self.env_declare(0, "Infinity", Value::Num(f64::INFINITY));
+        // Reflect: plain object (no constructor). Reads/writes honor
+        // proxy traps; the rest forwards to the shared free-fn paths.
+        let mut rp: Vec<(String, Value)> = Vec::new();
+        for (n, f) in [
+            ("get", n_reflect_get as NativeFn),
+            ("set", n_reflect_set),
+            ("has", n_reflect_has),
+            ("deleteProperty", n_reflect_delete),
+            ("getOwnPropertyDescriptor", n_reflect_get_desc),
+            ("getPrototypeOf", n_reflect_get_proto),
+            ("ownKeys", n_reflect_own_keys),
+            ("construct", n_reflect_construct),
+            ("apply", n_reflect_apply),
+        ] {
+            match self.heap.alloc_obj(nat(n, f)) {
+                Ok(id) => rp.push((n.into(), Value::Obj(id))),
+                Err(_) => break,
+            }
+        }
+        if let Ok(r) = self.obj_pairs(rp) {
+            self.env_declare(0, "Reflect", Value::Obj(r));
         }
         self.env_declare(0, "this", Value::Undef);
     }
@@ -1584,6 +2048,26 @@ impl Interp {
         parts.join(" > ")
     }
 
+    /// "{msg} (in a > b)" when inside calls - the same chain context
+    /// undefined_err adds, for errors raised at call boundaries.
+    fn err_chain(&self, msg: String) -> JsError {
+        if self.js_stack.is_empty() {
+            return err(msg);
+        }
+        err(format!("{msg} (in {})", self.js_chain()))
+    }
+
+    /// Append the call chain to a propagated Msg (member reads, calls)
+    /// unless it already carries one - pinpoints bundle failures.
+    fn chain_msg(&self, e: JsError) -> JsError {
+        match e {
+            JsError::Msg(m) if !m.contains("(in ") && !self.js_stack.is_empty() => {
+                JsError::Msg(format!("{m} (in {})", self.js_chain()))
+            }
+            _ => e,
+        }
+    }
+
     /// "{n} is not defined", plus the call chain when inside calls.
     fn undefined_err(&self, n: &str) -> JsError {
         let mut m = format!("{n} is not defined");
@@ -1807,7 +2291,19 @@ impl Interp {
         match v {
             Value::Obj(id) => match self.heap.obj(id) {
                 Obj::Arr { items, .. } => Ok(items.clone()),
-                _ => Err(err("for-of only over arrays and strings")),
+                Obj::Bytes { bytes, .. } => {
+                    Ok(bytes.iter().map(|b| Value::Num(*b as f64)).collect())
+                }
+                Obj::Typed { elems, .. } => Ok(elems.iter().map(|e| Value::Num(*e)).collect()),
+                Obj::Set { items, .. } => Ok(items.clone()),
+                Obj::Map { entries, .. } => {
+                    let mut out = Vec::with_capacity(entries.len());
+                    for (k, v) in entries.clone() {
+                        out.push(Value::Obj(self.arr_obj(vec![k, v])?));
+                    }
+                    Ok(out)
+                }
+                _ => Err(err("for-of only over arrays, typed arrays, sets, maps and strings")),
             },
             Value::Str(id) => {
                 let s = self.heap.get_str(id).to_string();
@@ -1817,7 +2313,7 @@ impl Interp {
                 }
                 Ok(out)
             }
-            _ => Err(err("for-of only over arrays and strings")),
+            _ => Err(err("for-of only over arrays, typed arrays, sets, maps and strings")),
         }
     }
 
@@ -1826,6 +2322,11 @@ impl Interp {
     fn for_in_keys(&mut self, env: u32, obj: &Expr) -> Result<Vec<Value>, JsError> {
         let v = self.expr(env, obj)?;
         let mut keys: Vec<String> = Vec::new();
+        // ownKeys trap is a documented gap: proxies enumerate the target.
+        let v = match v {
+            Value::Obj(id) => Value::Obj(proxy_resolve(&self.heap, id)),
+            _ => v,
+        };
         match v {
             Value::Obj(id) => match self.heap.obj(id) {
                 Obj::Ordinary { pairs, .. }
@@ -1837,6 +2338,14 @@ impl Interp {
                     keys.extend((0..items.len()).map(|i| i.to_string()));
                     keys.extend(pairs.iter().map(|(k, _)| k.clone()));
                 }
+                Obj::Bytes { bytes, pairs, .. } => {
+                    keys.extend((0..bytes.len()).map(|i| i.to_string()));
+                    keys.extend(pairs.iter().map(|(k, _)| k.clone()));
+                }
+                Obj::Typed { elems, pairs, .. } => {
+                    keys.extend((0..elems.len()).map(|i| i.to_string()));
+                    keys.extend(pairs.iter().map(|(k, _)| k.clone()));
+                }
                 Obj::RegExp { .. }
                 | Obj::Promise(_)
                 | Obj::Dom(_)
@@ -1846,6 +2355,9 @@ impl Interp {
                 | Obj::Map { .. }
                 | Obj::Set { .. }
                 | Obj::WeakMap { .. }
+                | Obj::Proxy { .. }
+                | Obj::Buf { .. }
+                | Obj::DView { .. }
                 | Obj::Freed => {}
             },
             Value::Str(id) => {
@@ -2187,6 +2699,9 @@ impl Interp {
 
     fn delete_key(&mut self, t: Value, key: &str, kval: Option<Value>) -> Result<Value, JsError> {
         match t {
+            Value::Obj(id) if matches!(self.heap.obj(id), Obj::Proxy { .. }) => {
+                self.proxy_delete(id, key, kval)
+            }
             Value::Obj(id) => match self.heap.obj(id) {
                 Obj::Ordinary { .. } | Obj::Func { .. } | Obj::Native { .. } => {
                     if let Obj::Ordinary { pairs, .. }
@@ -2231,6 +2746,34 @@ impl Interp {
                         k => k,
                     };
                     self.dom_remove_attr(n, attr)?;
+                    Ok(Value::Bool(true))
+                }
+                // Typed-array indices are non-configurable (false);
+                // expandos delete like ordinary props.
+                Obj::Bytes { bytes, .. } => {
+                    let locked = key
+                        .parse::<usize>()
+                        .map(|i| i < bytes.len())
+                        .unwrap_or(false);
+                    if locked {
+                        return Ok(Value::Bool(false));
+                    }
+                    if let Obj::Bytes { pairs, .. } = self.heap.obj_mut(id) {
+                        pairs.retain(|(k, _)| k != key);
+                    }
+                    Ok(Value::Bool(true))
+                }
+                Obj::Typed { elems, .. } => {
+                    let locked = key
+                        .parse::<usize>()
+                        .map(|i| i < elems.len())
+                        .unwrap_or(false);
+                    if locked {
+                        return Ok(Value::Bool(false));
+                    }
+                    if let Obj::Typed { pairs, .. } = self.heap.obj_mut(id) {
+                        pairs.retain(|(k, _)| k != key);
+                    }
                     Ok(Value::Bool(true))
                 }
                 _ => Ok(Value::Bool(true)),
@@ -2325,8 +2868,13 @@ impl Interp {
             ">>" => Value::Num((to_i32(h, l) >> (to_i32(h, r) & 31)) as f64),
             ">>>" => Value::Num((to_u32(h, l) >> (to_u32(h, r) & 31)) as f64),
             "in" => {
-                let key = to_str(h, l);
+                let key = to_str(&*h, l);
                 match r {
+                    Value::Obj(id)
+                        if matches!(h.obj(id), Obj::Proxy { .. }) =>
+                    {
+                        Value::Bool(self.proxy_has(id, &key)?)
+                    }
                     Value::Obj(_) => Value::Bool(has_prop(h, &self.protos, r, &key)),
                     _ => return Err(err("'in' needs an object on the right")),
                 }
@@ -2538,14 +3086,36 @@ impl Interp {
         Ok(v)
     }
 
-    /// `...x` in calls and arrays: x must be an array (strict subset).
+    /// `...x` in calls and arrays: arrays, strings, typed views, Sets
+    /// (Map spreads as [k,v] pairs). Custom iterables via
+    /// Symbol.iterator are a documented gap.
     fn spread_items(&mut self, env: u32, e: &Expr) -> Result<Vec<Value>, JsError> {
         match self.expr(env, e)? {
             Value::Obj(id) => match self.heap.obj(id) {
                 Obj::Arr { items, .. } => Ok(items.clone()),
-                _ => Err(err("spread of a non-array")),
+                Obj::Bytes { bytes, .. } => {
+                    Ok(bytes.iter().map(|b| Value::Num(*b as f64)).collect())
+                }
+                Obj::Typed { elems, .. } => Ok(elems.iter().map(|e| Value::Num(*e)).collect()),
+                Obj::Set { items, .. } => Ok(items.clone()),
+                Obj::Map { entries, .. } => {
+                    let mut out = Vec::with_capacity(entries.len());
+                    for (k, v) in entries.clone() {
+                        out.push(Value::Obj(self.arr_obj(vec![k, v])?));
+                    }
+                    Ok(out)
+                }
+                _ => Err(err("spread of a non-iterable")),
             },
-            _ => Err(err("spread of a non-array")),
+            Value::Str(id) => {
+                let s = self.heap.get_str(id).to_string();
+                let mut out = Vec::with_capacity(s.len());
+                for c in s.chars() {
+                    out.push(Value::Str(self.heap.alloc_str(c.to_string())?));
+                }
+                Ok(out)
+            }
+            _ => Err(err("spread of a non-iterable")),
         }
     }
 
@@ -2618,13 +3188,34 @@ impl Interp {
                 }
                 Ok(out)
             }
-            Value::Obj(id) => match self.heap.obj(id) {
+            // ownKeys trap is a documented gap: proxies spread the target.
+            Value::Obj(id) => {
+                let rid = proxy_resolve(&self.heap, id);
+                match self.heap.obj(rid) {
                 Obj::Arr { items, pairs, .. } => {
                     let mut out: Vec<(String, Value)> = items
                         .clone()
                         .into_iter()
                         .enumerate()
                         .map(|(i, v)| (i.to_string(), v))
+                        .collect();
+                    out.extend(pairs.clone());
+                    Ok(out)
+                }
+                Obj::Bytes { bytes, pairs, .. } => {
+                    let mut out: Vec<(String, Value)> = bytes
+                        .iter()
+                        .enumerate()
+                        .map(|(i, b)| (i.to_string(), Value::Num(*b as f64)))
+                        .collect();
+                    out.extend(pairs.clone());
+                    Ok(out)
+                }
+                Obj::Typed { elems, pairs, .. } => {
+                    let mut out: Vec<(String, Value)> = elems
+                        .iter()
+                        .enumerate()
+                        .map(|(i, e)| (i.to_string(), Value::Num(*e)))
                         .collect();
                     out.extend(pairs.clone());
                     Ok(out)
@@ -2641,8 +3232,73 @@ impl Interp {
                 | Obj::Map { .. }
                 | Obj::Set { .. }
                 | Obj::WeakMap { .. }
+                | Obj::Proxy { .. }
+                | Obj::Buf { .. }
+                | Obj::DView { .. }
                 | Obj::Freed => Ok(vec![]),
-            },
+                }
+            }
+        }
+    }
+
+    /// Trace aid: dump innermost lexical frames (locals) so anonymous
+    /// bundle functions can be told apart. Zero cost unless VIGIA_JSENVDUMP.
+    fn dump_envs(&self, env: u32) {
+        if std::env::var_os("VIGIA_JSENVDUMP").is_none() {
+            return;
+        }
+        // JS stack signatures: name(params)@defenv for each live frame.
+        let mut sigs = Vec::new();
+        for &id in &self.js_stack {
+            match self.heap.obj(id) {
+                Obj::Func { def, env: fenv, .. } => {
+                    let ps: Vec<String> = def
+                        .params
+                        .iter()
+                        .map(|(p, d)| {
+                            let s = match p {
+                                Pat::Ident(n) => n.clone(),
+                                _ => "?pat".into(),
+                            };
+                            if d.is_some() {
+                                format!("{s}=d")
+                            } else {
+                                s
+                            }
+                        })
+                        .collect();
+                    sigs.push(format!(
+                        "{}({})@{}",
+                        def.name.clone().unwrap_or_else(|| "?".into()),
+                        ps.join(","),
+                        fenv
+                    ));
+                }
+                Obj::Native { name, .. } => sigs.push(format!("[{name}]")),
+                _ => sigs.push("[?]".into()),
+            }
+        }
+        eprintln!("js? stack: {}", sigs.join(" > "));
+        let mut e = Some(env);
+        for _ in 0..3 {
+            let Some(id) = e else { break };
+            let Some(ev) = self.envs.get(id as usize) else {
+                break;
+            };
+            let mut names: Vec<String> = ev
+                .vars
+                .iter()
+                .take(60)
+                .map(|(k, v)| {
+                    format!(
+                        "{k}={}",
+                        self.inspect(*v).chars().take(60).collect::<String>()
+                    )
+                })
+                .collect();
+            names.sort();
+            eprintln!("js? env{id}: {}", names.join(" "));
+            e = ev.parent;
         }
     }
 
@@ -2650,14 +3306,28 @@ impl Interp {
         let (f, this, hint) = match callee {
             Expr::Member(o, name) => {
                 let recv = self.expr(env, o)?;
+                if matches!(recv, Value::Null | Value::Undef) {
+                    self.dump_envs(env);
+                    if std::env::var_os("VIGIA_JSENVDUMP").is_some() {
+                        let dbg = format!("{o:?}");
+                        eprintln!(
+                            "js? .{name} of nullish from {:.300}",
+                            dbg.chars().take(300).collect::<String>()
+                        );
+                    }
+                }
                 // DOM node methods dispatch on the node, not the property map
                 if let Some(n) = self.as_node(recv) {
                     return self.call_dom(n, name, env, arg_es);
                 }
                 // proto chains resolve string/array/etc methods to Natives;
-                // `this` = the receiver
+                // `this` = the receiver. Getters apply like a plain read.
                 (
-                    get_prop(&self.heap, &self.protos, recv, name)?,
+                    {
+                        let val = get_prop(&self.heap, &self.protos, recv, name)
+                            .map_err(|e| self.chain_msg(e))?;
+                        self.invoke_getter(val, recv, name)?
+                    },
                     recv,
                     Some(name.as_str()),
                 )
@@ -2672,7 +3342,12 @@ impl Interp {
                     }
                 }
                 (
-                    get_index(&mut self.heap, &self.protos, recv, k)?,
+                    {
+                        let val = get_index(&mut self.heap, &self.protos, recv, k)
+                            .map_err(|e| self.chain_msg(e))?;
+                        let key = to_str(&self.heap, k);
+                        self.invoke_getter(val, recv, &key)?
+                    },
                     recv,
                     None,
                 )
@@ -2697,13 +3372,24 @@ impl Interp {
                     _ => po(self.protos.object),
                 };
                 (
-                    walk_props(&self.heap, &self.protos, proto, &key)?,
+                    {
+                        let val = walk_props(&self.heap, &self.protos, proto, &key)?;
+                        self.invoke_getter(val, recv, &key)?
+                    },
                     recv,
                     None,
                 )
             }
             _ => (self.expr(env, callee)?, Value::Undef, None),
         };
+        // Trace aid: what non-function value sits in callee position.
+        if std::env::var_os("VIGIA_JSTRACE").is_some() && !matches!(f, Value::Obj(_)) {
+            eprintln!(
+                "js? callee {:?} holds {}",
+                hint.unwrap_or("?"),
+                self.inspect(f)
+            );
+        }
         if let Value::Obj(id) = f {
             if let Obj::Func { def, .. } = self.heap.obj(id) {
                 if def.cls.is_some() {
@@ -2818,7 +3504,7 @@ impl Interp {
         let id = match f {
             Value::Obj(id) => id,
             _ => {
-                return Err(err(format!(
+                return Err(self.err_chain(format!(
                     "{} is not a function",
                     hint.unwrap_or(type_str(&self.heap, f))
                 )))
@@ -2828,7 +3514,7 @@ impl Interp {
             Obj::Func { def, env, .. } => C::Fn(def.clone(), *env),
             Obj::Native { f, .. } => C::Nat(*f),
             _ => {
-                return Err(err(format!(
+                return Err(self.err_chain(format!(
                     "{} is not a function",
                     hint.unwrap_or("object")
                 )))
@@ -3301,6 +3987,7 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
         }
         Value::Str(id) => Json::Str(h.get_str(id).to_string()),
         Value::Obj(id) => match h.obj(id) {
+            Obj::Proxy { target, .. } => return val_to_json(h, Value::Obj(*target), depth),
             Obj::Ordinary { pairs, .. } => Json::Obj(
                 pairs
                     .iter()
@@ -3322,6 +4009,22 @@ fn val_to_json(h: &Heap, v: Value, depth: u32) -> Result<Json, JsError> {
             Obj::Map { .. } => Json::Obj(vec![]),
             Obj::Set { .. } => Json::Obj(vec![]),
             Obj::WeakMap { .. } => Json::Obj(vec![]),
+            Obj::Bytes { bytes, .. } => Json::Obj(
+                bytes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| (i.to_string(), Json::Num(*b as f64)))
+                    .collect(),
+            ),
+            Obj::Typed { elems, .. } => Json::Obj(
+                elems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (i.to_string(), Json::Num(*e)))
+                    .collect(),
+            ),
+            Obj::DView { .. } => Json::Obj(vec![]),
+            Obj::Buf { .. } => Json::Obj(vec![]),
             Obj::Style { .. } => Json::Obj(vec![]),
         },
     })
@@ -3353,6 +4056,8 @@ fn this_arr(it: &Interp, this: Value) -> Result<u32, JsError> {
 fn arr_items(it: &Interp, id: u32) -> Vec<Value> {
     match it.heap.obj(id) {
         Obj::Arr { items, .. } => items.clone(),
+        Obj::Bytes { bytes, .. } => bytes.iter().map(|b| Value::Num(*b as f64)).collect(),
+        Obj::Typed { elems, .. } => elems.iter().map(|e| Value::Num(*e)).collect(),
         _ => Vec::new(),
     }
 }
@@ -3373,6 +4078,37 @@ fn n_has_own(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsEr
     Ok(Value::Bool(hit))
 }
 
+/// Object.prototype.isPrototypeOf(v): `this` on v's proto chain (Chart.js
+/// registry shape). Non-objects on either side read false, like V8.
+fn n_is_proto(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (Value::Obj(tid), Value::Obj(mut cur)) = (this, arg(args, 0)) else {
+        return Ok(Value::Bool(false));
+    };
+    for _ in 0..64 {
+        match proto_of(&it.heap, &it.protos, cur) {
+            Some(p) if p == tid => return Ok(Value::Bool(true)),
+            Some(p) => cur = p,
+            None => return Ok(Value::Bool(false)),
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+fn n_prop_is_enum(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let key = to_str(&it.heap, arg(args, 0));
+    let hit = match this {
+        Value::Obj(id) => own_prop(&it.heap, id, &key).is_some(),
+        Value::Str(id) => key.parse::<usize>().is_ok_and(|i| i < it.heap.get_str(id).chars().count()),
+        _ => false,
+    };
+    Ok(Value::Bool(hit))
+}
+
+fn n_value_of(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let _ = it;
+    Ok(this)
+}
+
 fn n_obj_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
     let tag = match this {
         Value::Undef => "[object Undefined]",
@@ -3391,6 +4127,11 @@ fn n_obj_to_string(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Valu
             Obj::Map { .. } => "[object Map]",
             Obj::Set { .. } => "[object Set]",
             Obj::WeakMap { .. } => "[object WeakMap]",
+            Obj::Bytes { .. } => "[object Uint8Array]",
+            Obj::Typed { kind, .. } => t_tag(*kind),
+            Obj::DView { .. } => "[object DataView]",
+            Obj::Buf { .. } => "[object ArrayBuffer]",
+            Obj::Proxy { .. } => "[object Object]",
             Obj::Style { .. } => "[object CSSStyleDeclaration]",
             Obj::Ordinary { .. } | Obj::Freed => "[object Object]",
         },
@@ -3410,9 +4151,10 @@ fn n_object(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsErr
 }
 
 /// Own enumerable (key, value) pairs; arrays enumerate as index strings.
+/// Proxies enumerate the target (ownKeys trap is a documented gap).
 fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
     match v {
-        Value::Obj(id) => match h.obj(id) {
+        Value::Obj(id) => match h.obj(proxy_resolve(h, id)) {
             Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
                 pairs.clone()
             }
@@ -3421,6 +4163,24 @@ fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
                     .iter()
                     .enumerate()
                     .map(|(i, x)| (i.to_string(), *x))
+                    .collect();
+                out.extend(pairs.iter().cloned());
+                out
+            }
+            Obj::Bytes { bytes, pairs, .. } => {
+                let mut out: Vec<(String, Value)> = bytes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| (i.to_string(), Value::Num(*b as f64)))
+                    .collect();
+                out.extend(pairs.iter().cloned());
+                out
+            }
+            Obj::Typed { elems, pairs, .. } => {
+                let mut out: Vec<(String, Value)> = elems
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| (i.to_string(), Value::Num(*e)))
                     .collect();
                 out.extend(pairs.iter().cloned());
                 out
@@ -3434,6 +4194,9 @@ fn own_pairs(h: &Heap, v: Value) -> Vec<(String, Value)> {
             | Obj::Map { .. }
             | Obj::Set { .. }
             | Obj::WeakMap { .. }
+            | Obj::Proxy { .. }
+            | Obj::Buf { .. }
+            | Obj::DView { .. }
             | Obj::Freed => Vec::new(),
         },
         _ => Vec::new(),
@@ -3576,6 +4339,14 @@ fn n_obj_own_names(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Valu
                 .map(|i| i.to_string())
                 .chain(pairs.iter().map(|(k, _)| k.clone()))
                 .collect(),
+            Obj::Bytes { bytes, pairs, .. } => (0..bytes.len())
+                .map(|i| i.to_string())
+                .chain(pairs.iter().map(|(k, _)| k.clone()))
+                .collect(),
+            Obj::Typed { elems, pairs, .. } => (0..elems.len())
+                .map(|i| i.to_string())
+                .chain(pairs.iter().map(|(k, _)| k.clone()))
+                .collect(),
             _ => Vec::new(),
         },
         _ => Vec::new(),
@@ -3595,7 +4366,12 @@ fn n_obj_own_symbols(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<V
 
 /// `{value,writable,enumerable,configurable}` or the accessor triple.
 /// All props report mutable + enumerable, except array `length`.
+/// Proxies describe the target (getOwnPropertyDescriptor trap gap).
 fn describe_own(it: &mut Interp, target: Value, key: &str) -> Result<Value, JsError> {
+    let target = match target {
+        Value::Obj(id) => Value::Obj(proxy_resolve(&it.heap, id)),
+        _ => target,
+    };
     let mut desc: Vec<(String, Value)> = vec![
         ("enumerable".into(), Value::Bool(true)),
         ("configurable".into(), Value::Bool(true)),
@@ -3617,6 +4393,38 @@ fn describe_own(it: &mut Interp, target: Value, key: &str) -> Result<Value, JsEr
                 }
                 if let Ok(i) = key.parse::<usize>() {
                     items.get(i).copied()
+                } else {
+                    pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+                }
+            }
+            Obj::Bytes { bytes, pairs, .. } => {
+                if key == "length" {
+                    desc = vec![
+                        ("value".into(), Value::Num(bytes.len() as f64)),
+                        ("writable".into(), Value::Bool(false)),
+                        ("enumerable".into(), Value::Bool(false)),
+                        ("configurable".into(), Value::Bool(false)),
+                    ];
+                    return Ok(Value::Obj(it.obj_pairs(desc)?));
+                }
+                if let Ok(i) = key.parse::<usize>() {
+                    bytes.get(i).map(|b| Value::Num(*b as f64))
+                } else {
+                    pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
+                }
+            }
+            Obj::Typed { elems, pairs, .. } => {
+                if key == "length" {
+                    desc = vec![
+                        ("value".into(), Value::Num(elems.len() as f64)),
+                        ("writable".into(), Value::Bool(false)),
+                        ("enumerable".into(), Value::Bool(false)),
+                        ("configurable".into(), Value::Bool(false)),
+                    ];
+                    return Ok(Value::Obj(it.obj_pairs(desc)?));
+                }
+                if let Ok(i) = key.parse::<usize>() {
+                    elems.get(i).map(|e| Value::Num(*e))
                 } else {
                     pairs.iter().find(|(k, _)| k == key).map(|(_, v)| *v)
                 }
@@ -3657,11 +4465,20 @@ fn n_obj_get_desc(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value
 fn n_obj_get_descs(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
     let mut out = Vec::new();
     if let Value::Obj(id) = arg(args, 0) {
+        let id = proxy_resolve(&it.heap, id);
         let keys: Vec<String> = match it.heap.obj(id) {
             Obj::Ordinary { pairs, .. } | Obj::Func { pairs, .. } | Obj::Native { pairs, .. } => {
                 pairs.iter().map(|(k, _)| k.clone()).collect()
             }
             Obj::Arr { items, pairs, .. } => (0..items.len())
+                .map(|i| i.to_string())
+                .chain(pairs.iter().map(|(k, _)| k.clone()))
+                .collect(),
+            Obj::Bytes { bytes, pairs, .. } => (0..bytes.len())
+                .map(|i| i.to_string())
+                .chain(pairs.iter().map(|(k, _)| k.clone()))
+                .collect(),
+            Obj::Typed { elems, pairs, .. } => (0..elems.len())
                 .map(|i| i.to_string())
                 .chain(pairs.iter().map(|(k, _)| k.clone()))
                 .collect(),
@@ -4576,6 +5393,45 @@ fn n_num_to_fixed(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value,
     Ok(Value::Str(it.heap.alloc_str(s)?))
 }
 
+/// Number.prototype.toString(radix): integers in bases 2..36, anything
+/// else in base 10 (fractional non-decimal expansion is a gap - falls
+/// back to the base-10 rendering).
+fn n_num_to_string(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let n = to_num(&it.heap, this);
+    let radix = match arg(args, 0) {
+        Value::Undef => 10,
+        v => to_num(&it.heap, v).trunc() as i64,
+    };
+    if !(2..=36).contains(&radix) {
+        return Err(err("radix out of range"));
+    }
+    let s = if !n.is_finite() || radix == 10 || n.fract() != 0.0 {
+        fmt_num(n)
+    } else {
+        let u = n.trunc().abs();
+        if u >= 9e15 {
+            fmt_num(n)
+        } else {
+            let mut ui = u as u64;
+            let mut out = Vec::new();
+            if ui == 0 {
+                out.push(b'0');
+            }
+            while ui > 0 {
+                out.push(DIGITS[(ui % radix as u64) as usize]);
+                ui /= radix as u64;
+            }
+            if n < 0.0 {
+                out.push(b'-');
+            }
+            out.reverse();
+            String::from_utf8(out).unwrap_or_default()
+        }
+    };
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
 // -- Date ---------------------------------------------------------------------------
 
 fn now_ms() -> f64 {
@@ -5384,6 +6240,1213 @@ fn is_regexp(it: &Interp, v: Value) -> bool {
     matches!(v, Value::Obj(id) if matches!(it.heap.obj(id), Obj::RegExp { .. }))
 }
 
+// -- Typed arrays / ArrayBuffer --------------------------------------------------
+// Minimal Uint8Array + ArrayBuffer for the base64/crypto/table code in
+// real bundles. Views copy (no shared memory with the buffer or
+// subarray/slice results - documented gap); only the u8 view exists.
+
+/// ToIndex for lengths: floor, negatives and absurd sizes throw.
+fn typed_len(h: &Heap, v: Value) -> Result<usize, JsError> {
+    let n = to_num(h, v);
+    if n.is_nan() {
+        return Ok(0);
+    }
+    let n = n.floor();
+    if n < 0.0 {
+        return Err(err("invalid typed array length"));
+    }
+    Ok((n as usize).min(1 << 28))
+}
+
+/// `this` as a Bytes heap id; natives below error out on other receivers.
+fn u8_this(it: &Interp, this: Value, name: &str) -> Result<u32, JsError> {
+    match this {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Bytes { .. }) => Ok(id),
+        _ => Err(err(format!("Uint8Array.{name} needs a Uint8Array receiver"))),
+    }
+}
+
+/// Element source for the ctor and set(): arrays map through ToUint8,
+/// bytes/buffers clone, anything else copies length-based (like V8's
+/// array-like path; strings yield zeros since chars aren't numbers).
+fn u8_src_items(it: &Interp, v: Value) -> Vec<u8> {
+    match v {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Arr { items, .. } => items.iter().map(|x| to_u8(&it.heap, *x)).collect(),
+            Obj::Bytes { bytes, .. } => bytes.clone(),
+            Obj::Buf { bytes, .. } => bytes.clone(),
+            _ => u8_len_items(it, Value::Obj(id)),
+        },
+        _ => u8_len_items(it, v),
+    }
+}
+
+fn u8_len_items(it: &Interp, v: Value) -> Vec<u8> {
+    let len = match get_prop(&it.heap, &it.protos, v, "length") {
+        Ok(Value::Num(n)) if n > 0.0 => (n.floor() as usize).min(1 << 28),
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let key = i.to_string();
+        let n = match get_prop(&it.heap, &it.protos, v, &key) {
+            Ok(x) => to_num(&it.heap, x),
+            Err(_) => f64::NAN,
+        };
+        out.push(to_u8_num(n));
+    }
+    out
+}
+
+/// ToUint8 on a bare number (shared by to_u8 and the length copier).
+fn to_u8_num(n: f64) -> u8 {
+    let n = n.trunc();
+    if !n.is_finite() {
+        return 0;
+    }
+    (((n % 256.0) + 256.0) % 256.0) as u8
+}
+
+/// Write coercion per view kind (V8 element semantics; stored as f64 so
+/// reads are exact, f32 round-trips through `as f32`).
+fn t_write(kind: TypedKind, n: f64) -> f64 {
+    match kind {
+        TypedKind::F64 => n,
+        TypedKind::F32 => (n as f32) as f64,
+        TypedKind::U32 => {
+            let n = n.trunc();
+            if !n.is_finite() {
+                return 0.0;
+            }
+            ((n % 4294967296.0) + 4294967296.0) % 4294967296.0
+        }
+        TypedKind::I32 => {
+            let n = n.trunc();
+            if !n.is_finite() {
+                return 0.0;
+            }
+            let u = ((n % 4294967296.0) + 4294967296.0) % 4294967296.0;
+            if u >= 2147483648.0 {
+                u - 4294967296.0
+            } else {
+                u
+            }
+        }
+        TypedKind::U16 => {
+            let n = n.trunc();
+            if !n.is_finite() {
+                return 0.0;
+            }
+            ((n % 65536.0) + 65536.0) % 65536.0
+        }
+        TypedKind::I16 => {
+            let u = t_write(TypedKind::U16, n);
+            if u >= 32768.0 {
+                u - 65536.0
+            } else {
+                u
+            }
+        }
+        TypedKind::I8 => {
+            let u = to_u8_num(n) as f64;
+            if u >= 128.0 {
+                u - 256.0
+            } else {
+                u
+            }
+        }
+        // ToUint8Clamp: NaN -> 0, saturate, round half to even.
+        TypedKind::U8C => {
+            if n.is_nan() || n <= 0.0 {
+                return 0.0;
+            }
+            if n >= 255.0 {
+                return 255.0;
+            }
+            let f = n.floor();
+            let d = n - f;
+            if d < 0.5 || (d == 0.5 && (f as i64) % 2 == 0) {
+                f
+            } else {
+                f + 1.0
+            }
+        }
+    }
+}
+
+/// Bytes per element (BYTES_PER_ELEMENT, buffer sizing).
+fn t_bpe(kind: TypedKind) -> usize {
+    match kind {
+        TypedKind::I8 | TypedKind::U8C => 1,
+        TypedKind::U16 | TypedKind::I16 => 2,
+        TypedKind::U32 | TypedKind::I32 | TypedKind::F32 => 4,
+        TypedKind::F64 => 8,
+    }
+}
+
+/// Tag for Object.prototype.toString.
+fn t_tag(kind: TypedKind) -> &'static str {
+    match kind {
+        TypedKind::I8 => "[object Int8Array]",
+        TypedKind::U8C => "[object Uint8ClampedArray]",
+        TypedKind::U16 => "[object Uint16Array]",
+        TypedKind::I16 => "[object Int16Array]",
+        TypedKind::U32 => "[object Uint32Array]",
+        TypedKind::I32 => "[object Int32Array]",
+        TypedKind::F32 => "[object Float32Array]",
+        TypedKind::F64 => "[object Float64Array]",
+    }
+}
+
+fn n_u8_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let bytes = match arg(args, 0) {
+        Value::Undef => Vec::new(),
+        v @ (Value::Num(_) | Value::Str(_) | Value::Bool(_) | Value::Null) => {
+            vec![0; typed_len(&it.heap, v)?]
+        }
+        v => u8_src_items(it, v),
+    };
+    let proto = po(it.protos.uint8array);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Bytes {
+        bytes,
+        pairs: Vec::new(),
+        proto,
+    })?))
+}
+
+fn n_buf_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let n = match arg(args, 0) {
+        Value::Undef => 0,
+        v => typed_len(&it.heap, v)?,
+    };
+    let proto = po(it.protos.buffer);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Buf {
+        bytes: vec![0; n],
+        proto,
+    })?))
+}
+
+/// Clamp [start,end) to [0,len]; negatives count from the end.
+fn typed_range(len: usize, s: f64, e: f64) -> (usize, usize) {
+    let lenf = len as f64;
+    let norm = |x: f64| {
+        if x.is_nan() {
+            return 0;
+        }
+        let x = x.trunc();
+        let x = if x < 0.0 { (lenf + x).max(0.0) } else { x.min(lenf) };
+        x as usize
+    };
+    let (a, b) = (norm(s), norm(e));
+    (a, b.max(a))
+}
+
+fn n_u8_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = u8_this(it, this, "set")?;
+    let src = u8_src_items(it, arg(args, 0));
+    let off = match arg(args, 1) {
+        Value::Undef => 0,
+        v => {
+            let n = to_num(&it.heap, v).trunc();
+            if n < 0.0 {
+                return Err(err("Uint8Array.set offset out of bounds"));
+            }
+            n as usize
+        }
+    };
+    match it.heap.obj(id) {
+        Obj::Bytes { bytes, .. } if off + src.len() <= bytes.len() => {}
+        _ => return Err(err("Uint8Array.set source out of bounds")),
+    }
+    if let Obj::Bytes { bytes, .. } = it.heap.obj_mut(id) {
+        bytes[off..off + src.len()].copy_from_slice(&src);
+    }
+    Ok(this)
+}
+
+fn n_u8_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = u8_this(it, this, "slice")?;
+    let (bytes, proto) = match it.heap.obj(id) {
+        Obj::Bytes { bytes, proto, .. } => (bytes.clone(), *proto),
+        _ => unreachable!(),
+    };
+    let (a, b) = match (arg(args, 0), arg(args, 1)) {
+        (Value::Undef, Value::Undef) => (0, bytes.len()),
+        (s, Value::Undef) => typed_range(bytes.len(), to_num(&it.heap, s), bytes.len() as f64),
+        (s, e) => typed_range(bytes.len(), to_num(&it.heap, s), to_num(&it.heap, e)),
+    };
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Bytes {
+        bytes: bytes[a..b].to_vec(),
+        pairs: Vec::new(),
+        proto,
+    })?))
+}
+
+fn n_u8_subarray(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    // Copy, not a live view (documented gap) - same observable bytes.
+    n_u8_slice(it, this, args)
+}
+
+fn n_u8_join(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = u8_this(it, this, "join")?;
+    let sep = match arg(args, 0) {
+        Value::Undef => ",".to_string(),
+        v => to_str(&it.heap, v),
+    };
+    let s = match it.heap.obj(id) {
+        Obj::Bytes { bytes, .. } => bytes
+            .iter()
+            .map(|b| b.to_string())
+            .collect::<Vec<_>>()
+            .join(&sep),
+        _ => unreachable!(),
+    };
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+fn n_u8_fill(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = u8_this(it, this, "fill")?;
+    let b = to_u8(&it.heap, arg(args, 0));
+    let len = match it.heap.obj(id) {
+        Obj::Bytes { bytes, .. } => bytes.len(),
+        _ => unreachable!(),
+    };
+    let (a, c) = match (arg(args, 1), arg(args, 2)) {
+        (Value::Undef, Value::Undef) => (0, len),
+        (s, Value::Undef) => typed_range(len, to_num(&it.heap, s), len as f64),
+        (s, e) => typed_range(len, to_num(&it.heap, s), to_num(&it.heap, e)),
+    };
+    if let Obj::Bytes { bytes, .. } = it.heap.obj_mut(id) {
+        bytes[a..c].fill(b);
+    }
+    Ok(this)
+}
+
+fn n_u8_index_of(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let id = u8_this(it, this, "indexOf")?;
+    let b = to_u8(&it.heap, arg(args, 0));
+    let from = match arg(args, 1) {
+        Value::Undef => 0,
+        v => {
+            let n = to_num(&it.heap, v).trunc();
+            if n <= 0.0 || n.is_nan() {
+                0
+            } else {
+                n as usize
+            }
+        }
+    };
+    Ok(match it.heap.obj(id) {
+        Obj::Bytes { bytes, .. } => Value::Num(
+            bytes
+                .iter()
+                .skip(from)
+                .position(|x| *x == b)
+                .map(|i| (from + i) as f64)
+                .unwrap_or(-1.0),
+        ),
+        _ => unreachable!(),
+    })
+}
+
+// -- Typed statics: of / from -------------------------------------------------------
+// `of` takes elements directly; `from` takes an array-like (strings feed
+// chars, like V8) plus an optional map fn. Coercion matches the view.
+
+/// Raw (pre-coercion) items of a `from` source.
+fn from_raw(it: &mut Interp, v: Value) -> Result<Vec<Value>, JsError> {
+    match v {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Arr { items, .. } => Ok(items.clone()),
+            Obj::Bytes { bytes, .. } => {
+                Ok(bytes.iter().map(|b| Value::Num(*b as f64)).collect())
+            }
+            Obj::Typed { elems, .. } => Ok(elems.iter().map(|e| Value::Num(*e)).collect()),
+            Obj::Buf { bytes, .. } => {
+                Ok(bytes.iter().map(|b| Value::Num(*b as f64)).collect())
+            }
+            _ => {
+                let len = match get_prop(&it.heap, &it.protos, Value::Obj(id), "length") {
+                    Ok(Value::Num(n)) if n > 0.0 => (n.floor() as usize).min(1 << 28),
+                    _ => return Ok(Vec::new()),
+                };
+                let mut out = Vec::with_capacity(len);
+                for i in 0..len {
+                    out.push(get_prop(&it.heap, &it.protos, Value::Obj(id), &i.to_string())?);
+                }
+                Ok(out)
+            }
+        },
+        Value::Str(id) => {
+            let s = it.heap.get_str(id).to_string();
+            let mut out = Vec::with_capacity(s.len());
+            for c in s.chars() {
+                out.push(Value::Str(it.heap.alloc_str(c.to_string())?));
+            }
+            Ok(out)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// Shared `from` body: None = Uint8Array, Some(k) = that view.
+fn typed_from(
+    it: &mut Interp,
+    kind: Option<TypedKind>,
+    args: &[Value],
+) -> Result<Value, JsError> {
+    let raw = from_raw(it, arg(args, 0))?;
+    let mapped: Vec<Value> = match arg(args, 1) {
+        Value::Obj(mid)
+            if matches!(it.heap.obj(mid), Obj::Func { .. } | Obj::Native { .. }) =>
+        {
+            let this_arg = arg(args, 2);
+            let mut out = Vec::with_capacity(raw.len());
+            for (i, v) in raw.into_iter().enumerate() {
+                out.push(it.call_value(
+                    Value::Obj(mid),
+                    this_arg,
+                    &[v, Value::Num(i as f64)],
+                    None,
+                )?);
+            }
+            out
+        }
+        _ => raw,
+    };
+    match kind {
+        None => {
+            let bytes = mapped.iter().map(|x| to_u8(&it.heap, *x)).collect();
+            let proto = po(it.protos.uint8array);
+            Ok(Value::Obj(it.heap.alloc_obj(Obj::Bytes {
+                bytes,
+                pairs: Vec::new(),
+                proto,
+            })?))
+        }
+        Some(k) => {
+            let elems = mapped.iter().map(|x| t_write(k, to_num(&it.heap, *x))).collect();
+            let proto = po(match k {
+                TypedKind::I8 => it.protos.int8array,
+                TypedKind::U8C => it.protos.uint8clampedarray,
+                TypedKind::U16 => it.protos.uint16array,
+                TypedKind::I16 => it.protos.int16array,
+                TypedKind::U32 => it.protos.uint32array,
+                TypedKind::I32 => it.protos.int32array,
+                TypedKind::F32 => it.protos.float32array,
+                TypedKind::F64 => it.protos.float64array,
+            });
+            Ok(Value::Obj(it.heap.alloc_obj(Obj::Typed {
+                kind: k,
+                elems,
+                pairs: Vec::new(),
+                proto,
+            })?))
+        }
+    }
+}
+
+fn n_u8_of(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let bytes = args.iter().map(|x| to_u8(&it.heap, *x)).collect();
+    let proto = po(it.protos.uint8array);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Bytes {
+        bytes,
+        pairs: Vec::new(),
+        proto,
+    })?))
+}
+
+fn n_u8_from(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    typed_from(it, None, args)
+}
+
+/// Shared `of` body for the non-u8 views.
+fn t_of(it: &mut Interp, kind: TypedKind, args: &[Value]) -> Result<Value, JsError> {
+    let elems = args.iter().map(|x| t_write(kind, to_num(&it.heap, *x))).collect();
+    let proto = po(match kind {
+        TypedKind::I8 => it.protos.int8array,
+        TypedKind::U8C => it.protos.uint8clampedarray,
+        TypedKind::U16 => it.protos.uint16array,
+        TypedKind::I16 => it.protos.int16array,
+        TypedKind::U32 => it.protos.uint32array,
+        TypedKind::I32 => it.protos.int32array,
+        TypedKind::F32 => it.protos.float32array,
+        TypedKind::F64 => it.protos.float64array,
+    });
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Typed {
+        kind,
+        elems,
+        pairs: Vec::new(),
+        proto,
+    })?))
+}
+
+fn n_i8_of(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_of(it, TypedKind::I8, a)
+}
+fn n_u8c_of(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_of(it, TypedKind::U8C, a)
+}
+fn n_u16_of(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_of(it, TypedKind::U16, a)
+}
+fn n_i16_of(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_of(it, TypedKind::I16, a)
+}
+fn n_u32_of(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_of(it, TypedKind::U32, a)
+}
+fn n_i32_of(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_of(it, TypedKind::I32, a)
+}
+fn n_f32_of(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_of(it, TypedKind::F32, a)
+}
+fn n_f64_of(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_of(it, TypedKind::F64, a)
+}
+fn n_i8_from(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    typed_from(it, Some(TypedKind::I8), a)
+}
+fn n_u8c_from(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    typed_from(it, Some(TypedKind::U8C), a)
+}
+fn n_u16_from(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    typed_from(it, Some(TypedKind::U16), a)
+}
+fn n_i16_from(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    typed_from(it, Some(TypedKind::I16), a)
+}
+fn n_u32_from(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    typed_from(it, Some(TypedKind::U32), a)
+}
+fn n_i32_from(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    typed_from(it, Some(TypedKind::I32), a)
+}
+fn n_f32_from(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    typed_from(it, Some(TypedKind::F32), a)
+}
+fn n_f64_from(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    typed_from(it, Some(TypedKind::F64), a)
+}
+
+fn n_buf_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {    let (bytes, proto) = match this {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Buf { .. }) => match it.heap.obj(id) {
+            Obj::Buf { bytes, proto, .. } => (bytes.clone(), *proto),
+            _ => unreachable!(),
+        },
+        _ => return Err(err("ArrayBuffer.slice needs an ArrayBuffer receiver")),
+    };
+    let (a, b) = match (arg(args, 0), arg(args, 1)) {
+        (Value::Undef, Value::Undef) => (0, bytes.len()),
+        (s, Value::Undef) => typed_range(bytes.len(), to_num(&it.heap, s), bytes.len() as f64),
+        (s, e) => typed_range(bytes.len(), to_num(&it.heap, s), to_num(&it.heap, e)),
+    };
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Buf {
+        bytes: bytes[a..b].to_vec(),
+        proto,
+    })?))
+}
+
+// -- Other numeric views (Int8..Float64) -----------------------------------------
+// Same copy semantics as Bytes: elements pre-coerced, one method set
+// shared across kinds (the kind rides on the instance).
+
+/// `this` as a Typed heap id with its kind.
+fn t_this(it: &Interp, this: Value, name: &str) -> Result<(u32, TypedKind), JsError> {
+    match this {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Typed { kind, .. } => Ok((id, *kind)),
+            _ => Err(err(format!("typed array method {name} needs a typed array"))),
+        },
+        _ => Err(err(format!("typed array method {name} needs a typed array"))),
+    }
+}
+
+/// Element source for view ctors: numbers coerce per kind; buffers
+/// decode little-endian bytes (like V8 reinterpreting the store).
+fn t_src_items(it: &Interp, kind: TypedKind, v: Value) -> Vec<f64> {
+    let cv = |n: f64| t_write(kind, n);
+    match v {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Arr { items, .. } => items.iter().map(|x| cv(to_num(&it.heap, *x))).collect(),
+            Obj::Bytes { bytes, .. } => bytes.iter().map(|b| cv(*b as f64)).collect(),
+            Obj::Typed { elems, .. } => elems.iter().map(|e| cv(*e)).collect(),
+            Obj::Buf { bytes, .. } => t_decode(kind, bytes),
+            _ => t_len_items(it, kind, Value::Obj(id)),
+        },
+        _ => t_len_items(it, kind, v),
+    }
+}
+
+fn t_len_items(it: &Interp, kind: TypedKind, v: Value) -> Vec<f64> {
+    let len = match get_prop(&it.heap, &it.protos, v, "length") {
+        Ok(Value::Num(n)) if n > 0.0 => (n.floor() as usize).min(1 << 28),
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let key = i.to_string();
+        let n = match get_prop(&it.heap, &it.protos, v, &key) {
+            Ok(x) => to_num(&it.heap, x),
+            Err(_) => f64::NAN,
+        };
+        out.push(t_write(kind, n));
+    }
+    out
+}
+
+/// Little-endian decode of raw bytes into elements (odd tails throw,
+/// like V8's length-mismatch RangeError).
+fn t_decode(kind: TypedKind, bytes: &[u8]) -> Vec<f64> {
+    let bpe = t_bpe(kind);
+    let mut out = Vec::with_capacity(bytes.len() / bpe);
+    for w in bytes.chunks_exact(bpe) {
+        let mut raw = [0u8; 8];
+        raw[..bpe].copy_from_slice(w);
+        let u = u64::from_le_bytes(raw);
+        out.push(match kind {
+            TypedKind::I8 => (w[0] as i8) as f64,
+            TypedKind::U8C => t_write(TypedKind::U8C, w[0] as f64),
+            TypedKind::U16 => (u as u16) as f64,
+            TypedKind::I16 => (u as u16) as i16 as f64,
+            TypedKind::U32 => (u as u32) as f64,
+            TypedKind::I32 => (u as u32) as i32 as f64,
+            TypedKind::F32 => f32::from_le_bytes([w[0], w[1], w[2], w[3]]) as f64,
+            TypedKind::F64 => f64::from_le_bytes(w.try_into().unwrap_or([0; 8])),
+        });
+    }
+    out
+}
+
+/// Shared view constructor: length, source view/array, buffer (+ byte
+/// offset/length), or empty. Buffer offsets must align to the element
+/// size; odd buffer lengths throw (V8 parity).
+fn t_ctor(it: &mut Interp, kind: TypedKind, proto: u32, args: &[Value]) -> Result<Value, JsError> {
+    let elems = match arg(args, 0) {
+        Value::Undef => Vec::new(),
+        v @ (Value::Num(_) | Value::Str(_) | Value::Bool(_) | Value::Null) => {
+            vec![t_write(kind, 0.0); typed_len(&it.heap, v)?]
+        }
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::Buf { .. }) => {
+            let bytes = match it.heap.obj(id) {
+                Obj::Buf { bytes, .. } => bytes.clone(),
+                _ => unreachable!(),
+            };
+            let bpe = t_bpe(kind);
+            let off = match arg(args, 1) {
+                Value::Undef => 0,
+                v => {
+                    let n = to_num(&it.heap, v).trunc();
+                    if n < 0.0 || n.fract() != 0.0 || !(n as usize).is_multiple_of(bpe) {
+                        return Err(err("typed array buffer offset misaligned"));
+                    }
+                    n as usize
+                }
+            };
+            if off > bytes.len() || bytes.len() % bpe != 0 {
+                return Err(err("typed array buffer length mismatch"));
+            }
+            let mut els = t_decode(kind, &bytes[off..]);
+            if !matches!(arg(args, 2), Value::Undef) {
+                let want = typed_len(&it.heap, arg(args, 2))?;
+                if want > els.len() {
+                    return Err(err("typed array length out of range"));
+                }
+                els.truncate(want);
+            }
+            els
+        }
+        v => t_src_items(it, kind, v),
+    };
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Typed {
+        kind,
+        elems,
+        pairs: Vec::new(),
+        proto: po(proto),
+    })?))
+}
+
+fn n_i8_ctor(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_ctor(it, TypedKind::I8, it.protos.int8array, a)
+}
+fn n_u8c_ctor(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_ctor(it, TypedKind::U8C, it.protos.uint8clampedarray, a)
+}
+fn n_u16_ctor(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_ctor(it, TypedKind::U16, it.protos.uint16array, a)
+}
+fn n_i16_ctor(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_ctor(it, TypedKind::I16, it.protos.int16array, a)
+}
+fn n_u32_ctor(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_ctor(it, TypedKind::U32, it.protos.uint32array, a)
+}
+fn n_i32_ctor(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_ctor(it, TypedKind::I32, it.protos.int32array, a)
+}
+fn n_f32_ctor(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_ctor(it, TypedKind::F32, it.protos.float32array, a)
+}
+fn n_f64_ctor(it: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, JsError> {
+    t_ctor(it, TypedKind::F64, it.protos.float64array, a)
+}
+
+fn n_t_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (id, kind) = t_this(it, this, "set")?;
+    let src: Vec<f64> = match arg(args, 0) {
+        Value::Obj(sid) => match it.heap.obj(sid) {
+            Obj::Arr { items, .. } => items.iter().map(|x| t_write(kind, to_num(&it.heap, *x))).collect(),
+            Obj::Bytes { bytes, .. } => bytes.iter().map(|b| t_write(kind, *b as f64)).collect(),
+            Obj::Typed { elems, .. } => elems.iter().map(|e| t_write(kind, *e)).collect(),
+            Obj::Buf { bytes, .. } => t_decode(kind, bytes),
+            _ => t_len_items(it, kind, Value::Obj(sid)),
+        },
+        v => t_len_items(it, kind, v),
+    };
+    let off = match arg(args, 1) {
+        Value::Undef => 0,
+        v => {
+            let n = to_num(&it.heap, v).trunc();
+            if n < 0.0 {
+                return Err(err("typed array set offset out of bounds"));
+            }
+            n as usize
+        }
+    };
+    match it.heap.obj(id) {
+        Obj::Typed { elems, .. } if off + src.len() <= elems.len() => {}
+        _ => return Err(err("typed array set source out of bounds")),
+    }
+    if let Obj::Typed { elems, .. } = it.heap.obj_mut(id) {
+        elems[off..off + src.len()].copy_from_slice(&src);
+    }
+    Ok(this)
+}
+
+fn t_slice_vec(it: &Interp, id: u32, args: &[Value]) -> Result<Vec<f64>, JsError> {
+    let elems = match it.heap.obj(id) {
+        Obj::Typed { elems, .. } => elems.clone(),
+        _ => unreachable!(),
+    };
+    let (a, b) = match (arg(args, 0), arg(args, 1)) {
+        (Value::Undef, Value::Undef) => (0, elems.len()),
+        (s, Value::Undef) => typed_range(elems.len(), to_num(&it.heap, s), elems.len() as f64),
+        (s, e) => typed_range(elems.len(), to_num(&it.heap, s), to_num(&it.heap, e)),
+    };
+    Ok(elems[a..b].to_vec())
+}
+
+fn n_t_slice(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (id, kind) = t_this(it, this, "slice")?;
+    let proto = match it.heap.obj(id) {
+        Obj::Typed { proto, .. } => *proto,
+        _ => unreachable!(),
+    };
+    let out = t_slice_vec(it, id, args)?;
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Typed {
+        kind,
+        elems: out,
+        pairs: Vec::new(),
+        proto,
+    })?))
+}
+
+fn n_t_subarray(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    // Copy, not a live view (documented gap) - same observable bytes.
+    n_t_slice(it, this, args)
+}
+
+fn n_t_join(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (id, _) = t_this(it, this, "join")?;
+    let sep = match arg(args, 0) {
+        Value::Undef => ",".to_string(),
+        v => to_str(&it.heap, v),
+    };
+    let s = match it.heap.obj(id) {
+        Obj::Typed { elems, .. } => elems
+            .iter()
+            .map(|e| to_str(&it.heap, Value::Num(*e)))
+            .collect::<Vec<_>>()
+            .join(&sep),
+        _ => unreachable!(),
+    };
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+fn n_t_fill(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (id, kind) = t_this(it, this, "fill")?;
+    let ne = t_write(kind, to_num(&it.heap, arg(args, 0)));
+    let len = match it.heap.obj(id) {
+        Obj::Typed { elems, .. } => elems.len(),
+        _ => unreachable!(),
+    };
+    let (a, c) = match (arg(args, 1), arg(args, 2)) {
+        (Value::Undef, Value::Undef) => (0, len),
+        (s, Value::Undef) => typed_range(len, to_num(&it.heap, s), len as f64),
+        (s, e) => typed_range(len, to_num(&it.heap, s), to_num(&it.heap, e)),
+    };
+    if let Obj::Typed { elems, .. } = it.heap.obj_mut(id) {
+        elems[a..c].fill(ne);
+    }
+    Ok(this)
+}
+
+fn n_t_index_of(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (id, kind) = t_this(it, this, "indexOf")?;
+    let ne = t_write(kind, to_num(&it.heap, arg(args, 0)));
+    let from = match arg(args, 1) {
+        Value::Undef => 0,
+        v => {
+            let n = to_num(&it.heap, v).trunc();
+            if n <= 0.0 || n.is_nan() {
+                0
+            } else {
+                n as usize
+            }
+        }
+    };
+    Ok(match it.heap.obj(id) {
+        Obj::Typed { elems, .. } => Value::Num(
+            elems
+                .iter()
+                .skip(from)
+                .position(|x| *x == ne)
+                .map(|i| (from + i) as f64)
+                .unwrap_or(-1.0),
+        ),
+        _ => unreachable!(),
+    })
+}
+
+// -- DataView --------------------------------------------------------------------
+// Minimal reader/writer over a buffer copy for font/table parsing in
+// bundles. Offset form slices the copy (byteOffset reported back).
+
+fn dv_this(it: &Interp, this: Value, name: &str) -> Result<u32, JsError> {
+    match this {
+        Value::Obj(id) if matches!(it.heap.obj(id), Obj::DView { .. }) => Ok(id),
+        _ => Err(err(format!("DataView.{name} needs a DataView receiver"))),
+    }
+}
+
+/// (bytes, base, little-endian) for an accessor call.
+fn dv_args(it: &Interp, id: u32, args: &[Value]) -> Result<(Vec<u8>, usize, bool), JsError> {
+    let (bytes, off) = match it.heap.obj(id) {
+        Obj::DView { bytes, off, .. } => (bytes.clone(), *off),
+        _ => unreachable!(),
+    };
+    let at = match to_num(&it.heap, arg(args, 0)).trunc() {
+        n if n < 0.0 => return Err(err("DataView offset out of bounds")),
+        n => n as usize,
+    };
+    let le = truthy(&it.heap, arg(args, 1));
+    Ok((bytes, off + at, le))
+}
+
+fn dv_need(bytes: &[u8], at: usize, size: usize) -> Result<(), JsError> {
+    if at + size <= bytes.len() {
+        Ok(())
+    } else {
+        Err(err("DataView offset out of bounds"))
+    }
+}
+
+fn n_dv_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let bytes = match arg(args, 0) {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Buf { bytes, .. } => bytes.clone(),
+            Obj::Bytes { bytes, .. } => bytes.clone(),
+            Obj::Typed { elems, kind, .. } => {
+                let mut out = Vec::with_capacity(elems.len() * t_bpe(*kind));
+                for e in elems {
+                    dv_push(&mut out, *kind, *e);
+                }
+                out
+            }
+            _ => return Err(err("DataView needs an ArrayBuffer")),
+        },
+        _ => return Err(err("DataView needs an ArrayBuffer")),
+    };
+    let off = match arg(args, 1) {
+        Value::Undef => 0,
+        v => match to_num(&it.heap, v).trunc() {
+            n if n < 0.0 => return Err(err("DataView offset out of bounds")),
+            n => n as usize,
+        },
+    };
+    if off > bytes.len() {
+        return Err(err("DataView offset out of bounds"));
+    }
+    let mut view = bytes[off..].to_vec();
+    if !matches!(arg(args, 2), Value::Undef) {
+        let want = typed_len(&it.heap, arg(args, 2))?;
+        if want > view.len() {
+            return Err(err("DataView length out of range"));
+        }
+        view.truncate(want);
+    }
+    let proto = po(it.protos.dataview);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::DView {
+        bytes: view,
+        off,
+        proto,
+    })?))
+}
+
+/// Little-endian encode of one element (for DataView-over-view; the
+/// bundle path this serves).
+fn dv_push(out: &mut Vec<u8>, kind: TypedKind, e: f64) {
+    match kind {
+        TypedKind::I8 => out.push(e as i8 as u8),
+        TypedKind::U8C => out.push(e as u8),
+        TypedKind::U16 | TypedKind::I16 => out.extend_from_slice(&(e as i16 as u16).to_le_bytes()),
+        TypedKind::U32 | TypedKind::I32 => out.extend_from_slice(&(e as i32 as u32).to_le_bytes()),
+        TypedKind::F32 => out.extend_from_slice(&(e as f32).to_le_bytes()),
+        TypedKind::F64 => out.extend_from_slice(&e.to_le_bytes()),
+    }
+}
+
+fn dv_get(it: &mut Interp, this: Value, args: &[Value], size: usize, name: &str) -> Result<Value, JsError> {
+    let id = dv_this(it, this, name)?;
+    let (bytes, at, le) = dv_args(it, id, args)?;
+    dv_need(&bytes, at, size)?;
+    let w = &bytes[at..at + size];
+    Ok(Value::Num(match (name, size) {
+        (_, 1) => w[0] as f64,
+        (_, 2) if le => u16::from_le_bytes([w[0], w[1]]) as f64,
+        (_, 2) => u16::from_be_bytes([w[0], w[1]]) as f64,
+        (_, 4) if name.starts_with("getFloat") => f32::from_le_bytes([w[0], w[1], w[2], w[3]]) as f64,
+        (_, 4) if le => u32::from_le_bytes([w[0], w[1], w[2], w[3]]) as f64,
+        (_, 4) => {
+            if name.starts_with("getFloat") {
+                f32::from_be_bytes([w[0], w[1], w[2], w[3]]) as f64
+            } else {
+                u32::from_be_bytes([w[0], w[1], w[2], w[3]]) as f64
+            }
+        }
+        (_, 8) if le => f64::from_le_bytes(w.try_into().unwrap_or([0; 8])),
+        (_, 8) => f64::from_be_bytes(w.try_into().unwrap_or([0; 8])),
+        _ => unreachable!(),
+    }))
+}
+
+fn n_dv_get_u8(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_get(it, t, a, 1, "getUint8")
+}
+fn n_dv_get_u16(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_get(it, t, a, 2, "getUint16")
+}
+fn n_dv_get_u32(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_get(it, t, a, 4, "getUint32")
+}
+fn n_dv_get_i8(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    let r = dv_get(it, t, a, 1, "getInt8")?;
+    Ok(match r {
+        Value::Num(n) if n >= 128.0 => Value::Num(n - 256.0),
+        _ => r,
+    })
+}
+fn n_dv_get_i16(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    let r = dv_get(it, t, a, 2, "getInt16")?;
+    Ok(match r {
+        Value::Num(n) if n >= 32768.0 => Value::Num(n - 65536.0),
+        _ => r,
+    })
+}
+fn n_dv_get_i32(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    let r = dv_get(it, t, a, 4, "getInt32")?;
+    Ok(match r {
+        Value::Num(n) if n >= 2147483648.0 => Value::Num(n - 4294967296.0),
+        _ => r,
+    })
+}
+fn n_dv_get_f32(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_get(it, t, a, 4, "getFloat32")
+}
+fn n_dv_get_f64(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_get(it, t, a, 8, "getFloat64")
+}
+
+fn dv_set(it: &mut Interp, this: Value, args: &[Value], size: usize, name: &str) -> Result<Value, JsError> {
+    let id = dv_this(it, this, name)?;
+    let (bytes_len, off) = match it.heap.obj(id) {
+        Obj::DView { bytes, off, .. } => (bytes.len(), *off),
+        _ => unreachable!(),
+    };
+    let at = match to_num(&it.heap, arg(args, 0)).trunc() {
+        n if n < 0.0 => return Err(err("DataView offset out of bounds")),
+        n => off + n as usize,
+    };
+    if at + size > bytes_len {
+        return Err(err("DataView offset out of bounds"));
+    }
+    let le = truthy(&it.heap, arg(args, 2));
+    let n = to_num(&it.heap, arg(args, 1));
+    let enc: Vec<u8> = match (name, size) {
+        (_, 1) => vec![to_u8_num(n)],
+        (_, 2) if le => ((n as i32 as u16).to_le_bytes()).to_vec(),
+        (_, 2) => ((n as i32 as u16).to_be_bytes()).to_vec(),
+        (_, 4) if name.starts_with("setFloat") => {
+            if le {
+                (n as f32).to_le_bytes().to_vec()
+            } else {
+                (n as f32).to_be_bytes().to_vec()
+            }
+        }
+        (_, 4) if le => (n as i64 as u32).to_le_bytes().to_vec(),
+        (_, 4) => (n as i64 as u32).to_be_bytes().to_vec(),
+        (_, 8) => {
+            if le {
+                n.to_le_bytes().to_vec()
+            } else {
+                n.to_be_bytes().to_vec()
+            }
+        }
+        _ => unreachable!(),
+    };
+    if let Obj::DView { bytes, .. } = it.heap.obj_mut(id) {
+        bytes[at..at + size].copy_from_slice(&enc);
+    }
+    Ok(Value::Undef)
+}
+
+fn n_dv_set_u8(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_set(it, t, a, 1, "setUint8")
+}
+fn n_dv_set_u16(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_set(it, t, a, 2, "setUint16")
+}
+fn n_dv_set_u32(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_set(it, t, a, 4, "setUint32")
+}
+fn n_dv_set_i8(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_set(it, t, a, 1, "setInt8")
+}
+fn n_dv_set_i16(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_set(it, t, a, 2, "setInt16")
+}
+fn n_dv_set_i32(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_set(it, t, a, 4, "setInt32")
+}
+fn n_dv_set_f32(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_set(it, t, a, 4, "setFloat32")
+}
+fn n_dv_set_f64(it: &mut Interp, t: Value, a: &[Value]) -> Result<Value, JsError> {
+    dv_set(it, t, a, 8, "setFloat64")
+}
+
+// -- TextEncoder / TextDecoder -----------------------------------------------------
+// UTF-8 via Rust's own encoding (engine strings are UTF-8); lossy decode
+// substitutes U+FFFD like V8's non-fatal path. Only utf-8 and latin1
+// families exist here; other labels throw. `stream` decode state and
+// `fatal` are documented gaps (stateless, never throws on bad bytes).
+
+/// Sugar for the one label family V8 reports for latin1 inputs.
+fn td_normalize(label: &str) -> Option<&'static str> {
+    let l = label.trim().to_ascii_lowercase().replace('_', "-");
+    match l.as_str() {
+        "utf-8" | "utf8" => Some("utf-8"),
+        "latin1" | "iso-8859-1" | "windows-1252" | "ascii" => Some("windows-1252"),
+        _ => None,
+    }
+}
+
+/// Decode input (any byte-ish view or array) to raw bytes.
+fn td_bytes(it: &Interp, v: Value) -> Vec<u8> {
+    match v {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Arr { items, .. } => items.iter().map(|x| to_u8(&it.heap, *x)).collect(),
+            Obj::Bytes { bytes, .. } => bytes.clone(),
+            Obj::Buf { bytes, .. } => bytes.clone(),
+            Obj::Typed { elems, kind, .. } => {
+                elems.iter().map(|e| to_u8_num(t_write(*kind, *e))).collect()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn n_te_ctor(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    if let Value::Obj(id) = this {
+        if matches!(it.heap.obj(id), Obj::Ordinary { .. }) {
+            return Ok(this);
+        }
+    }
+    let proto = po(it.protos.textencoder);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Ordinary {
+        pairs: Vec::new(),
+        proto,
+    })?))
+}
+
+fn n_te_encode(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = match arg(args, 0) {
+        Value::Undef => String::new(),
+        v => to_str(&it.heap, v),
+    };
+    let proto = po(it.protos.uint8array);
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Bytes {
+        bytes: s.into_bytes(),
+        pairs: Vec::new(),
+        proto,
+    })?))
+}
+
+fn n_td_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let enc = match arg(args, 0) {
+        Value::Undef => "utf-8",
+        v => match td_normalize(&to_str(&it.heap, v)) {
+            Some(e) => e,
+            None => return Err(err(format!("unknown encoding {}", to_str(&it.heap, v)))),
+        },
+    };
+    let proto = po(it.protos.textdecoder);
+    let id = it.heap.alloc_obj(Obj::Ordinary {
+        pairs: Vec::new(),
+        proto,
+    })?;
+    let es = Value::Str(it.heap.alloc_str(enc.to_string())?);
+    set_prop(&mut it.heap, Value::Obj(id), "encoding", es)?;
+    Ok(Value::Obj(id))
+}
+
+fn n_td_decode(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let enc = match get_prop(&it.heap, &it.protos, this, "encoding")? {
+        Value::Str(id) => it.heap.get_str(id).to_string(),
+        _ => "utf-8".into(),
+    };
+    let bytes = td_bytes(it, arg(args, 0));
+    let s = if enc == "windows-1252" {
+        bytes.iter().map(|b| *b as char).collect()
+    } else {
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Ok(Value::Str(it.heap.alloc_str(s)?))
+}
+
+// -- Proxy / Reflect -----------------------------------------------------------
+
+/// `new Proxy(target, handler)`: both must be objects (V8 throws
+/// TypeError otherwise - surfaced here as a plain error like the other
+/// internal TypeErrors). Callable targets stay non-callable through the
+/// proxy (no apply/construct traps - documented gap).
+fn n_proxy_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let (target, handler) = match (arg(args, 0), arg(args, 1)) {
+        (Value::Obj(t), Value::Obj(h)) => (t, h),
+        _ => return Err(err("Proxy needs an object target and handler")),
+    };
+    Ok(Value::Obj(it.heap.alloc_obj(Obj::Proxy {
+        target,
+        handler,
+    })?))
+}
+
+/// Proxy-aware read shared by Reflect.get: runs the get trap, else the
+/// target's value (getters applied, receiver = the proxy/target value).
+fn reflect_get(it: &mut Interp, target: Value, key: &str) -> Result<Value, JsError> {
+    if let Value::Obj(id) = target {
+        if matches!(it.heap.obj(id), Obj::Proxy { .. }) {
+            return it.proxy_get(id, key, target);
+        }
+    }
+    let val = get_prop(&it.heap, &it.protos, target, key)?;
+    it.invoke_getter(val, target, key)
+}
+
+fn n_reflect_get(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let key = to_str(&it.heap, arg(args, 1));
+    reflect_get(it, arg(args, 0), &key)
+}
+
+fn n_reflect_set(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let target = arg(args, 0);
+    let key = to_str(&it.heap, arg(args, 1));
+    let val = arg(args, 2);
+    if let Value::Obj(id) = target {
+        if matches!(it.heap.obj(id), Obj::Proxy { .. }) {
+            it.proxy_set(id, &key, val, target)?;
+            return Ok(Value::Bool(true));
+        }
+    }
+    let cur = get_prop(&it.heap, &it.protos, target, &key)?;
+    if it.invoke_setter(cur, target, val, &key)? {
+        return Ok(Value::Bool(true));
+    }
+    set_prop(&mut it.heap, target, &key, val)?;
+    Ok(Value::Bool(true))
+}
+
+fn n_reflect_has(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let target = arg(args, 0);
+    let key = to_str(&it.heap, arg(args, 1));
+    if let Value::Obj(id) = target {
+        if matches!(it.heap.obj(id), Obj::Proxy { .. }) {
+            return Ok(Value::Bool(it.proxy_has(id, &key)?));
+        }
+    }
+    Ok(Value::Bool(has_prop(&it.heap, &it.protos, target, &key)))
+}
+
+fn n_reflect_delete(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let target = arg(args, 0);
+    let key = to_str(&it.heap, arg(args, 1));
+    it.delete_key(target, &key, Some(arg(args, 1)))
+}
+
+fn n_reflect_get_desc(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let key = to_str(&it.heap, arg(args, 1));
+    let d = describe_own(it, arg(args, 0), &key)?;
+    // Absent key reads undefined (describe_own reports it so); real
+    // Reflect returns undefined instead of a descriptor.
+    if let Value::Obj(id) = d {
+        if let Obj::Ordinary { pairs, .. } = it.heap.obj(id) {
+            if !pairs.iter().any(|(k, _)| k == "value" || k == "get") {
+                return Ok(Value::Undef);
+            }
+        }
+    }
+    Ok(d)
+}
+
+fn n_reflect_get_proto(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    match arg(args, 0) {
+        Value::Obj(id) => Ok(match proto_of(&it.heap, &it.protos, id) {
+            Some(p) => Value::Obj(p),
+            None => Value::Null,
+        }),
+        _ => Err(err("Reflect.getPrototypeOf needs an object")),
+    }
+}
+
+fn n_reflect_own_keys(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    // ownKeys trap is a documented gap: proxies report the target's keys.
+    let mut keys = Vec::new();
+    for (k, _) in own_pairs(&it.heap, arg(args, 0)) {
+        keys.push(Value::Str(it.heap.alloc_str(k)?));
+    }
+    Ok(Value::Obj(it.arr_obj(keys)?))
+}
+
+fn n_reflect_construct(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let argv = match arg(args, 1) {
+        Value::Obj(id) => arr_items(it, id),
+        Value::Undef => Vec::new(),
+        _ => return Err(err("Reflect.construct needs an argument list")),
+    };
+    it.construct_value(arg(args, 0), &argv)
+}
+
+fn n_reflect_apply(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let argv = match arg(args, 2) {
+        Value::Obj(id) => arr_items(it, id),
+        Value::Undef => Vec::new(),
+        _ => return Err(err("Reflect.apply needs an argument list")),
+    };
+    it.call_value(arg(args, 0), arg(args, 1), &argv, None)
+}
+
 /// Pattern source for a String-method argument: a RegExp object, or a
 /// freshly compiled pattern from any other value (Undef means absent).
 enum PatSrc {
@@ -5746,6 +7809,116 @@ fn n_math_pow(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsErr
 }
 fn n_math_sqrt(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
     Ok(Value::Num(to_num(&it.heap, arg(args, 0)).sqrt()))
+}
+
+fn n_math_fround(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(to_num(&it.heap, arg(args, 0)) as f32 as f64))
+}
+
+fn n_math_trunc(it: &mut Interp, _t: Value, args: &[Value]) -> Result<Value, JsError> {
+    Ok(Value::Num(to_num(&it.heap, arg(args, 0)).trunc()))
+}
+
+// -- base64 globals ---------------------------------------------------------------
+// atob/btoa over Latin-1 strings (browser parity: whitespace stripped,
+// missing padding tolerated, bad chars throw).
+
+fn b64_val(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// `Function(p1, .., pn, body)` / `new Function(...)`: params and body
+/// are source fragments, compiled in global scope like V8 (sloppy).
+/// Parse errors surface as plain errors (SyntaxError shape at catch).
+fn n_function_ctor(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let mut params = Vec::with_capacity(args.len().saturating_sub(1));
+    for a in args.iter().take(args.len().saturating_sub(1)) {
+        params.push(to_str(&it.heap, *a));
+    }
+    let body = match args.last() {
+        Some(v) => to_str(&it.heap, *v),
+        None => String::new(),
+    };
+    let src = format!("(function anonymous({}){{{}}})", params.join(","), body);
+    let stmts = crate::parse::parse_program(&src)?;
+    let [Stmt::Expr(Expr::Func(def))] = stmts.as_slice() else {
+        return Err(err("Function could not compile"));
+    };
+    Ok(Value::Obj(it.func_obj(def.clone(), 0)?))
+}
+fn n_atob(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let s = to_str(&it.heap, arg(args, 0));
+    let mut clean: Vec<u8> = Vec::with_capacity(s.len());
+    for b in s.bytes() {
+        if matches!(b, b'\t' | b'\n' | b'\x0C' | b'\r' | b' ') {
+            continue;
+        }
+        clean.push(b);
+    }
+    if clean.len() % 4 == 1 {
+        return Err(err("Invalid character in atob"));
+    }
+    while !clean.len().is_multiple_of(4) {
+        clean.push(b'=');
+    }
+    let mut out = String::new();
+    for w in clean.as_chunks::<4>().0 {
+        let pad = w.iter().rev().take_while(|&&b| b == b'=').count();
+        if pad > 2 {
+            return Err(err("Invalid character in atob"));
+        }
+        let mut n: u32 = 0;
+        for (i, &b) in w.iter().enumerate() {
+            if b == b'=' {
+                if i < 4 - pad {
+                    return Err(err("Invalid character in atob"));
+                }
+                n <<= 6;
+            } else {
+                let Some(v) = b64_val(b) else {
+                    return Err(err("Invalid character in atob"));
+                };
+                n = (n << 6) | v as u32;
+            }
+        }
+        out.push((n >> 16) as u8 as char);
+        if pad < 2 {
+            out.push(((n >> 8) & 0xFF) as u8 as char);
+        }
+        if pad < 1 {
+            out.push((n & 0xFF) as u8 as char);
+        }
+    }
+    Ok(Value::Str(it.heap.alloc_str(out)?))
+}
+
+fn n_btoa(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let s = to_str(&it.heap, arg(args, 0));
+    let bytes = s.as_bytes();
+    if s.chars().any(|c| c as u32 > 255) {
+        return Err(err("Invalid character in btoa"));
+    }
+    let mut out = String::new();
+    for w in bytes.chunks(3) {
+        let (b0, b1, b2) = (w[0], *w.get(1).unwrap_or(&0), *w.get(2).unwrap_or(&0));
+        out.push(ALPHA[(b0 >> 2) as usize] as char);
+        out.push(ALPHA[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if w.len() > 1 {
+            ALPHA[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if w.len() > 2 { ALPHA[(b2 & 63) as usize] as char } else { '=' });
+    }
+    Ok(Value::Str(it.heap.alloc_str(out)?))
 }
 
 // ---- async runtime: promises, microtasks, timers -----------------------------
@@ -6529,7 +8702,7 @@ mod tests {
         assert_eq!(disp("({...( {a: 1}), a: 9}).a"), "9");
         assert_eq!(disp("({x: 1, ...null}).x"), "1");
         assert_eq!(disp("({...'hi'})[1]"), "i");
-        assert!(errmsg("var x = [...5]").contains("non-array"));
+        assert!(errmsg("var x = [...5]").contains("non-iterable"));
     }
 
     #[test]
@@ -6705,6 +8878,332 @@ mod tests {
         assert_eq!(disp("var o={k:3};Object.defineProperty(o,'k',{enumerable:true});o.k"), "3");
         assert_eq!(disp("var o={};Object.defineProperty(o,'k',{enumerable:true});o.k"), "undefined");
         assert_eq!(disp("var o={};Object.defineProperty(o,'k',{value:42});o.k"), "42");
+    }
+
+    #[test]
+    fn proxy_forwarding() {
+        // No traps: transparent forwarding to the target.
+        assert_eq!(disp("var p=new Proxy({a:1},{});p.a"), "1");
+        assert_eq!(disp("var p=new Proxy({a:1},{});'a' in p"), "true");
+        assert_eq!(disp("var p=new Proxy({a:1},{});Object.keys(p).join()"), "a");
+        assert_eq!(disp("var p=new Proxy({a:1},{});typeof p"), "object");
+        assert_eq!(disp("var t={a:1};var p=new Proxy(t,{});p.b=2;t.b"), "2");
+        assert_eq!(disp("var p=new Proxy({a:1},{});p instanceof Object"), "true");
+        assert_eq!(
+            disp("var p=new Proxy({a:1},{});Object.getPrototypeOf(p)===Object.prototype"),
+            "true"
+        );
+        assert_eq!(disp("var p=new Proxy({s:5},{});JSON.stringify({...p})"), "{\"s\":5}");
+        assert_eq!(disp("Object.prototype.toString.call(new Proxy({},{}))"), "[object Object]");
+        assert_eq!(disp("var p=new Proxy({a:1},{});delete p.a;('a' in p)"), "false");
+        // for-in enumerates the target (ownKeys trap gap).
+        assert_eq!(disp("var s='';for(var k in new Proxy({a:1},{})){s+=k}s"), "a");
+        // Target and handler must be objects.
+        assert!(errmsg("new Proxy(1,{})").contains("object target"));
+        assert!(errmsg("new Proxy({},1)").contains("object target"));
+        assert!(errmsg("new Proxy({},null)").contains("object target"));
+    }
+
+    #[test]
+    fn proxy_traps() {
+        // get/has/set/deleteProperty traps run at the recv_ level.
+        assert_eq!(disp("var q=new Proxy({x:1},{get:(o,k)=>k==='x'?42:o[k]});q.x"), "42");
+        assert_eq!(
+            disp("var q=new Proxy({},{has:(o,k)=>k==='y'});('y' in q)"),
+            "true"
+        );
+        assert_eq!(
+            disp("var q=new Proxy({},{has:(o,k)=>k==='y'});('z' in q)"),
+            "false"
+        );
+        assert_eq!(
+            disp("var r=new Proxy({m:1},{set:(o,k,v)=>{o[k]=v*10;return true}});r.m=3;r.m"),
+            "30"
+        );
+        assert_eq!(
+            disp("var q=new Proxy({x:1},{get:(o,k)=>42});delete q.x;q.x"),
+            "42"
+        );
+        assert_eq!(
+            disp("var seen='';var q=new Proxy({},{deleteProperty:(o,k)=>{seen=k;return true}});delete q.z;seen"),
+            "z"
+        );
+    }
+
+    #[test]
+    fn reflect_basics() {
+        assert_eq!(disp("Reflect.get({g:7},'g')"), "7");
+        assert_eq!(disp("Reflect.has({},'toString')"), "true");
+        assert_eq!(disp("var o={};Reflect.set(o,'k',9);o.k"), "9");
+        assert_eq!(disp("var o={v:1};Reflect.deleteProperty(o,'v');('v' in o)"), "false");
+        assert_eq!(disp("Reflect.getOwnPropertyDescriptor({v:9},'v').value"), "9");
+        assert_eq!(disp("Reflect.getOwnPropertyDescriptor({},'nope')"), "undefined");
+        assert_eq!(disp("Reflect.getPrototypeOf([])===Array.prototype"), "true");
+        assert_eq!(disp("Reflect.ownKeys({a:1}).join()"), "a");
+        assert_eq!(disp("Reflect.apply(Math.max,null,[2,9])"), "9");
+        assert_eq!(disp("function C(a){this.a=a}Reflect.construct(C,['z']).a"), "z");
+        // Reflect.get honors the get trap.
+        assert_eq!(
+            disp("Reflect.get(new Proxy({x:1},{get:(o,k)=>42}),'x')"),
+            "42"
+        );
+        // Reflect.getOwnPropertyDescriptor reads through (trap gap).
+        assert_eq!(disp("Reflect.getOwnPropertyDescriptor(new Proxy({v:9},{}),'v').value"), "9");
+        assert_eq!(disp("typeof Reflect"), "object");
+    }
+
+    #[test]
+    fn typed_arrays() {
+        // Clamping (ToUint8 mod semantics).
+        assert_eq!(disp("var a=new Uint8Array([257,-1,300.5]);a[0]"), "1");
+        assert_eq!(disp("var a=new Uint8Array([257,-1,300.5]);a[1]"), "255");
+        assert_eq!(disp("var a=new Uint8Array([257,-1,300.5]);a[2]"), "44");
+        assert_eq!(disp("new Uint8Array(3.7).length"), "3");
+        assert_eq!(disp("new Uint8Array().length"), "0");
+        assert!(errmsg("new Uint8Array(-1)").contains("invalid typed array"));
+        // set / slice / subarray / join / fill / indexOf.
+        assert_eq!(disp("var u=new Uint8Array([1,2,3,4]);u.set([9,9],2);u.join()"), "1,2,9,9");
+        assert!(errmsg("new Uint8Array([1]).set([1],9)").contains("out of bounds"));
+        assert_eq!(disp("new Uint8Array([1,2,3,4]).slice(1,3).join()"), "2,3");
+        assert_eq!(disp("new Uint8Array([1,2,3,4]).subarray(-2).join()"), "3,4");
+        assert_eq!(disp("String(new Uint8Array([1,2,3]))"), "1,2,3");
+        assert_eq!(disp("JSON.stringify(new Uint8Array([1,2]))"), "{\"0\":1,\"1\":2}");
+        assert_eq!(
+            disp("Object.prototype.toString.call(new Uint8Array([1]))"),
+            "[object Uint8Array]"
+        );
+        assert_eq!(disp("Object.keys(new Uint8Array([7,8])).join()"), "0,1");
+        assert_eq!(disp("var u=new Uint8Array([1]);(1 in u)+'|'+('length' in u)"), "false|true");
+        assert_eq!(disp("var s='';for(var x of new Uint8Array([1,2])){s+=x}s"), "12");
+        assert_eq!(disp("var u=new Uint8Array([5,6]);var c=u.slice();c[0]=9;u[0]"), "5");
+        assert_eq!(disp("var u=new Uint8Array(3);u.fill(7);u.join()"), "7,7,7");
+        assert_eq!(disp("new Uint8Array([1,2,3]).indexOf(2)"), "1");
+        assert_eq!(disp("new Uint8Array([1,2,3]).indexOf(9)"), "-1");
+        assert_eq!(disp("var u=new Uint8Array(2);u[5]=9;u.length"), "2");
+        assert_eq!(disp("var u=new Uint8Array([1]);delete u[0]"), "false");
+        assert_eq!(disp("var u=new Uint8Array([1]);delete u[0];u[0]"), "1");
+        assert_eq!(disp("var u=new Uint8Array(2);u instanceof Uint8Array"), "true");
+        assert_eq!(disp("var u=new Uint8Array(2);u instanceof Object"), "true");
+        assert_eq!(disp("new Uint8Array(2).byteLength"), "2");
+        // ArrayBuffer + views over it (copies).
+        assert_eq!(disp("new ArrayBuffer(4).byteLength"), "4");
+        assert_eq!(disp("var v=new Uint8Array(new ArrayBuffer(4));v[0]=77;v[0]+'|'+v.length"), "77|4");
+        assert_eq!(disp("new ArrayBuffer(8).slice(2,5).byteLength"), "3");
+        assert_eq!(
+            disp("Object.prototype.toString.call(new ArrayBuffer(1))"),
+            "[object ArrayBuffer]"
+        );
+        // apply() expands typed arrays (base64 decode path).
+        assert_eq!(disp("String.fromCharCode.apply(String,new Uint8Array([72,105]))"), "Hi");
+        assert_eq!(disp("typeof Uint8Array"), "function");
+        assert_eq!(disp("typeof ArrayBuffer"), "function");
+    }
+
+    #[test]
+    fn typed_views() {
+        // Write coercion per kind (oracle: node -e one-liners).
+        assert_eq!(disp("new Uint16Array([70000,-1]).join()"), "4464,65535");
+        assert_eq!(disp("new Int8Array([200,-200]).join()"), "-56,56");
+        assert_eq!(disp("new Int32Array([4294967297,-1]).join()"), "1,-1");
+        assert_eq!(disp("new Uint32Array([-1])[0]"), "4294967295");
+        assert_eq!(disp("new Float32Array([0.1])[0]===Math.fround(0.1)"), "true");
+        assert_eq!(disp("Uint16Array.BYTES_PER_ELEMENT"), "2");
+        assert_eq!(disp("Float64Array.BYTES_PER_ELEMENT"), "8");
+        // Buffer reinterpretation (little-endian) + offset/length forms.
+        assert_eq!(disp("new Uint16Array(new Uint8Array([1,0,2,0])).join()"), "1,0,2,0");
+        assert_eq!(disp("new Uint16Array(new ArrayBuffer(8),2,2).length"), "2");
+        assert!(errmsg("new Uint16Array(new ArrayBuffer(3))").contains("mismatch"));
+        assert!(errmsg("new Uint16Array(new ArrayBuffer(8),1)").contains("misaligned"));
+        // Methods mirror the u8 set.
+        assert_eq!(disp("var a=new Uint16Array(3);a.set([1,2],1);a.join()"), "0,1,2");
+        assert_eq!(disp("var a=new Uint16Array([1,2,3]);a.fill(9,1);a.join()"), "1,9,9");
+        assert_eq!(disp("new Uint16Array([1,2,3]).subarray(1).join()"), "2,3");
+        assert_eq!(disp("new Int32Array([5,6]).slice(1).join()"), "6");
+        assert_eq!(disp("new Uint32Array([7,8]).indexOf(8)"), "1");
+        assert_eq!(disp("new Uint16Array(1) instanceof Uint16Array"), "true");
+        assert_eq!(disp("new Uint16Array(3).byteLength"), "6");
+        assert_eq!(
+            disp("Object.prototype.toString.call(new Uint16Array(1))"),
+            "[object Uint16Array]"
+        );
+        assert_eq!(disp("var u=new Int32Array(852);u.length"), "852");
+    }
+
+    #[test]
+    fn dataview() {
+        assert_eq!(
+            disp("var v=new DataView(new ArrayBuffer(4));v.setUint16(0,0x1234);v.getUint16(0).toString(16)"),
+            "1234"
+        );
+        assert_eq!(
+            disp("var v=new DataView(new ArrayBuffer(4));v.setUint16(2,0x5678,true);v.getUint16(2,true).toString(16)"),
+            "5678"
+        );
+        assert_eq!(
+            disp("var v=new DataView(new ArrayBuffer(4));v.setUint16(0,0x1234);v.getUint8(1).toString(16)"),
+            "34"
+        );
+        assert_eq!(
+            disp("var v=new DataView(new ArrayBuffer(4));v.setUint16(0,0x1234);v.setUint16(2,0x5678,true);v.getUint32(0).toString(16)"),
+            "12347856"
+        );
+        assert_eq!(disp("new DataView(new ArrayBuffer(5)).byteLength"), "5");
+        assert_eq!(
+            disp("Object.prototype.toString.call(new DataView(new ArrayBuffer(1)))"),
+            "[object DataView]"
+        );
+        assert!(errmsg("new DataView(new ArrayBuffer(2)).getUint16(1)").contains("out of bounds"));
+    }
+
+    #[test]
+    fn math_extra() {
+        assert_eq!(disp("Math.fround(0.1)===new Float32Array([0.1])[0]"), "true");
+        assert_eq!(disp("Math.trunc(3.7)"), "3");
+        assert_eq!(disp("Math.trunc(-3.7)"), "-3");
+        assert_eq!(disp("(0x1234).toString(16)"), "1234");
+        assert_eq!(disp("(255).toString(2)"), "11111111");
+        assert_eq!(disp("(-10).toString(16)"), "-a");
+        assert_eq!(disp("(3.5).toString()"), "3.5");
+        assert_eq!(disp("(42).toString()"), "42");
+        assert_eq!(disp("NaN.toString(16)"), "NaN");
+        assert_eq!(disp("typeof NaN"), "number");
+        assert_eq!(disp("Infinity>1e308"), "true");
+        assert!(errmsg("(1).toString(37)").contains("radix"));
+        assert!(errmsg("(1).toString(1)").contains("radix"));
+    }
+
+    #[test]
+    fn text_codec() {
+        assert_eq!(disp("new TextEncoder().encode('Hi').join()"), "72,105");
+        assert_eq!(disp("new TextEncoder().encode('').length"), "0");
+        assert_eq!(
+            disp("new TextEncoder().encode('ñ €').join()"),
+            "195,177,32,226,130,172"
+        );
+        assert_eq!(
+            disp("new TextDecoder().decode(new Uint8Array([72,105]))"),
+            "Hi"
+        );
+        assert_eq!(
+            disp("new TextDecoder().decode(new Uint8Array([195,177]))"),
+            "ñ"
+        );
+        assert_eq!(disp("new TextDecoder().encoding"), "utf-8");
+        assert_eq!(disp("new TextDecoder('utf8').encoding"), "utf-8");
+        assert_eq!(disp("new TextDecoder('latin1').encoding"), "windows-1252");
+        assert_eq!(
+            disp("new TextDecoder('latin1').decode(new Uint8Array([65,233,255]))"),
+            "Aéÿ"
+        );
+        // Lossy: bad bytes become U+FFFD, never throw.
+        assert_eq!(
+            disp("new TextDecoder().decode(new Uint8Array([72,255,105]))"),
+            "H�i"
+        );
+        assert_eq!(disp("typeof TextEncoder.prototype.encode"), "function");
+        assert_eq!(disp("typeof TextDecoder.prototype.decode"), "function");
+        assert_eq!(disp("new TextEncoder() instanceof TextEncoder"), "true");
+        assert_eq!(disp("new TextDecoder() instanceof TextDecoder"), "true");
+        assert!(errmsg("new TextDecoder('nope')").contains("unknown encoding"));
+    }
+
+    #[test]
+    fn object_proto_extras() {
+        assert_eq!(disp("Object.prototype.isPrototypeOf.call(Array.prototype, [])"), "true");
+        assert_eq!(disp("Object.prototype.isPrototypeOf.call({}, [])"), "false");
+        assert_eq!(disp("Object.prototype.isPrototypeOf.call({}, 5)"), "false");
+        assert_eq!(disp("class A{}class B extends A{}Object.prototype.isPrototypeOf.call(A.prototype, new B())"), "true");
+        assert_eq!(disp("({x:1}).propertyIsEnumerable('x')"), "true");
+        assert_eq!(disp("({}).propertyIsEnumerable('x')"), "false");
+        assert_eq!(disp("(5).valueOf()"), "5");
+        assert_eq!(disp("({a:1}).valueOf().a"), "1");
+    }
+
+    #[test]
+    fn spread_iterables() {
+        assert_eq!(disp("[...new Set([3,1])].join()"), "3,1");
+        assert_eq!(disp("[...new Map([[1,2]])][0].join()"), "1,2");
+        assert_eq!(disp("[...'hi'].join()"), "h,i");
+        assert_eq!(disp("[...new Uint8Array([7,8])].join()"), "7,8");
+        assert_eq!(disp("[...new Uint16Array([9])].join()"), "9");
+        assert_eq!(disp("Math.max(...new Set([2,9]))"), "9");
+        assert_eq!(disp("var s='';for(var x of new Set([1,2])){s+=x}s"), "12");
+        assert!(errmsg("[...{}]").contains("non-iterable"));
+        assert!(errmsg("[...5]").contains("non-iterable"));
+    }
+
+    #[test]
+    fn typed_clamped() {
+        assert_eq!(disp("new Uint8ClampedArray([0.5,1.5,2.5,3.5,-1,300,NaN]).join()"), "0,2,2,4,0,255,0");
+        assert_eq!(disp("var a=new Uint8ClampedArray(2);a[0]=2.5;a[1]=300;a.join()"), "2,255");
+        assert_eq!(disp("Uint8ClampedArray.BYTES_PER_ELEMENT"), "1");
+        assert_eq!(
+            disp("Object.prototype.toString.call(new Uint8ClampedArray(1))"),
+            "[object Uint8ClampedArray]"
+        );
+        assert_eq!(disp("new Uint8ClampedArray(2) instanceof Uint8ClampedArray"), "true");
+        assert_eq!(disp("Uint8ClampedArray.of(300).join()"), "255");
+    }
+
+    #[test]
+    fn typed_statics() {
+        assert_eq!(disp("Uint8Array.of(137,80).join()"), "137,80");
+        assert_eq!(disp("Uint8Array.from([1.7,'3'],x=>x+1).join()"), "2,31");
+        assert_eq!(disp("Uint8Array.from('hi').join()"), "0,0");
+        assert_eq!(disp("Uint16Array.of(70000).join()"), "4464");
+        assert_eq!(disp("Uint8Array.from(new Uint8Array([5])).join()"), "5");
+        assert_eq!(disp("var s=0;Uint8Array.from([1,2],function(v,i){s+=i;return v});s"), "1");
+    }
+
+    #[test]
+    fn base64_globals() {
+        assert_eq!(disp("atob('aGk=')"), "hi");
+        assert_eq!(disp("btoa('Hi')"), "SGk=");
+        assert_eq!(disp("atob('aGk')"), "hi");
+        assert_eq!(disp("atob(' aGk= ')"), "hi");
+        assert_eq!(disp("atob('')"), "");
+        assert_eq!(disp("btoa('')"), "");
+        assert_eq!(disp("atob('AP+A').length"), "3");
+        assert_eq!(disp("atob('AP+A').charCodeAt(1)"), "255");
+        assert_eq!(disp("btoa(atob('aGk='))"), "aGk=");
+        assert!(errmsg("atob('aGkxy')").contains("Invalid character"));
+        assert!(errmsg("atob('!!!')").contains("Invalid character"));
+        assert!(errmsg("btoa('€')").contains("Invalid character"));
+        assert_eq!(disp("typeof atob"), "function");
+        // jsPDF shape: bound helpers off a facade object.
+        assert_eq!(disp("var Y={atob:atob};var f=Y.atob.bind(Y);f('aGk=')"), "hi");
+    }
+
+    #[test]
+    fn call_through_getter() {
+        // tslib __createBinding shape: re-exported via a getter must be
+        // callable, not just readable.
+        assert_eq!(
+            disp("var r=function(d,b){return 'ext:'+b};var m={__extends:r};var o={};\
+                  Object.defineProperty(o,'__extends',{enumerable:true,get:function(){return m['__extends']}});\
+                  o.__extends('D','B')"),
+            "ext:B"
+        );
+        assert_eq!(
+            disp("var o={};Object.defineProperty(o,'m',{get:function(){return function(x){return x*2}}});o.m(21)"),
+            "42"
+        );
+        assert_eq!(
+            disp("var o={arr:[1,2]};o.arr.map(function(x){return x+1}).join()"),
+            "2,3"
+        );
+    }
+
+    #[test]
+    fn function_ctor() {
+        assert_eq!(disp("Function('return 41')()"), "41");
+        assert_eq!(disp("new Function('a','b','return a+b')(2,3)"), "5");
+        assert_eq!(disp("Function().length"), "0");
+        assert_eq!(disp("Function('a','b','return a') instanceof Function"), "true");
+        assert_eq!(disp("typeof Function"), "function");
+        // Global scope, not closure scope.
+        assert_eq!(disp("var x=1;var f=Function('return x');var x=2;f()"), "2");
+        assert!(errmsg("Function('return )')").contains("byte") || errmsg("Function('return )')").contains("expected"));
     }
 
     #[test]
@@ -7285,7 +9784,7 @@ mod tests {
     #[test]
     fn limits() {
         // heap cap: concat allocates a fresh slot per iteration
-        let mut it = Interp::with_cap(20);
+        let mut it = Interp::with_cap(192);
         let e = it.run("var s='a';while(1){s=s+s}").unwrap_err();
         assert!(e.to_string().contains("heap cap"), "{e}");
         // step limit
@@ -7551,7 +10050,7 @@ mod tests {
         // tight heap: proto/builtin installs hit the cap and skip; plain
         // own-prop objects still work. The cap tracks the install
         // footprint - every new builtin moves it, update deliberately.
-        let mut it = Interp::with_cap(192);
+        let mut it = Interp::with_cap(196);
         assert_eq!(it.run("var o={a:1};o.a").unwrap(), Value::Num(1.0));
     }
 

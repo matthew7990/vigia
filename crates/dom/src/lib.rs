@@ -143,6 +143,25 @@ impl Dom {
         self.nodes[parent as usize].children.push(id);
     }
 
+    /// Create a detached text node (document.createTextNode): no parent,
+    /// no merging - the caller links it with append/insert.
+    pub fn text_node(&mut self, text: &str) -> NodeId {
+        self.push(Node {
+            parent: None,
+            children: Vec::new(),
+            data: NodeData::Text(text.to_string()),
+        })
+    }
+
+    /// Create a detached comment node (document.createComment).
+    pub fn comment_node(&mut self, text: &str) -> NodeId {
+        self.push(Node {
+            parent: None,
+            children: Vec::new(),
+            data: NodeData::Comment(text.to_string()),
+        })
+    }
+
     fn push(&mut self, node: Node) -> NodeId {
         let id = self.nodes.len() as NodeId;
         self.nodes.push(node);

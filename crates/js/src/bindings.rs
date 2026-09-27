@@ -210,11 +210,23 @@ impl Interp {
         };
         self.env_declare(0, "navigator", Value::Obj(nav));
         self.env_declare(0, "location", Value::Obj(loc));
-        if let Ok(w) = self.obj_pairs(vec![
+        // `window` mirrors the global scope (real browsers alias them):
+        // seed with document/navigator/location plus every global so far
+        // (builtins like atob included). Later script-defined globals
+        // read through bare identifiers; `window.x` reads for those are
+        // a documented gap (writes land on window itself and do read
+        // back within the page).
+        let mut wp = vec![
             ("document".into(), doc),
             ("navigator".into(), Value::Obj(nav)),
             ("location".into(), Value::Obj(loc)),
-        ]) {
+        ];
+        for (k, v) in &self.envs[0].vars {
+            if !wp.iter().any(|(ek, _)| ek == k) {
+                wp.push((k.clone(), *v));
+            }
+        }
+        if let Ok(w) = self.obj_pairs(wp) {
             if let Obj::Ordinary { pairs, .. } = self.heap.obj_mut(w) {
                 pairs.push(("window".into(), Value::Obj(w)));
                 // `self` (workers/global alias) and `globalThis` match window.
@@ -1055,6 +1067,16 @@ impl Interp {
                     };
                     self.dom_wrap(n)
                 }
+                "createTextNode" => {
+                    let t = to_str(&self.heap, arg(0));
+                    let n = self.dom_mut()?.text_node(&t);
+                    self.dom_wrap(n)
+                }
+                "createComment" => {
+                    let t = to_str(&self.heap, arg(0));
+                    let n = self.dom_mut()?.comment_node(&t);
+                    self.dom_wrap(n)
+                }
                 "querySelector" => {
                     let hits = self.select(id, arg(0))?;
                     self.opt_node(hits.into_iter().next())
@@ -1255,6 +1277,11 @@ mod tests {
     fn globals() {
         let mut it = interp(PAGE);
         assert_eq!(ev(&mut it, "window.document === document"), "true");
+        // window mirrors the global scope (builtins included).
+        assert_eq!(ev(&mut it, "window.atob === atob"), "true");
+        assert_eq!(ev(&mut it, "window.Uint8Array === Uint8Array"), "true");
+        assert_eq!(ev(&mut it, "window.window === window"), "true");
+        assert_eq!(ev(&mut it, "globalThis.atob('aGk=')"), "hi");
         assert_eq!(ev(&mut it, "document.nodeType"), "9");
         assert_eq!(ev(&mut it, "navigator.userAgent"), "vigia/0.1");
         assert_eq!(ev(&mut it, "typeof location.href"), "string");
@@ -1444,12 +1471,19 @@ mod tests {
             "var h=document.createElement('h1');h.textContent='INJ';document.body.appendChild(h)",
         )
         .unwrap();
+        // createTextNode/createComment: detached until linked.
+        it.run("var t=document.createTextNode('hi');document.body.appendChild(t)")
+            .unwrap();
+        it.run("var c=document.createComment('note');document.body.appendChild(c)")
+            .unwrap();
         it.run("document.getElementById('a').appendChild(document.getElementById('l'))")
             .unwrap();
         it.run("document.getElementById('i').remove()").unwrap();
         let dom = it.take_dom();
         let h1 = vigia_css::query(&dom, "body > h1").unwrap();
         assert_eq!(vigia_actions::text_content(&dom, h1[0]), "INJ");
+        assert!(vigia_actions::text_content(&dom, vigia_css::query(&dom, "body").unwrap()[0])
+            .contains("hi"));
         // moved, not copied: link is now inside #a
         assert_eq!(vigia_css::query(&dom, "#a > a").unwrap().len(), 1);
         // detached: orphan stays in the arena but query() skips unreachable

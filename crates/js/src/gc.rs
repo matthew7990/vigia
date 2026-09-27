@@ -123,6 +123,10 @@ impl Marker {
                         }
                     }
                     Obj::Dom(_) | Obj::Style { .. } | Obj::Freed => {}
+                    Obj::Proxy { target, handler } => {
+                        self.ow.push(*target);
+                        self.ow.push(*handler);
+                    }
                     Obj::Accessor { get, set, proto } => {
                         if let Some(g) = get {
                             self.ow.push(*g);
@@ -155,6 +159,32 @@ impl Marker {
                         for v in items {
                             self.val(*v);
                         }
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
+                    Obj::Bytes { pairs, proto, .. } => {
+                        for (_, v) in pairs {
+                            self.val(*v);
+                        }
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
+                    Obj::Typed { pairs, proto, .. } => {
+                        for (_, v) in pairs {
+                            self.val(*v);
+                        }
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
+                    Obj::DView { proto, .. } => {
+                        if let Some(p) = proto {
+                            self.ow.push(*p);
+                        }
+                    }
+                    Obj::Buf { proto, .. } => {
                         if let Some(p) = proto {
                             self.ow.push(*p);
                         }
@@ -288,6 +318,19 @@ impl Interp {
             self.protos.set,
             self.protos.weakmap,
             self.protos.url,
+            self.protos.uint8array,
+            self.protos.buffer,
+            self.protos.dataview,
+            self.protos.int8array,
+            self.protos.uint8clampedarray,
+            self.protos.uint16array,
+            self.protos.int16array,
+            self.protos.uint32array,
+            self.protos.int32array,
+            self.protos.float32array,
+            self.protos.float64array,
+            self.protos.textencoder,
+            self.protos.textdecoder,
         ] {
             if p != u32::MAX {
                 m.ow.push(p);

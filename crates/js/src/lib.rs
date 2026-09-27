@@ -137,6 +137,20 @@ pub enum Value {
     Obj(u32),
 }
 
+/// Element kind of a Typed view (everything but Uint8Array, which has
+/// its own byte-packed variant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypedKind {
+    I8,
+    U8C,
+    U16,
+    I16,
+    U32,
+    I32,
+    F32,
+    F64,
+}
+
 /// Builtin function signature: interpreter access, the receiver (`this`),
 /// and already-evaled args.
 pub type NativeFn = fn(&mut Interp, this: Value, &[Value]) -> Result<Value, JsError>;
@@ -240,6 +254,38 @@ pub enum Obj {
     },
     /// Promise cell; Promise.prototype is a virtual proto (proto_of).
     Promise(PromiseState),
+    /// Uint8Array bytes (+ expando pairs); no shared memory - views over
+    /// buffers and subarray()/slice() copy (documented gap).
+    Bytes {
+        bytes: Vec<u8>,
+        pairs: Vec<(String, Value)>,
+        proto: Option<u32>,
+    },
+    /// Other numeric views (elements pre-coerced to f64, so reads are
+    /// exact; f32 coerces through `as f32` on write). Copies like Bytes.
+    Typed {
+        kind: TypedKind,
+        elems: Vec<f64>,
+        pairs: Vec<(String, Value)>,
+        proto: Option<u32>,
+    },
+    /// DataView over a buffer copy (+ base byteOffset for the offset
+    /// form); multi-byte accessors honor the littleEndian flag.
+    DView {
+        bytes: Vec<u8>,
+        off: usize,
+        proto: Option<u32>,
+    },
+    /// ArrayBuffer backing store (non-extensible: writes to named props
+    /// are sloppy no-ops).
+    Buf { bytes: Vec<u8>, proto: Option<u32> },
+    /// Forwarding proxy: reads/writes go to `target` unless `handler`
+    /// defines the matching trap (`get`/`set`/`has`/`deleteProperty`,
+    /// run at the recv_ level). Free-fn paths (proto chains, keys,
+    /// JSON, descriptors) forward transparently; `ownKeys` /
+    /// `getOwnPropertyDescriptor` / `getPrototypeOf` / `apply` /
+    /// `construct` traps are documented gaps (forwarded, not run).
+    Proxy { target: u32, handler: u32 },
     /// GC tombstone: a swept slot awaiting freelist reuse. Reads on a
     /// dangling id see an empty, proto-less object instead of stale data.
     Freed,
@@ -312,6 +358,19 @@ pub struct Protos {
     pub set: u32,
     pub weakmap: u32,
     pub url: u32,
+    pub uint8array: u32,
+    pub buffer: u32,
+    pub dataview: u32,
+    pub int8array: u32,
+    pub uint8clampedarray: u32,
+    pub uint16array: u32,
+    pub int16array: u32,
+    pub uint32array: u32,
+    pub int32array: u32,
+    pub float32array: u32,
+    pub float64array: u32,
+    pub textencoder: u32,
+    pub textdecoder: u32,
 }
 
 impl Protos {
@@ -331,6 +390,19 @@ impl Protos {
             set: u32::MAX,
             weakmap: u32::MAX,
             url: u32::MAX,
+            uint8array: u32::MAX,
+            buffer: u32::MAX,
+            dataview: u32::MAX,
+            int8array: u32::MAX,
+            uint8clampedarray: u32::MAX,
+            uint16array: u32::MAX,
+            int16array: u32::MAX,
+            uint32array: u32::MAX,
+            int32array: u32::MAX,
+            float32array: u32::MAX,
+            float64array: u32::MAX,
+            textencoder: u32::MAX,
+            textdecoder: u32::MAX,
         }
     }
 }

@@ -211,6 +211,8 @@ impl Interp {
         self.dom = Some(dom);
         self.dom_objs.clear();
         self.sheets.clear();
+        self.canvases.clear();
+        self.ctx2ds.clear();
         self.listeners.clear();
         self.pending_nav = None;
         self.pending_submit = None;
@@ -1636,6 +1638,13 @@ impl Interp {
                             .dom_mut()?
                             .set_attr(id, key, &format!("{}", n.max(0.0) as u32));
                     }
+                    // Resizing a canvas clears it (even to the same size);
+                    // drop the buffer so ops lazily rebuild it transparent.
+                    // setAttribute bypasses this and only takes effect via
+                    // the size check in canvas_ensure (documented gap).
+                    if tag == "canvas" {
+                        self.canvases.remove(&id);
+                    }
                 }
             }
             "checked" | "disabled" => {
@@ -2007,8 +2016,8 @@ impl Interp {
                 if self.dom_ref()?.tag_name(id) != Some("canvas") {
                     return Err(err("toDataURL is not a function"));
                 }
-                // No rasterizer behind the stub: the empty document.
-                self.str_val("data:,".into())
+                let url = self.canvas_data_url(id)?;
+                self.str_val(url)
             }
             "querySelector" => {
                 let hits = self.select(id, arg(0))?;
@@ -2374,21 +2383,221 @@ pub(crate) fn n_dom_method(it: &mut Interp, this: Value, args: &[Value]) -> Resu
 }
 
 // ---- canvas -------------------------------------------------------------
+// Software 2d rasterizer: real RGBA pixels behind the ctx stub so
+// feature-detects and pixel reads behave. Paths, text, gradients and
+// shadows stay no-ops (their method names remain wired so pages that
+// stringify natives still see them).
 
-/// 2d context for a canvas node: ordinary object (props like fillStyle
-/// are plain expandos) with the drawing methods main.js-class bundles
-/// call. Everything draws nowhere - the methods only must not throw,
-/// measureText reports zero width, pixel reads come back blank.
+/// Live pixel buffer of one canvas node (RGBA, row-major).
+#[derive(Clone, Default)]
+pub(crate) struct CanvasBuf {
+    w: u32,
+    h: u32,
+    px: Vec<u8>,
+}
+
+/// Per-canvas pixel budget: getContext('2d') throws past this instead of
+/// allocating (a 10000x10000 fingerprint probe must fail, not OOM).
+const CANVAS_MAX_AREA: u64 = 16 * 1024 * 1024;
+
+/// Canvas dimension from the live attr, mirroring dom_get (300x150
+/// defaults, invalid text falls back to the default, negatives clamp).
+fn canvas_dim(dom: &Dom, node: NodeId, key: &str, def: u32) -> u32 {
+    match dom.attr(node, key).unwrap_or("") {
+        "" => def,
+        a => match a.parse::<f64>() {
+            Ok(n) if !n.is_nan() => n.max(0.0).min(u32::MAX as f64) as u32,
+            _ => def,
+        },
+    }
+}
+
+/// Ensure a transparent buffer matching the live attrs. Rebuilds when the
+/// size drifted (e.g. via setAttribute, which bypasses dom_set); throws a
+/// RangeError-style error past the area cap instead of allocating.
+fn canvas_ensure(it: &mut Interp, node: NodeId) -> Result<(), JsError> {
+    let (w, h) = {
+        let d = it.dom_ref()?;
+        (
+            canvas_dim(d, node, "width", 300),
+            canvas_dim(d, node, "height", 150),
+        )
+    };
+    if w as u64 * h as u64 > CANVAS_MAX_AREA {
+        return Err(err("RangeError: canvas area over the 16M pixel budget"));
+    }
+    let fresh = match it.canvases.get(&node) {
+        Some(b) if b.w == w && b.h == h => false,
+        _ => true,
+    };
+    if fresh {
+        it.canvases.insert(
+            node,
+            CanvasBuf {
+                w,
+                h,
+                px: vec![0; w as usize * h as usize * 4],
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Canvas node behind a ctx call: carried on the method native itself
+/// (token_lists pattern), falling back to the ctx object's own marker so
+/// detached method refs still resolve.
+fn ctx_node(it: &Interp, this: Value) -> Option<NodeId> {
+    for v in [it.cur_native, this] {
+        if let Ok(Value::Num(n)) = get_prop(&it.heap, &it.protos, v, "__node") {
+            return Some(n as NodeId);
+        }
+    }
+    None
+}
+
+/// Validated style string stored under the hidden key (`__fillStyle` /
+/// `__strokeStyle`), parsed fresh on every fill. Absent/unparseable falls
+/// back to opaque black (the setter only stores valid colors, so the
+/// fallback only fires for detached-`this` calls).
+fn ctx_color(it: &Interp, this: Value, hidden: &str) -> [u8; 4] {
+    match get_prop(&it.heap, &it.protos, this, hidden) {
+        Ok(Value::Str(id)) => parse_color(it.heap.get_str(id)).unwrap_or([0, 0, 0, 255]),
+        _ => [0, 0, 0, 255],
+    }
+}
+
+/// Clip a float rect to the buffer; None = empty or non-finite (no-op).
+fn rect_clip(bw: u32, bh: u32, x: f64, y: f64, w: f64, h: f64) -> Option<(u32, u32, u32, u32)> {
+    if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) {
+        return None;
+    }
+    let (x0, y0, w0, h0) = (x.trunc() as i64, y.trunc() as i64, w.trunc() as i64, h.trunc() as i64);
+    if w0 <= 0 || h0 <= 0 {
+        return None;
+    }
+    let (cx0, cy0) = (x0.max(0), y0.max(0));
+    let (cx1, cy1) = ((x0 + w0).min(bw as i64), (y0 + h0).min(bh as i64));
+    if cx1 <= cx0 || cy1 <= cy0 {
+        return None;
+    }
+    Some((cx0 as u32, cy0 as u32, cx1 as u32, cy1 as u32))
+}
+
+fn hex_nybble(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// CSS color subset: #rgb, #rrggbb, #rrggbbaa, rgb()/rgba() in comma or
+/// space syntax (channels 0-255 clamped, alpha 0-1), the 16 basic named
+/// colors plus transparent. Anything else is invalid (a fillStyle=
+/// assignment of it is ignored, like V8).
+fn parse_color(s: &str) -> Option<[u8; 4]> {
+    let t = s.trim();
+    if let Some(h) = t.strip_prefix('#') {
+        let b = h.as_bytes();
+        let pair = |i: usize| Some(hex_nybble(b[i])? * 16 + hex_nybble(b[i + 1])?);
+        return match b.len() {
+            3 => Some([
+                hex_nybble(b[0])? * 17,
+                hex_nybble(b[1])? * 17,
+                hex_nybble(b[2])? * 17,
+                255,
+            ]),
+            6 => Some([pair(0)?, pair(2)?, pair(4)?, 255]),
+            8 => Some([pair(0)?, pair(2)?, pair(4)?, pair(6)?]),
+            _ => None,
+        };
+    }
+    let low = t.to_ascii_lowercase();
+    let inner = if let Some(r) = low.strip_prefix("rgba(") {
+        r.strip_suffix(')')?
+    } else if let Some(r) = low.strip_prefix("rgb(") {
+        r.strip_suffix(')')?
+    } else {
+        return match low.as_str() {
+            "black" => Some([0, 0, 0, 255]),
+            "silver" => Some([192, 192, 192, 255]),
+            "gray" | "grey" => Some([128, 128, 128, 255]),
+            "white" => Some([255, 255, 255, 255]),
+            "maroon" => Some([128, 0, 0, 255]),
+            "red" => Some([255, 0, 0, 255]),
+            "purple" => Some([128, 0, 128, 255]),
+            "fuchsia" => Some([255, 0, 255, 255]),
+            "green" => Some([0, 128, 0, 255]),
+            "lime" => Some([0, 255, 0, 255]),
+            "olive" => Some([128, 128, 0, 255]),
+            "yellow" => Some([255, 255, 0, 255]),
+            "navy" => Some([0, 0, 128, 255]),
+            "blue" => Some([0, 0, 255, 255]),
+            "teal" => Some([0, 128, 128, 255]),
+            "aqua" => Some([0, 255, 255, 255]),
+            "transparent" => Some([0, 0, 0, 0]),
+            _ => None,
+        };
+    };
+    // Slash alpha (`rgb(1 2 3 / .5)`) normalizes to a plain 4th part.
+    let spaced = inner.replace('/', " ");
+    let parts: Vec<&str> = if inner.contains(',') {
+        inner.split(',').map(str::trim).collect()
+    } else {
+        spaced.split_whitespace().collect()
+    };
+    if parts.len() != 3 && parts.len() != 4 {
+        return None;
+    }
+    let ch = |p: &str| {
+        let n: f64 = p.parse().ok()?;
+        if !n.is_finite() {
+            return None;
+        }
+        Some(n.round().clamp(0.0, 255.0) as u8)
+    };
+    let a = match parts.get(3) {
+        None => 255,
+        Some(p) => {
+            let n: f64 = p.parse().ok()?;
+            if !n.is_finite() {
+                return None;
+            }
+            (n.clamp(0.0, 1.0) * 255.0).round() as u8
+        }
+    };
+    Some([ch(parts[0])?, ch(parts[1])?, ch(parts[2])?, a])
+}
+
+/// 2d context for a canvas node, cached per node for === identity.
+/// fillStyle/strokeStyle are validating accessors (invalid assignments
+/// ignored, like V8) over hidden `__fillStyle`/`__strokeStyle` expandos;
+/// fill ops re-parse those each call. Everything not drawing pixels stays
+/// on the pre-existing noop.
 fn canvas_ctx2d(it: &mut Interp, node: NodeId) -> Result<Value, JsError> {
+    if let Some(&o) = it.ctx2ds.get(&node) {
+        return Ok(Value::Obj(o));
+    }
+    let (w, h) = {
+        let d = it.dom_ref()?;
+        (
+            canvas_dim(d, node, "width", 300),
+            canvas_dim(d, node, "height", 150),
+        )
+    };
+    if w as u64 * h as u64 > CANVAS_MAX_AREA {
+        return Err(err("RangeError: canvas area over the 16M pixel budget"));
+    }
     let mut pairs: Vec<(String, Value)> = Vec::new();
     for (n, f) in [
-        ("fillRect", n_ctx_noop as NativeFn),
-        ("clearRect", n_ctx_noop),
+        ("fillRect", n_ctx_fill_rect as NativeFn),
+        ("clearRect", n_ctx_clear_rect),
         ("strokeRect", n_ctx_noop),
         ("fillText", n_ctx_noop),
         ("strokeText", n_ctx_noop),
-        ("drawImage", n_ctx_noop),
-        ("putImageData", n_ctx_noop),
+        ("drawImage", n_ctx_draw_image),
+        ("putImageData", n_ctx_put_image),
         ("beginPath", n_ctx_noop),
         ("closePath", n_ctx_noop),
         ("moveTo", n_ctx_noop),
@@ -2406,20 +2615,126 @@ fn canvas_ctx2d(it: &mut Interp, node: NodeId) -> Result<Value, JsError> {
         ("setTransform", n_ctx_noop),
         ("transform", n_ctx_noop),
         ("measureText", n_ctx_measure),
-        ("getImageData", n_ctx_image_data),
-        ("createImageData", n_ctx_image_data),
+        ("getImageData", n_ctx_get_image_data),
+        ("createImageData", n_ctx_create_image_data),
         ("createLinearGradient", n_ctx_gradient),
         ("createRadialGradient", n_ctx_gradient),
         ("createPattern", n_ctx_pattern),
     ] {
-        pairs.push((n.into(), Value::Obj(it.heap.alloc_obj(nat(n, f))?)));
+        let m = it.heap.alloc_obj(nat(n, f))?;
+        let _ = set_prop(&mut it.heap, Value::Obj(m), "__node", Value::Num(node as f64));
+        pairs.push((n.into(), Value::Obj(m)));
     }
     let o = it.obj_pairs(pairs)?;
+    // Validating style accessors (invoke_getter/invoke_setter run these on
+    // read/write); the validated string persists on a hidden expando.
+    for key in ["fillStyle", "strokeStyle"] {
+        let g = it.heap.alloc_obj(nat(key, n_ctx_style_get))?;
+        let s = it.heap.alloc_obj(nat(key, n_ctx_style_set))?;
+        let proto = po(it.protos.object);
+        let acc = it
+            .heap
+            .alloc_obj(Obj::Accessor { get: Some(g), set: Some(s), proto })?;
+        if let Obj::Ordinary { pairs, .. } = it.heap.obj_mut(o) {
+            pairs.push((key.into(), Value::Obj(acc)));
+        }
+    }
+    let _ = set_prop(&mut it.heap, Value::Obj(o), "__node", Value::Num(node as f64));
     // ctx.canvas backref (wraps the same node, identity preserved).
     if let Ok(w) = it.dom_wrap(node) {
         let _ = set_prop(&mut it.heap, Value::Obj(o), "canvas", w);
     }
+    it.ctx2ds.insert(node, o);
     Ok(Value::Obj(o))
+}
+
+/// fillStyle/strokeStyle getter: hidden validated value or "#000000".
+/// The key comes from the native's own name (one fn serves both).
+fn n_ctx_style_get(it: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, JsError> {
+    let name = match it.cur_native {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Native { name, .. } => *name,
+            _ => "fillStyle",
+        },
+        _ => "fillStyle",
+    };
+    let key = format!("__{name}");
+    match get_prop(&it.heap, &it.protos, this, &key) {
+        Ok(Value::Str(id)) => Ok(Value::Str(id)),
+        _ => Ok(Value::Str(it.heap.alloc_str("#000000".into())?)),
+    }
+}
+
+/// fillStyle/strokeStyle setter: stores only valid colors, ignores the
+/// rest (V8 keeps the old value on invalid assignment).
+fn n_ctx_style_set(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let name = match it.cur_native {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Native { name, .. } => *name,
+            _ => "fillStyle",
+        },
+        _ => "fillStyle",
+    };
+    let raw = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    if parse_color(&raw).is_some() {
+        let key = format!("__{name}");
+        let id = it.heap.alloc_str(raw)?;
+        set_prop(&mut it.heap, this, &key, Value::Str(id))?;
+    }
+    Ok(Value::Undef)
+}
+
+fn n_ctx_fill_rect(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(node) = ctx_node(it, this) else {
+        return Ok(Value::Undef);
+    };
+    let nums: Vec<f64> = (0..4)
+        .map(|i| to_num(&it.heap, args.get(i).copied().unwrap_or(Value::Undef)))
+        .collect();
+    let color = ctx_color(it, this, "__fillStyle");
+    canvas_ensure(it, node)?;
+    if let Some((x0, y0, x1, y1)) = rect_clip(
+        it.canvases.get(&node).map(|b| b.w).unwrap_or(0),
+        it.canvases.get(&node).map(|b| b.h).unwrap_or(0),
+        nums[0], nums[1], nums[2], nums[3],
+    ) {
+        if let Some(b) = it.canvases.get_mut(&node) {
+            let w = b.w as usize;
+            for y in y0 as usize..y1 as usize {
+                let base = y * w * 4;
+                for px in b.px[base + x0 as usize * 4..base + x1 as usize * 4].chunks_exact_mut(4) {
+                    px.copy_from_slice(&color);
+                }
+            }
+        }
+    }
+    Ok(Value::Undef)
+}
+
+fn n_ctx_clear_rect(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(node) = ctx_node(it, this) else {
+        return Ok(Value::Undef);
+    };
+    let nums: Vec<f64> = (0..4)
+        .map(|i| to_num(&it.heap, args.get(i).copied().unwrap_or(Value::Undef)))
+        .collect();
+    canvas_ensure(it, node)?;
+    if let Some((x0, y0, x1, y1)) = rect_clip(
+        it.canvases.get(&node).map(|b| b.w).unwrap_or(0),
+        it.canvases.get(&node).map(|b| b.h).unwrap_or(0),
+        nums[0], nums[1], nums[2], nums[3],
+    ) {
+        if let Some(b) = it.canvases.get_mut(&node) {
+            let w = b.w as usize;
+            for y in y0 as usize..y1 as usize {
+                let base = y * w * 4;
+                for px in b.px[base + x0 as usize * 4..base + x1 as usize * 4].chunks_exact_mut(4) {
+                    px.copy_from_slice(&[0, 0, 0, 0]);
+                }
+            }
+        }
+    }
+    Ok(Value::Undef)
 }
 
 fn n_ctx_noop(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, JsError> {
@@ -2435,20 +2750,275 @@ fn n_ctx_measure(it: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value
     )])?))
 }
 
-/// getImageData/createImageData: blank {width,height,data:[]}.
-fn n_ctx_image_data(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
-    let w = to_num(&it.heap, args.first().copied().unwrap_or(Value::Undef));
-    let h = to_num(&it.heap, args.get(1).copied().unwrap_or(Value::Undef));
-    let (w, h) = (
-        if w.is_nan() { 0.0 } else { w },
-        if h.is_nan() { 0.0 } else { h },
+/// drawImage canvas-source only (img/video sources have no decoder here,
+/// so they no-op): 3-arg blit, 5-arg nearest-neighbor scale, 9-arg
+/// source-rect + scale. Out-of-range source pixels clip (dest untouched);
+/// negative dest sizes mirror; non-positive source sizes no-op.
+fn n_ctx_draw_image(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(dst_node) = ctx_node(it, this) else {
+        return Ok(Value::Undef);
+    };
+    let num = |i: usize| to_num(&it.heap, args.get(i).copied().unwrap_or(Value::Undef));
+    let (sx, sy, sw, sh, dx, dy, dw, dh) = match args.len() {
+        3 => (0.0, 0.0, 0.0, 0.0, num(1), num(2), 0.0, 0.0),
+        5 => (0.0, 0.0, 0.0, 0.0, num(1), num(2), num(3), num(4)),
+        9 => (num(1), num(2), num(3), num(4), num(5), num(6), num(7), num(8)),
+        _ => return Err(err("drawImage needs 3, 5 or 9 arguments")),
+    };
+    let src_node = match it.as_node(args.first().copied().unwrap_or(Value::Undef)) {
+        Some(n) if it.dom_ref().map(|d| d.tag_name(n) == Some("canvas")).unwrap_or(false) => n,
+        _ => return Ok(Value::Undef),
+    };
+    canvas_ensure(it, src_node)?;
+    canvas_ensure(it, dst_node)?;
+    // Snapshot the source: self-draws must read pre-blit pixels, and two
+    // HashMap entries cannot borrow mutably at once.
+    let (src_w, src_h, src_px) = match it.canvases.get(&src_node) {
+        Some(b) => (b.w, b.h, b.px.clone()),
+        None => return Ok(Value::Undef),
+    };
+    let (mut sx, mut sy, mut sw, mut sh) = (
+        sx.trunc() as i64,
+        sy.trunc() as i64,
+        sw.trunc() as i64,
+        sh.trunc() as i64,
     );
-    let data = Value::Obj(it.arr_obj(Vec::new())?);
+    let (dx, dy, mut dw, mut dh) = (dx.trunc() as i64, dy.trunc() as i64, dw.trunc() as i64, dh.trunc() as i64);
+    if args.len() <= 5 {
+        // Natural size (3-arg) or full-source scale (5-arg).
+        sx = 0;
+        sy = 0;
+        sw = src_w as i64;
+        sh = src_h as i64;
+        if args.len() == 3 {
+            dw = sw;
+            dh = sh;
+        }
+    }
+    if sw <= 0 || sh <= 0 || dw == 0 || dh == 0 {
+        return Ok(Value::Undef);
+    }
+    let Some(dst) = it.canvases.get_mut(&dst_node) else {
+        return Ok(Value::Undef);
+    };
+    // Dest iteration range clipped to the buffer so huge scales cannot
+    // spin; per-pixel source bounds checks do the source-side clipping.
+    let (adw, adh) = (dw.abs(), dh.abs());
+    let (mut i0, mut i1) = (0i64, adw);
+    let (mut j0, mut j1) = (0i64, adh);
+    if dw > 0 {
+        i1 = i1.min(dst.w as i64 - dx);
+        i0 = i0.max(-dx);
+    } else {
+        i1 = i1.min(dx + 1);
+        i0 = i0.max(dx - dst.w as i64 + 1);
+    }
+    if dh > 0 {
+        j1 = j1.min(dst.h as i64 - dy);
+        j0 = j0.max(-dy);
+    } else {
+        j1 = j1.min(dy + 1);
+        j0 = j0.max(dy - dst.h as i64 + 1);
+    }
+    if i1 <= i0 || j1 <= j0 {
+        return Ok(Value::Undef);
+    }
+    let dwid = dst.w as usize;
+    for j in j0..j1 {
+        let py = if dh > 0 { dy + j } else { dy - j };
+        let qy = sy + j * sh / adh;
+        if qy < 0 || qy >= src_h as i64 {
+            continue;
+        }
+        for i in i0..i1 {
+            let px = if dw > 0 { dx + i } else { dx - i };
+            let qx = sx + i * sw / adw;
+            if qx < 0 || qx >= src_w as i64 {
+                continue;
+            }
+            let s = (qy as usize * src_w as usize + qx as usize) * 4;
+            let d = (py as usize * dwid + px as usize) * 4;
+            dst.px[d..d + 4].copy_from_slice(&src_px[s..s + 4]);
+        }
+    }
+    Ok(Value::Undef)
+}
+
+/// ImageData {width,height,data} builder shared by get/put/create paths.
+fn image_data_obj(it: &mut Interp, w: u32, h: u32, px: &[u8]) -> Result<Value, JsError> {
+    let items: Vec<Value> = px.iter().map(|b| Value::Num(*b as f64)).collect();
+    let data = Value::Obj(it.arr_obj(items)?);
     Ok(Value::Obj(it.obj_pairs(vec![
-        ("width".into(), Value::Num(w)),
-        ("height".into(), Value::Num(h)),
+        ("width".into(), Value::Num(w as f64)),
+        ("height".into(), Value::Num(h as f64)),
         ("data".into(), data),
     ])?))
+}
+
+/// getImageData(x,y,w,h): real clipped pixels, data a plain Array of
+/// numbers. Zero/negative sizes and fully-outside rects throw like V8.
+fn n_ctx_get_image_data(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(node) = ctx_node(it, this) else {
+        return Err(err("getImageData needs a 2d context"));
+    };
+    let num = |i: usize| to_num(&it.heap, args.get(i).copied().unwrap_or(Value::Undef));
+    let (sx, sy, sw, sh) = (num(0).trunc() as i64, num(1).trunc() as i64, num(2), num(3));
+    if !sw.is_finite() || !sh.is_finite() || sw <= 0.0 || sh <= 0.0 {
+        return Err(err("IndexSizeError: getImageData size must be positive"));
+    }
+    canvas_ensure(it, node)?;
+    let (bw, bh, px) = match it.canvases.get(&node) {
+        Some(b) => (b.w as i64, b.h as i64, b.px.clone()),
+        None => return Err(err("IndexSizeError: getImageData outside the canvas")),
+    };
+    let (x0, y0) = (sx.max(0), sy.max(0));
+    let (x1, y1) = ((sx + sw as i64).min(bw), (sy + sh as i64).min(bh));
+    if x1 <= x0 || y1 <= y0 {
+        return Err(err("IndexSizeError: getImageData outside the canvas"));
+    }
+    let mut out = Vec::with_capacity((x1 - x0) as usize * (y1 - y0) as usize * 4);
+    for y in y0..y1 {
+        let base = y as usize * bw as usize * 4;
+        out.extend_from_slice(&px[base + x0 as usize * 4..base + x1 as usize * 4]);
+    }
+    image_data_obj(it, (x1 - x0) as u32, (y1 - y0) as u32, &out)
+}
+
+/// putImageData(img,dx,dy,...): blits all of img at (dx,dy), clipped to
+/// the buffer. The dirty-rect form is accepted and ignored (full blit).
+fn n_ctx_put_image(it: &mut Interp, this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let Some(node) = ctx_node(it, this) else {
+        return Ok(Value::Undef);
+    };
+    let img = args.first().copied().unwrap_or(Value::Undef);
+    let num = |i: usize| to_num(&it.heap, args.get(i).copied().unwrap_or(Value::Undef));
+    let (dx, dy) = (num(1).trunc() as i64, num(2).trunc() as i64);
+    let iw = match get_prop(&it.heap, &it.protos, img, "width") {
+        Ok(v) => to_num(&it.heap, v).trunc() as i64,
+        Err(_) => return Err(err("putImageData needs ImageData")),
+    };
+    let ih = match get_prop(&it.heap, &it.protos, img, "height") {
+        Ok(v) => to_num(&it.heap, v).trunc() as i64,
+        Err(_) => return Err(err("putImageData needs ImageData")),
+    };
+    let items: Vec<Value> = match get_prop(&it.heap, &it.protos, img, "data") {
+        Ok(Value::Obj(id)) => match it.heap.obj(id) {
+            Obj::Arr { items, .. } => items.clone(),
+            _ => return Err(err("putImageData needs ImageData")),
+        },
+        _ => return Err(err("putImageData needs ImageData")),
+    };
+    if iw <= 0 || ih <= 0 {
+        return Ok(Value::Undef);
+    }
+    canvas_ensure(it, node)?;
+    let Some(dst) = it.canvases.get_mut(&node) else {
+        return Ok(Value::Undef);
+    };
+    let (bw, bh) = (dst.w as i64, dst.h as i64);
+    let byte = |v: Value| {
+        let n = to_num(&it.heap, v);
+        if !n.is_finite() {
+            0
+        } else {
+            n.round().clamp(0.0, 255.0) as u8
+        }
+    };
+    for r in 0..ih {
+        let y = dy + r;
+        if y < 0 || y >= bh {
+            continue;
+        }
+        for c in 0..iw {
+            let x = dx + c;
+            if x < 0 || x >= bw {
+                continue;
+            }
+            let s = (r * iw + c) as usize * 4;
+            let d = (y as usize * bw as usize + x as usize) * 4;
+            for k in 0..4 {
+                dst.px[d + k] = items.get(s + k).copied().map(byte).unwrap_or(0);
+            }
+        }
+    }
+    Ok(Value::Undef)
+}
+
+/// createImageData(w,h): transparent black {width,height,data}.
+fn n_ctx_create_image_data(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let num = |i: usize| to_num(&it.heap, args.get(i).copied().unwrap_or(Value::Undef));
+    let (w, h) = (num(0), num(1));
+    if !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0 {
+        return Err(err("IndexSizeError: createImageData size must be positive"));
+    }
+    let (w, h) = (w.trunc() as u64, h.trunc() as u64);
+    if w * h > CANVAS_MAX_AREA {
+        return Err(err("RangeError: ImageData over the 16M pixel budget"));
+    }
+    let px = vec![0u8; w as usize * h as usize * 4];
+    image_data_obj(it, w as u32, h as u32, &px)
+}
+
+/// Standard base64 alphabet, no line breaks. n_btoa (eval.rs) encodes
+/// Latin-1 &str for JS; BMP needs raw bytes, hence this local encoder.
+fn b64_encode(bytes: &[u8]) -> String {
+    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    for w in bytes.chunks(3) {
+        let (b0, b1, b2) = (w[0], *w.get(1).unwrap_or(&0), *w.get(2).unwrap_or(&0));
+        out.push(ALPHA[(b0 >> 2) as usize] as char);
+        out.push(ALPHA[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if w.len() > 1 {
+            ALPHA[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if w.len() > 2 { ALPHA[(b2 & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Minimal 32-bit BI_RGB BMP (bottom-up BGRA rows) of the live buffer.
+fn canvas_bmp(buf: &CanvasBuf) -> Vec<u8> {
+    let row = buf.w as usize * 4;
+    let img_sz = (row * buf.h as usize) as u32;
+    let mut out = Vec::with_capacity(54 + img_sz as usize);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(54 + img_sz).to_le_bytes());
+    out.extend_from_slice(&[0u8; 4]);
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&(buf.w as i32).to_le_bytes());
+    out.extend_from_slice(&(buf.h as i32).to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&img_sz.to_le_bytes());
+    out.extend_from_slice(&[0u8; 16]);
+    for y in (0..buf.h).rev() {
+        let base = y as usize * row;
+        for x in 0..buf.w as usize {
+            let p = base + x * 4;
+            out.push(buf.px[p + 2]);
+            out.push(buf.px[p + 1]);
+            out.push(buf.px[p]);
+            out.push(buf.px[p + 3]);
+        }
+    }
+    out
+}
+
+impl Interp {
+    /// toDataURL(): `data:image/bmp;base64,...` of the live pixels
+    /// (type/quality args ignored - one honest encoding, not a stub).
+    fn canvas_data_url(&mut self, node: NodeId) -> Result<String, JsError> {
+        canvas_ensure(self, node)?;
+        let bmp = match self.canvases.get(&node) {
+            Some(b) => canvas_bmp(b),
+            None => Vec::new(),
+        };
+        Ok(format!("data:image/bmp;base64,{}", b64_encode(&bmp)))
+    }
 }
 
 /// Gradient stub: only addColorStop, a no-op.
@@ -3308,7 +3878,7 @@ mod tests {
             "0"
         );
         assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.getContext('webgl')"), "null");
-        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.toDataURL()"), "data:,");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.toDataURL().slice(0,22)"), "data:image/bmp;base64,");
         assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.width"), "300");
         assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.width=100;c.width"), "100");
         assert_eq!(ev(&mut it, "var d=document.createElement('div');try{d.getContext('2d')}catch(e){'throws'}"), "throws");
@@ -3337,6 +3907,164 @@ mod tests {
         assert_eq!(
             ev(&mut it, "var d=document.createElement('div');d.style.backgroundColor='blue';d.style.getPropertyValue('background-color')"),
             "blue"
+        );
+    }
+
+    #[test]
+    fn canvas_fill_and_readback() {
+        let mut it = interp(PAGE);
+        // fill red rect then getImageData pixel equals 255,0,0,255.
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=4;c.height=4;var x=c.getContext('2d');x.fillStyle='#ff0000';x.fillRect(0,0,2,2);var d=x.getImageData(0,0,1,1).data;d[0]===255&&d[1]===0&&d[2]===0&&d[3]===255"),
+            "true"
+        );
+        // Comma rgb() green pixel shape.
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=4;c.height=4;var x=c.getContext('2d');x.fillStyle='rgb(0,255,0)';x.fillRect(1,1,1,1);var d=x.getImageData(1,1,1,1).data;d[0]===0&&d[1]===255&&d[2]===0&&d[3]===255"),
+            "true"
+        );
+        // Space-syntax rgba with alpha.
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');var x=c.getContext('2d');x.fillStyle='rgba(0 0 255 / 0.5)';x.fillRect(0,0,1,1);var d=x.getImageData(0,0,1,1).data;d[2]===255&&d[3]===128"),
+            "true"
+        );
+        // Untouched pixels stay transparent black.
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=4;c.height=4;var x=c.getContext('2d');var d=x.getImageData(3,3,1,1).data;d[0]===0&&d[1]===0&&d[2]===0&&d[3]===0"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn canvas_clear_rect() {
+        let mut it = interp(PAGE);
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=4;c.height=4;var x=c.getContext('2d');x.fillStyle='red';x.fillRect(0,0,4,4);x.clearRect(0,0,2,2);var d=x.getImageData(0,0,1,1).data;d[0]===0&&d[1]===0&&d[2]===0&&d[3]===0"),
+            "true"
+        );
+        // Pixels outside the cleared rect survive.
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=4;c.height=4;var x=c.getContext('2d');x.fillStyle='red';x.fillRect(0,0,4,4);x.clearRect(0,0,2,2);var d=x.getImageData(3,3,1,1).data;d[0]===255&&d[3]===255"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn canvas_draw_image() {
+        let mut it = interp(PAGE);
+        // Canvas-to-canvas 3-arg blit copies a pixel.
+        assert_eq!(
+            ev(&mut it, "var a=document.createElement('canvas');a.width=2;a.height=2;var ax=a.getContext('2d');ax.fillStyle='#00ff00';ax.fillRect(0,0,2,2);var b=document.createElement('canvas');b.width=2;b.height=2;var bx=b.getContext('2d');bx.drawImage(a,0,0);var d=bx.getImageData(1,1,1,1).data;d[0]===0&&d[1]===255&&d[2]===0&&d[3]===255"),
+            "true"
+        );
+        // 5-arg nearest-neighbor upscale spreads the pixel.
+        assert_eq!(
+            ev(&mut it, "var a=document.createElement('canvas');a.width=1;a.height=1;var ax=a.getContext('2d');ax.fillStyle='blue';ax.fillRect(0,0,1,1);var b=document.createElement('canvas');b.width=4;b.height=4;var bx=b.getContext('2d');bx.drawImage(a,0,0,4,4);var d=bx.getImageData(3,3,1,1).data;d[2]===255&&d[3]===255"),
+            "true"
+        );
+        // 9-arg source-rect pick.
+        assert_eq!(
+            ev(&mut it, "var a=document.createElement('canvas');a.width=2;a.height=1;var ax=a.getContext('2d');ax.fillStyle='red';ax.fillRect(0,0,1,1);ax.fillStyle='lime';ax.fillRect(1,0,1,1);var b=document.createElement('canvas');b.width=2;b.height=1;var bx=b.getContext('2d');bx.drawImage(a,1,0,1,1,0,0,1,1);var d=bx.getImageData(0,0,1,1).data;d[1]===255&&d[0]===0"),
+            "true"
+        );
+        // Non-canvas sources no-op without throwing.
+        assert_eq!(
+            ev(&mut it, "var b=document.createElement('canvas');b.width=2;b.height=2;var bx=b.getContext('2d');bx.drawImage(document.createElement('div'),0,0);'ok'"),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn canvas_put_image_data() {
+        let mut it = interp(PAGE);
+        // createImageData is transparent black; put/get roundtrips a pixel.
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=4;c.height=4;var x=c.getContext('2d');var im=x.createImageData(2,2);im.data[0]=255;im.data[3]=255;x.putImageData(im,1,1);var d=x.getImageData(1,1,1,1).data;d[0]===255&&d[1]===0&&d[2]===0&&d[3]===255"),
+            "true"
+        );
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');var x=c.getContext('2d');var im=x.createImageData(1,1);im.width===1&&im.height===1&&im.data[0]===0&&im.data[3]===0"),
+            "true"
+        );
+        // Dirty-rect form accepted (ignored, full blit).
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=4;c.height=4;var x=c.getContext('2d');var im=x.createImageData(1,1);im.data[2]=255;im.data[3]=255;x.putImageData(im,2,2,0,0,1,1);var d=x.getImageData(2,2,1,1).data;d[2]===255&&d[3]===255"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn canvas_resize_clears() {
+        let mut it = interp(PAGE);
+        // Even a same-value width write resets the buffer.
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=4;c.height=4;var x=c.getContext('2d');x.fillStyle='red';x.fillRect(0,0,4,4);c.width=4;var d=x.getImageData(0,0,1,1).data;d[3]===0"),
+            "true"
+        );
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=4;c.height=4;var x=c.getContext('2d');x.fillStyle='red';x.fillRect(0,0,4,4);c.height=2;var d=x.getImageData(0,0,1,1).data;d[3]===0"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn canvas_invalid_fill_style_keeps_color() {
+        let mut it = interp(PAGE);
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=2;c.height=2;var x=c.getContext('2d');x.fillStyle='#00ff00';x.fillStyle='nope';x.fillRect(0,0,2,2);var d=x.getImageData(0,0,1,1).data;d[0]===0&&d[1]===255&&d[2]===0&&d[3]===255"),
+            "true"
+        );
+        // Readback also keeps the old value.
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');var x=c.getContext('2d');x.fillStyle='#00ff00';x.fillStyle='nope';x.fillStyle"),
+            "#00ff00"
+        );
+        // Default is opaque black.
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');var x=c.getContext('2d');x.fillStyle"),
+            "#000000"
+        );
+    }
+
+    #[test]
+    fn canvas_data_url_bmp() {
+        let mut it = interp(PAGE);
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=2;c.height=2;c.toDataURL().slice(0,22)"),
+            "data:image/bmp;base64,"
+        );
+        // A red pixel roundtrips through BMP bytes (BM magic + red in the
+        // bottom-up BGRA row): decode the tail past the 54-byte header.
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=1;c.height=1;var x=c.getContext('2d');x.fillStyle='red';x.fillRect(0,0,1,1);var u=c.toDataURL();u.slice(0,22)==='data:image/bmp;base64,'&&atob(u.slice(22)).length===58"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn canvas_ctx_identity() {
+        let mut it = interp(PAGE);
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.getContext('2d')===c.getContext('2d')"),
+            "true"
+        );
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');var x=c.getContext('2d');x.canvas===c"),
+            "true"
+        );
+    }
+
+    #[test]
+    fn canvas_oversize_throws() {
+        let mut it = interp(PAGE);
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=10000;c.height=10000;try{c.getContext('2d');'no-throw'}catch(e){'throws'}"),
+            "throws"
+        );
+        // Fully-outside getImageData throws too.
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');c.width=4;c.height=4;var x=c.getContext('2d');try{x.getImageData(99,99,2,2);'no-throw'}catch(e){'throws'}"),
+            "throws"
         );
     }
 

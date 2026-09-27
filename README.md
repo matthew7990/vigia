@@ -204,7 +204,9 @@ Working:
   `geolocation`, `indexedDB`, hardware fields; `screen` + viewport dims;
   `performance.now`/`timeOrigin`; `document` props (`compatMode`,
   `hidden`, `hasFocus`, ...); `getComputedStyle` snapshot;
-  `HTMLCanvasElement` 2d stub (draws nowhere, blank pixels);
+  `HTMLCanvasElement` 2d with real pixels (`fillRect`, `drawImage`,
+  `getImageData`/`putImageData`, BMP `toDataURL`; paths, text and
+  gradients stay stubs);
   zero-geometry `getBoundingClientRect`; all-visible
   `IntersectionObserver`; fixed `America/Montevideo` timezone.
   `--stealth` sends the Chrome request profile (UA + `Sec-Fetch-*`)
@@ -219,7 +221,7 @@ Working:
 Still to do:
 
 - JS: classes (`extends`/`super`), logical assignment, `**`, `delete`
-- Canvas rasterizer (pixels behind the 2d stub), WebGL absence,
+- Canvas paths/text/gradients, WebGL absence,
   CSS cascade behind `getComputedStyle`
 - Own TLS 1.3 (replace the rustls exception)
 - HTML5 tree-construction hardening (adoption agency, foster parenting)

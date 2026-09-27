@@ -85,6 +85,7 @@ pub mod regex;
 
 pub use ast::{Expr, FnDef, Stmt};
 pub use bindings::ScriptsOutcome;
+pub(crate) use bindings::CanvasBuf;
 pub use gc::GcStats;
 pub use parse::parse_program as parse;
 
@@ -612,6 +613,13 @@ pub struct Interp {
     pub(crate) sheets: HashMap<NodeId, u32>,
     /// classList facades per element (cached for === identity).
     pub(crate) token_lists: HashMap<NodeId, u32>,
+    /// Live pixel buffers per canvas node (RGBA row-major). Created lazily
+    /// by 2d ops from the width/height attrs; cleared by set_dom (fresh
+    /// arena per page, so stale ids must not leak pixels across pages).
+    pub(crate) canvases: HashMap<NodeId, CanvasBuf>,
+    /// 2d ctx objects per canvas node (cached for === identity, GC-rooted
+    /// like token_lists). fillStyle/strokeStyle live on the cached object.
+    pub(crate) ctx2ds: HashMap<NodeId, u32>,
     /// node -> (event type, handler) listeners. JS values, so they live
     /// here rather than on DOM nodes. Cleared by set_dom.
     pub(crate) listeners: HashMap<NodeId, Vec<(String, Value)>>,
@@ -729,6 +737,8 @@ impl Interp {
             cur_script: None,
             sheets: HashMap::new(),
             token_lists: HashMap::new(),
+            canvases: HashMap::new(),
+            ctx2ds: HashMap::new(),
             listeners: HashMap::new(),
             net: None,
             pending_nav: None,

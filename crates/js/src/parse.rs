@@ -735,6 +735,9 @@ impl P {
         let mut base: Option<Expr> = None;
         let mut ops: Vec<OptOp> = Vec::new();
         loop {
+            if matches!(self.peek(), Tok::Tpl { head: true, .. }) {
+                return Err(err("tagged templates unsupported"));
+            }
             if self.at_p("?.") {
                 if base.is_none() {
                     let (b, mut prefix) = split_chain(e);
@@ -812,6 +815,30 @@ impl P {
                 crate::regex::compile(&pat, &flags)
                     .map_err(|m| err(format!("invalid regex: {m}")))?;
                 Ok(Expr::Regex { pat, flags })
+            }
+            Tok::Tpl { cooked, expr, .. } => {
+                if !expr {
+                    return Ok(Expr::Str(cooked));
+                }
+                let mut parts = Vec::new();
+                let mut head = cooked;
+                loop {
+                    let e = self.expr()?;
+                    match self.bump() {
+                        Tok::Tpl {
+                            cooked: c2,
+                            expr: e2,
+                            ..
+                        } => {
+                            parts.push((std::mem::take(&mut head), e));
+                            if !e2 {
+                                return Ok(Expr::Tpl(parts, c2));
+                            }
+                            head = c2;
+                        }
+                        t => return Err(err(format!("expected template continuation, got {t:?}"))),
+                    }
+                }
             }
             Tok::Kw("function") => {
                 let name = if matches!(self.peek(), Tok::Ident(_)) {

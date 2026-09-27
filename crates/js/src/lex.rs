@@ -11,7 +11,18 @@ pub enum Tok {
     Ident(String),
     Kw(&'static str),
     P(&'static str),
-    Regex { pat: String, flags: String },
+    Regex {
+        pat: String,
+        flags: String,
+    },
+    /// Template chunk: cooked text; `expr` means it ended in `${`,
+    /// `head` means it opened with a backtick (a Tpl after an expression
+    /// with head set is a tagged template; continuations never are).
+    Tpl {
+        cooked: String,
+        expr: bool,
+        head: bool,
+    },
     Eof,
 }
 
@@ -66,6 +77,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, JsError> {
     let mut out = Vec::new();
     let mut i = 0;
     let mut nl = false;
+    // `{` push false; a `}` popping true resumes template scanning.
+    let mut braces: Vec<bool> = Vec::new();
     while i < b.len() {
         match b[i] {
             b' ' | b'\t' | b'\r' => {
@@ -122,11 +135,28 @@ pub fn lex(src: &str) -> Result<Vec<Token>, JsError> {
                     Tok::P("?.")
                 }
             }
+            b'`' => {
+                i += 1;
+                tpl_chunk(b, &mut i, &mut braces, true)?
+            }
+            b'}' if matches!(braces.last(), Some(true)) => {
+                braces.pop();
+                i += 1;
+                tpl_chunk(b, &mut i, &mut braces, false)?
+            }
             _ => {
                 let hit = PUNCTS.iter().find(|p| src[i..].starts_with(**p));
                 match hit {
                     Some(p) => {
                         i += p.len();
+                        if *p == "{" {
+                            braces.push(false);
+                        } else if *p == "}" && braces.pop() != Some(false) {
+                            // A `}` with no matching `{`: the template arm
+                            // above owns `}` closing a substitution, so this
+                            // is a genuine unbalanced brace.
+                            return Err(err(format!("unbalanced '}}' at byte {pos}")));
+                        }
                         Tok::P(p)
                     }
                     None => {
@@ -238,51 +268,109 @@ fn string(b: &[u8], i: &mut usize) -> Result<Tok, JsError> {
                     std::str::from_utf8(&b[chunk..*i]).map_err(|_| err("bad utf-8 in string"))?,
                 );
                 *i += 1;
-                let e = b
-                    .get(*i)
-                    .copied()
-                    .ok_or_else(|| err("unterminated escape"))?;
+                push_escape(b, &mut *i, &mut s)?;
+                chunk = *i;
+            }
+            Some(_) => *i += 1,
+        }
+    }
+}
+
+/// One `\x` escape after the backslash was consumed. Shared by strings
+/// and template literals (both also accept \` \$ etc. via the fallback).
+fn push_escape(b: &[u8], i: &mut usize, s: &mut String) -> Result<(), JsError> {
+    let e = b
+        .get(*i)
+        .copied()
+        .ok_or_else(|| err("unterminated escape"))?;
+    *i += 1;
+    match e {
+        b'n' => s.push('\n'),
+        b't' => s.push('\t'),
+        b'r' => s.push('\r'),
+        b'b' => s.push('\u{8}'),
+        b'f' => s.push('\u{c}'),
+        b'v' => s.push('\u{b}'),
+        b'0' => s.push('\0'),
+        b'\\' => s.push('\\'),
+        b'\'' => s.push('\''),
+        b'"' => s.push('"'),
+        b'/' => s.push('/'),
+        b'\n' => {} // line continuation
+        b'\r' => {
+            if b.get(*i) == Some(&b'\n') {
                 *i += 1;
-                match e {
-                    b'n' => s.push('\n'),
-                    b't' => s.push('\t'),
-                    b'r' => s.push('\r'),
-                    b'b' => s.push('\u{8}'),
-                    b'f' => s.push('\u{c}'),
-                    b'v' => s.push('\u{b}'),
-                    b'0' => s.push('\0'),
-                    b'\\' => s.push('\\'),
-                    b'\'' => s.push('\''),
-                    b'"' => s.push('"'),
-                    b'/' => s.push('/'),
-                    b'\n' => {} // line continuation
-                    b'\r' => {
-                        if b.get(*i) == Some(&b'\n') {
-                            *i += 1;
-                        }
-                    }
-                    b'x' => {
-                        let h = hex(b, i, 2)?;
-                        s.push(char::from_u32(h).unwrap_or('\u{FFFD}'));
-                    }
-                    b'u' => {
-                        let hi = hex(b, i, 4)?;
-                        if (0xD800..0xDC00).contains(&hi)
-                            && b.get(*i) == Some(&b'\\')
-                            && b.get(*i + 1) == Some(&b'u')
-                        {
-                            *i += 2;
-                            let lo = hex(b, i, 4)?;
-                            let cp =
-                                0x10000 + ((hi - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3FF);
-                            s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-                        } else {
-                            s.push(char::from_u32(hi).unwrap_or('\u{FFFD}'));
-                        }
-                    }
-                    // unknown escape = the char itself (JS sloppy rule)
-                    other => s.push(other as char),
+            }
+        }
+        b'x' => {
+            let h = hex(b, i, 2)?;
+            s.push(char::from_u32(h).unwrap_or('\u{FFFD}'));
+        }
+        b'u' => {
+            let hi = hex(b, i, 4)?;
+            if (0xD800..0xDC00).contains(&hi)
+                && b.get(*i) == Some(&b'\\')
+                && b.get(*i + 1) == Some(&b'u')
+            {
+                *i += 2;
+                let lo = hex(b, i, 4)?;
+                let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo.wrapping_sub(0xDC00) & 0x3FF);
+                s.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+            } else {
+                s.push(char::from_u32(hi).unwrap_or('\u{FFFD}'));
+            }
+        }
+        // unknown escape = the char itself (JS sloppy rule)
+        other => s.push(other as char),
+    }
+    Ok(())
+}
+
+fn tpl_utf8(b: &[u8], a: usize, e: usize) -> Result<&str, JsError> {
+    std::str::from_utf8(&b[a..e]).map_err(|_| err("bad utf-8 in template"))
+}
+
+/// Template body from after the backtick (or `}` closing `${`): cooked
+/// text until the closing backtick (`expr: false`) or `${` (`expr: true`,
+/// pushing a substitution context). Newlines normalize to `\n`.
+fn tpl_chunk(b: &[u8], i: &mut usize, braces: &mut Vec<bool>, head: bool) -> Result<Tok, JsError> {
+    let mut s = String::new();
+    let mut chunk = *i;
+    loop {
+        match b.get(*i).copied() {
+            None => return Err(err("unterminated template")),
+            Some(b'`') => {
+                s.push_str(tpl_utf8(b, chunk, *i)?);
+                *i += 1;
+                return Ok(Tok::Tpl {
+                    cooked: s,
+                    expr: false,
+                    head,
+                });
+            }
+            Some(b'$') if b.get(*i + 1) == Some(&b'{') => {
+                s.push_str(tpl_utf8(b, chunk, *i)?);
+                *i += 2;
+                braces.push(true);
+                return Ok(Tok::Tpl {
+                    cooked: s,
+                    expr: true,
+                    head,
+                });
+            }
+            Some(b'\\') => {
+                s.push_str(tpl_utf8(b, chunk, *i)?);
+                *i += 1;
+                push_escape(b, &mut *i, &mut s)?;
+                chunk = *i;
+            }
+            Some(b'\n') | Some(b'\r') => {
+                s.push_str(tpl_utf8(b, chunk, *i)?);
+                if b[*i] == b'\r' && b.get(*i + 1) == Some(&b'\n') {
+                    *i += 1;
                 }
+                *i += 1;
+                s.push('\n');
                 chunk = *i;
             }
             Some(_) => *i += 1,
@@ -464,6 +552,34 @@ mod tests {
                 Tok::Ident("letx".into()),
                 Tok::Ident("functiony".into()),
                 Tok::Kw("in"),
+            ]
+        );
+    }
+
+    #[test]
+    fn template_chunks() {
+        match tt("`a${b}c`").as_slice() {
+            [Tok::Tpl {
+                cooked: h,
+                expr: true,
+                head: true,
+            }, Tok::Ident(b), Tok::Tpl {
+                cooked: t,
+                expr: false,
+                head: false,
+            }] => {
+                assert_eq!((h.as_str(), b.as_str(), t.as_str()), ("a", "b", "c"));
+            }
+            t => panic!("{t:?}"),
+        }
+        // `${` in plain code is `$`-ident plus a block brace, not a template.
+        assert_eq!(
+            tt("a${b}"),
+            vec![
+                Tok::Ident("a$".into()),
+                Tok::P("{"),
+                Tok::Ident("b".into()),
+                Tok::P("}"),
             ]
         );
     }

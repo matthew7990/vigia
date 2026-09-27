@@ -1034,6 +1034,16 @@ impl Interp {
                 }
             }
             Expr::Regex { pat, flags } => make_regexp(self, pat, flags),
+            Expr::Tpl(parts, tail) => {
+                let mut s = String::new();
+                for (cooked, e) in parts {
+                    s.push_str(cooked);
+                    let v = self.expr(env, e)?;
+                    s.push_str(&to_str(&self.heap, v));
+                }
+                s.push_str(tail);
+                Ok(Value::Str(self.heap.intern_str(&s)?))
+            }
             Expr::OptChain(b, ops) => self.opt_chain(env, b, ops),
             Expr::Index(o, ix) => {
                 let v = self.expr(env, o)?;
@@ -4135,6 +4145,18 @@ mod tests {
 
     fn errmsg(src: &str) -> String {
         ev(src).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn templates() {
+        assert_eq!(disp("var n='w';`hi ${n}!`"), "hi w!");
+        assert_eq!(disp("`sum=${1 + 2}`"), "sum=3");
+        assert_eq!(disp("`a${`b${'c'}d`}e`"), "abcde");
+        assert_eq!(disp("`esc \\` \\$`"), "esc ` $");
+        assert_eq!(disp("`x=${{a: 1}.a}`"), "x=1");
+        assert_eq!(out("console.log(`v=${7}`)"), "v=7\n");
+        assert!(errmsg("var t=`x`;f`t`").contains("tagged templates"));
+        assert!(errmsg("`abc").contains("unterminated template"));
     }
 
     #[test]

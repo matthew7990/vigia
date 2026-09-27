@@ -28,6 +28,8 @@ pub enum Expr {
         pat: String,
         flags: String,
     },
+    /// Template: (cooked, expr) pairs plus the cooked tail.
+    Tpl(Vec<(String, Expr)>, String),
     /// Optional chain: base + steps. Each step carries its own `?.` flag.
     /// `a?.b.c(d)` is Chain(a, [Member(b,true), Member(c,false), Call(d,false)]).
     OptChain(Box<Expr>, Vec<OptOp>),

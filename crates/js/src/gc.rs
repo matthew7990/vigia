@@ -407,6 +407,9 @@ impl Interp {
         for &o in self.ctx2ds.values() {
             m.ow.push(o);
         }
+        for &o in self.ctxgls.values() {
+            m.ow.push(o);
+        }
         for &s in self.heap.intern.values() {
             m.sw.push(s);
         }

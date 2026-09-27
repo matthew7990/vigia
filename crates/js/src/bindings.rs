@@ -213,6 +213,7 @@ impl Interp {
         self.sheets.clear();
         self.canvases.clear();
         self.ctx2ds.clear();
+        self.ctxgls.clear();
         self.listeners.clear();
         self.pending_nav = None;
         self.pending_submit = None;
@@ -2000,14 +2001,17 @@ impl Interp {
             }
             "getContext" => {
                 // Only <canvas> has it; anything else reads "not a
-                // function". "2d" (default) yields the stub context;
-                // webgl/others are null (no GPU backend here).
+                // function". "2d" yields the stub context; "webgl" and
+                // "experimental-webgl" yield the cached persona stub;
+                // anything else is null.
                 if self.dom_ref()?.tag_name(id) != Some("canvas") {
                     return Err(err("getContext is not a function"));
                 }
                 let mode = to_str(&self.heap, arg(0)).to_ascii_lowercase();
                 if mode == "2d" {
                     canvas_ctx2d(self, id)
+                } else if mode == "webgl" || mode == "experimental-webgl" {
+                    canvas_ctxwebgl(self, id)
                 } else {
                     Ok(Value::Null)
                 }
@@ -2646,6 +2650,55 @@ fn canvas_ctx2d(it: &mut Interp, node: NodeId) -> Result<Value, JsError> {
     }
     it.ctx2ds.insert(node, o);
     Ok(Value::Obj(o))
+}
+
+/// Minimal WebGL persona stub, cached per canvas node for === identity
+/// (both "webgl" and "experimental-webgl" share it). Carries only the
+/// bot-manager probe surface: getExtension + getParameter. The strings
+/// are the SwiftShader (headless-Chrome software GL) persona,
+/// deterministic by design, no GPU behind them.
+/// Gap: 2d and webgl contexts coexist here; browsers return only the
+/// first mode requested per canvas, but no bundle mixes modes on one.
+fn canvas_ctxwebgl(it: &mut Interp, node: NodeId) -> Result<Value, JsError> {
+    if let Some(&o) = it.ctxgls.get(&node) {
+        return Ok(Value::Obj(o));
+    }
+    let mut pairs: Vec<(String, Value)> = Vec::new();
+    for (n, f) in [
+        ("getExtension", n_gl_get_extension as NativeFn),
+        ("getParameter", n_gl_get_parameter),
+    ] {
+        pairs.push((n.into(), Value::Obj(it.heap.alloc_obj(nat(n, f))?)));
+    }
+    let o = it.obj_pairs(pairs)?;
+    it.ctxgls.insert(node, o);
+    Ok(Value::Obj(o))
+}
+
+/// getExtension(name): only 'WEBGL_debug_renderer_info' resolves, to the
+/// two UNMASKED_* constants; anything else is null.
+fn n_gl_get_extension(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let name = to_str(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    if name == "WEBGL_debug_renderer_info" {
+        return Ok(Value::Obj(it.obj_pairs(vec![
+            ("UNMASKED_VENDOR_WEBGL".into(), Value::Num(37445.0)),
+            ("UNMASKED_RENDERER_WEBGL".into(), Value::Num(37446.0)),
+        ])?));
+    }
+    Ok(Value::Null)
+}
+
+/// getParameter(p): only the UNMASKED_* enums answer (SwiftShader persona
+/// strings); anything else is null.
+fn n_gl_get_parameter(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let p = to_num(&it.heap, args.first().copied().unwrap_or(Value::Undef));
+    if p == 37445.0 {
+        return it.str_val("WebKit".to_string());
+    }
+    if p == 37446.0 {
+        return it.str_val("WebKit WebGL".to_string());
+    }
+    Ok(Value::Null)
 }
 
 /// fillStyle/strokeStyle getter: hidden validated value or "#000000".
@@ -3877,7 +3930,7 @@ mod tests {
             ev(&mut it, "var c=document.createElement('canvas');var x=c.getContext('2d');x.fillStyle='red';x.fillRect(0,0,10,10);x.measureText('hi').width"),
             "0"
         );
-        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.getContext('webgl')"), "null");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.getContext('webgl')!==null"), "true");
         assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.toDataURL().slice(0,22)"), "data:image/bmp;base64,");
         assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.width"), "300");
         assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.width=100;c.width"), "100");
@@ -3907,6 +3960,32 @@ mod tests {
         assert_eq!(
             ev(&mut it, "var d=document.createElement('div');d.style.backgroundColor='blue';d.style.getPropertyValue('background-color')"),
             "blue"
+        );
+    }
+
+    #[test]
+    fn canvas_webgl_persona() {
+        let mut it = interp(PAGE);
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.getContext('webgl')!==null"), "true");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.getContext('experimental-webgl')!==null"), "true");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.getContext('webgl')===c.getContext('webgl')"), "true");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.getContext('webgl')===c.getContext('experimental-webgl')"), "true");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');c.getContext('webgl2')"), "null");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');var t=c.getContext('webgl');t.getExtension('WEBGL_compressed_texture_s3tc')"), "null");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');var t=c.getContext('webgl');var n=t.getExtension('WEBGL_debug_renderer_info');n.UNMASKED_VENDOR_WEBGL"), "37445");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');var t=c.getContext('webgl');var n=t.getExtension('WEBGL_debug_renderer_info');n.UNMASKED_RENDERER_WEBGL"), "37446");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');var t=c.getContext('webgl');t.getParameter(37445)"), "WebKit");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');var t=c.getContext('webgl');t.getParameter(37446)"), "WebKit WebGL");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');var t=c.getContext('webgl');t.getParameter(7937)"), "null");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');var t=c.getContext('webgl');typeof t.fillRect"), "undefined");
+        assert_eq!(ev(&mut it, "var c=document.createElement('canvas');var t=c.getContext('webgl');typeof t.getImageData"), "undefined");
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');var t=c.getContext('webgl');var x=c.getContext('2d');x.fillStyle='red';x.fillRect(0,0,1,1);var d=x.getImageData(0,0,1,1).data;d[0]===255&&d[3]===255"),
+            "true"
+        );
+        assert_eq!(
+            ev(&mut it, "var c=document.createElement('canvas');var t=c.getContext('webgl')||c.getContext('experimental-webgl');var n=t.getExtension('WEBGL_debug_renderer_info');String(t.getParameter(n.UNMASKED_RENDERER_WEBGL))"),
+            "WebKit WebGL"
         );
     }
 

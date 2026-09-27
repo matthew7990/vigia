@@ -620,6 +620,9 @@ pub struct Interp {
     /// 2d ctx objects per canvas node (cached for === identity, GC-rooted
     /// like token_lists). fillStyle/strokeStyle live on the cached object.
     pub(crate) ctx2ds: HashMap<NodeId, u32>,
+    /// WebGL persona stubs per canvas node (cached for === identity,
+    /// GC-rooted like ctx2ds). Independent of the 2d object.
+    pub(crate) ctxgls: HashMap<NodeId, u32>,
     /// node -> (event type, handler) listeners. JS values, so they live
     /// here rather than on DOM nodes. Cleared by set_dom.
     pub(crate) listeners: HashMap<NodeId, Vec<(String, Value)>>,
@@ -739,6 +742,7 @@ impl Interp {
             token_lists: HashMap::new(),
             canvases: HashMap::new(),
             ctx2ds: HashMap::new(),
+            ctxgls: HashMap::new(),
             listeners: HashMap::new(),
             net: None,
             pending_nav: None,

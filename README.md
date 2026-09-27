@@ -207,7 +207,8 @@ Working:
   `HTMLCanvasElement` 2d with real pixels (`fillRect`, `drawImage`,
   `getImageData`/`putImageData`, BMP `toDataURL`; paths, text and
   gradients stay stubs);
-  zero-geometry `getBoundingClientRect`; all-visible
+  zero-geometry `getBoundingClientRect`; WebGL persona (SwiftShader
+  renderer string, no GPU); all-visible
   `IntersectionObserver`; fixed `America/Montevideo` timezone.
   `--stealth` sends the Chrome request profile (UA + `Sec-Fetch-*`)
   and syncs the JS `navigator` UA family to it
@@ -221,8 +222,7 @@ Working:
 Still to do:
 
 - JS: classes (`extends`/`super`), logical assignment, `**`, `delete`
-- Canvas paths/text/gradients, WebGL absence,
-  CSS cascade behind `getComputedStyle`
+- Canvas paths/text/gradients, CSS cascade behind `getComputedStyle`
 - Own TLS 1.3 (replace the rustls exception)
 - HTML5 tree-construction hardening (adoption agency, foster parenting)
 - Keep-alive pooling; parallel fetch engine (thread pool, RSS budget)

@@ -4330,7 +4330,7 @@ mod tests {
         assert_eq!(disp("var [n,...r]=[1,2,3];r.length+n"), "3");
         assert_eq!(disp("var {o,...rest}={o:1,x:2};rest.x+o"), "3");
         assert_eq!(disp("var {a:{b}}={a:{b:42}};b"), "42");
-        assert_eq!(disp("const [x,y]='ab'.split('=');x+y"), "ab");
+        assert_eq!(disp("const [x,y]='a=b'.split('=');x+y"), "ab");
         assert!(errmsg("var [a]=null").contains("non-iterable"));
         assert!(errmsg("var [a]=1").contains("non-iterable"));
     }

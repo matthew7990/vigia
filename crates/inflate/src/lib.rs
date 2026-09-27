@@ -415,7 +415,10 @@ pub fn gzip_decode(data: &[u8], limit: usize) -> Result<Vec<u8>, Error> {
         }
     }
     if flg & 0x02 != 0 {
-        i = i.checked_add(2).filter(|&n| n <= data.len()).ok_or(Error::Truncated)?; // FHCRC - skipped, trailer CRC covers output
+        i = i
+            .checked_add(2)
+            .filter(|&n| n <= data.len())
+            .ok_or(Error::Truncated)?; // FHCRC - skipped, trailer CRC covers output
     }
     if i >= data.len() {
         return Err(Error::Truncated);

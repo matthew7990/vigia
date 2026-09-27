@@ -374,7 +374,10 @@ impl P {
         let save_fn = self.in_fn;
         let is_async = if matches!(self.peek(), Tok::Kw("async")) {
             // `async function` is not an arrow.
-            if matches!(self.t.get(self.i + 1).map(|t| &t.t), Some(Tok::Kw("function"))) {
+            if matches!(
+                self.t.get(self.i + 1).map(|t| &t.t),
+                Some(Tok::Kw("function"))
+            ) {
                 return Ok(None);
             }
             self.i += 1;

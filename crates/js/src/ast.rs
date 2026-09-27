@@ -63,7 +63,12 @@ pub enum Stmt {
     For(Option<Box<Stmt>>, Option<Expr>, Option<Expr>, Box<Stmt>),
     /// Strict `for-of` over arrays and strings only:
     /// `for (var|let|const x of iter) body` (decl) or `for (x of iter) body`.
-    ForOf { name: String, is_decl: bool, iter: Expr, body: Box<Stmt> },
+    ForOf {
+        name: String,
+        is_decl: bool,
+        iter: Expr,
+        body: Box<Stmt>,
+    },
     Block(Vec<Stmt>),
     Break,
     Continue,

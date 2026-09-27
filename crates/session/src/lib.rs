@@ -79,8 +79,9 @@ impl CookieJar {
         if !cookie.path.starts_with('/') {
             cookie.path = default_path(&url.path);
         }
-        self.cookies
-            .retain(|c| !(c.name == cookie.name && c.domain == cookie.domain && c.path == cookie.path));
+        self.cookies.retain(|c| {
+            !(c.name == cookie.name && c.domain == cookie.domain && c.path == cookie.path)
+        });
         self.cookies.push(cookie);
     }
 
@@ -269,9 +270,6 @@ mod tests {
     fn domain_match_case_insensitive() {
         let mut jar = CookieJar::new();
         jar.store_header(&u("https://a.com/"), "w=1; Domain=A.COM; Path=/");
-        assert_eq!(
-            jar.header_for(&u("https://sub.a.com/")),
-            Some("w=1".into())
-        );
+        assert_eq!(jar.header_for(&u("https://sub.a.com/")), Some("w=1".into()));
     }
 }

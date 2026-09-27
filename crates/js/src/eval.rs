@@ -765,9 +765,12 @@ impl Interp {
                 Ok(Flow::Normal)
             }
             Stmt::For(init, test, upd, body) => self.stmt_for(env, init, test, upd, body),
-            Stmt::ForOf { name, is_decl, iter, body } => {
-                self.stmt_for_of(env, name, *is_decl, iter, body)
-            }
+            Stmt::ForOf {
+                name,
+                is_decl,
+                iter,
+                body,
+            } => self.stmt_for_of(env, name, *is_decl, iter, body),
             Stmt::Block(ss) => self.exec_scoped(env, ss),
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
@@ -3659,7 +3662,10 @@ mod tests {
     fn arrows() {
         assert_eq!(num("(x=>x*2)(21)"), 42.0);
         assert_eq!(num("((a,b)=>a+b)(2,3)"), 5.0);
-        assert_eq!(disp("var o={x:9,m:function(){var h=()=>this.x;return h()}};o.m()"), "9");
+        assert_eq!(
+            disp("var o={x:9,m:function(){var h=()=>this.x;return h()}};o.m()"),
+            "9"
+        );
         assert_eq!(out("var f=()=>1;console.log(f())"), "1\n");
         assert!(errmsg("var f=()=>1;new f()").contains("not a constructor"));
     }
@@ -3675,8 +3681,14 @@ mod tests {
         assert_eq!(disp("null ?? 'd'"), "d");
         assert_eq!(disp("undefined ?? 'd'"), "d");
         assert_eq!(disp("false ?? 'd'"), "false");
-        assert_eq!(out("var g={x:7,h:function(){return this.x}};console.log(g.h?.())"), "7\n");
-        assert_eq!(out("var g={x:7,h:function(){return this.x}};console.log(g?.h?.())"), "7\n");
+        assert_eq!(
+            out("var g={x:7,h:function(){return this.x}};console.log(g.h?.())"),
+            "7\n"
+        );
+        assert_eq!(
+            out("var g={x:7,h:function(){return this.x}};console.log(g?.h?.())"),
+            "7\n"
+        );
         assert!(errmsg("var o={b:null};o.b.c").contains("cannot read"));
         assert!(errmsg("null.x").contains("cannot read"));
     }

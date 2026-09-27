@@ -11685,12 +11685,38 @@ fn n_intl_number_resolved(it: &mut Interp, this: Value, _args: &[Value]) -> Resu
 /// namespace instead of the globals.
 fn intl_ctor(it: &mut Interp, name: &'static str, f: NativeFn, bag: u32) -> Option<Value> {
     let id = it.heap.alloc_obj(nat(name, f)).ok()?;
+    let proto = po(bag);
+    let statik = it.heap.alloc_obj(nat("supportedLocalesOf", n_intl_supported)).ok();
     if let Obj::Native { pairs, .. } = it.heap.obj_mut(id) {
-        if let Some(p) = po(bag) {
+        if let Some(p) = proto {
             pairs.push(("prototype".into(), Value::Obj(p)));
+        }
+        if let Some(s) = statik {
+            pairs.push(("supportedLocalesOf".into(), Value::Obj(s)));
         }
     }
     Some(Value::Obj(id))
+}
+
+/// `Intl.X.supportedLocalesOf(locales)`: echo the input tags as an
+/// array (no likely-subtags canonicalization; the subset treats every
+/// tag as usable via its fallback - documented).
+fn n_intl_supported(it: &mut Interp, _this: Value, args: &[Value]) -> Result<Value, JsError> {
+    let first = arg(args, 0);
+    let tags: Vec<Value> = match first {
+        Value::Obj(id) => match it.heap.obj(id) {
+            Obj::Arr { items, .. } => items.clone(),
+            _ => vec![first],
+        },
+        Value::Undef => vec![],
+        _ => vec![first],
+    };
+    let mut out = Vec::with_capacity(tags.len());
+    for t in tags {
+        let s = to_str(&it.heap, t);
+        out.push(Value::Str(it.heap.alloc_str(s)?));
+    }
+    Ok(Value::Obj(it.arr_obj(out)?))
 }
 
 // -- Proxy / Reflect -----------------------------------------------------------
@@ -15315,6 +15341,11 @@ mod tests {
 
     #[test]
     fn intl_subset() {
+        assert_eq!(
+            disp("Intl.PluralRules.supportedLocalesOf(['en','es']).join()"),
+            "en,es"
+        );
+        assert_eq!(disp("Intl.NumberFormat.supportedLocalesOf('en').length"), "1");
         assert_eq!(
             disp("var p=new Intl.PluralRules('en',{type:'ordinal'});[p.select(1),p.select(2),p.select(3),p.select(4)].join()"),
             "one,two,few,other"
